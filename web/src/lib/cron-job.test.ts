@@ -24,6 +24,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     context_from: "",
     enabled_toolsets: [],
     workdir: "",
+    session: "",
     ...overrides,
   };
 }
@@ -68,6 +69,7 @@ describe("buildCronJobPayload", () => {
       context_from: null,
       enabled_toolsets: null,
       workdir: null,
+      session: null,
     });
   });
 });
@@ -102,7 +104,20 @@ describe("cronJobFormFromJob", () => {
       schedule: "every 1h",
       context_from: "upstream-a\nupstream-b",
       enabled_toolsets: ["web"],
+      session: "",
     });
+  });
+
+  it("round-trips an explicit main conversation", () => {
+    const job: CronJob = {
+      id: "main-job",
+      enabled: true,
+      session: "main",
+    };
+
+    const jobForm = cronJobFormFromJob(job);
+    expect(jobForm.session).toBe("main");
+    expect(buildCronJobPayload(jobForm).session).toBe("main");
   });
 
   it("prefers one-shot run_at over the human display string", () => {

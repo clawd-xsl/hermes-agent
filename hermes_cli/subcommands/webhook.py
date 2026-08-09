@@ -62,6 +62,15 @@ def build_webhook_parser(subparsers, *, cmd_webhook: Callable) -> None:
         "payload is passed as JSON on stdin; empty stdout, [SILENT], or a "
         "nonzero exit code ignores the webhook.",
     )
+    wh_sub.add_argument(
+        "--session",
+        choices=("isolated", "main"),
+        default=None,
+        help=(
+            "Agent conversation: isolated webhook run, or the live main "
+            "gateway conversation with full context"
+        ),
+    )
 
     webhook_subparsers.add_parser(
         "list", aliases=["ls"], help="List all dynamic subscriptions"

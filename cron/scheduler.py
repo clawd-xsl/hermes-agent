@@ -642,6 +642,29 @@ def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool
         return False
 
 
+def _cron_session_mode(job: dict, cfg: Optional[dict] = None) -> str:
+    """Resolve whether a cron fire uses the historical isolated agent or main.
+
+    Per-job ``session`` wins, then global ``cron.session``.  Existing jobs and
+    upstream users remain isolated by default.  ``no_agent`` jobs never create
+    an agent turn, so the global default does not change their script-only
+    semantics (an explicit invalid ``no_agent + main`` job is rejected when
+    created/updated).
+    """
+    from gateway.main_session import normalize_session_mode
+
+    if job.get("no_agent"):
+        return "isolated"
+    per_job = job.get("session")
+    if per_job is not None and str(per_job).strip():
+        return normalize_session_mode(per_job)
+    if cfg is None:
+        cfg = load_config() or {}
+    cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else {}
+    configured = cron_cfg.get("session") if isinstance(cron_cfg, dict) else None
+    return normalize_session_mode(configured)
+
+
 def _target_matches_origin(origin: dict, platform_name: str, chat_id: str,
                            thread_id: Optional[str]) -> bool:
     """True when a delivery target is the job's own origin conversation.
@@ -2440,7 +2463,12 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+def _build_job_prompt(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+    *,
+    main_session: bool = False,
+) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -2539,19 +2567,30 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
-    # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
+    # Always prepend cron execution guidance. Main-session jobs are ordinary
+    # turns in the user's real conversation, so they use its normal response
+    # delivery instead of the isolated scheduler's [SILENT] post-processor.
+    if main_session:
+        cron_hint = (
+            "[IMPORTANT: A scheduled task is entering the user's existing "
+            "main conversation as a new turn. Use the full conversation "
+            "context available in this session. Your final response is sent "
+            "back in this same conversation, so do not call send_message to "
+            "deliver it. If there is nothing new, say so concisely rather "
+            "than emitting an internal marker.]\n\n"
+        )
+    else:
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: Your final response will be automatically delivered "
+            "to the user — do NOT use send_message or try to deliver "
+            "the output yourself. Just produce your report/output as your "
+            "final response and the system handles the rest. "
+            "SILENT: If there is genuinely nothing new to report, respond "
+            "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+            "Never combine [SILENT] with content — either report your "
+            "findings normally, or say [SILENT] and nothing more.]\n\n"
+        )
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -3889,6 +3928,123 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _run_main_session_job(
+    job: dict,
+    *,
+    loop=None,
+) -> tuple[bool, str, Optional[str]]:
+    """Build and enqueue one cron fire as a real main-conversation turn.
+
+    Acceptance into the gateway FIFO is the scheduler-side completion point;
+    the normal gateway turn owns model execution, streaming, persistence, and
+    response delivery.  This keeps the persistent provider session and exact
+    conversation history intact instead of cloning either into a cron agent.
+    """
+    job_id = str(job.get("id") or "unknown")
+    job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    run_time = _hermes_now()
+    try:
+        prerun_script = None
+        script_path = job.get("script")
+        if script_path:
+            prerun_script = _run_job_script(script_path)
+            ran_ok, script_output = prerun_script
+            if ran_ok and not _parse_wake_gate(script_output):
+                output = (
+                    f"# Cron Job: {job_name}\n\n"
+                    f"**Job ID:** {job_id}\n"
+                    f"**Run Time:** {run_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    "**Session:** main\n"
+                    "**Status:** silent (wakeAgent=false)\n"
+                )
+                return True, output, None
+
+        prompt = _build_job_prompt(
+            job,
+            prerun_script=prerun_script,
+            main_session=True,
+        )
+        if prompt is None:
+            output = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {run_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Session:** main\n"
+                "**Status:** silent (empty script output)\n"
+            )
+            return True, output, None
+
+        from gateway.main_session import (
+            enqueue_main_session_turn,
+            resolve_main_session_source,
+        )
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        origin = _resolve_origin(job)
+        profile = str((origin or {}).get("profile") or "").strip() or None
+        source = resolve_main_session_source(
+            runner,
+            origin=origin,
+            profile=profile,
+        )
+        target_loop = loop or getattr(runner, "_gateway_loop", None)
+        if target_loop is None or not target_loop.is_running():
+            raise RuntimeError(
+                "session: main requires the live gateway event loop"
+            )
+
+        event_text = f"[Scheduled task: {job_name}]\n\n{prompt}"
+        event_id = f"cron:{job_id}:{run_time.strftime('%Y%m%dT%H%M%S%f')}"
+        from agent.async_utils import safe_schedule_threadsafe
+
+        future = safe_schedule_threadsafe(
+            enqueue_main_session_turn(
+                runner,
+                source=source,
+                text=event_text,
+                event_id=event_id,
+                raw_message={"trigger": "cron", "job_id": job_id},
+                metadata={"trigger": "cron", "job_id": job_id},
+            ),
+            target_loop,
+        )
+        if future is None:
+            raise RuntimeError("session: main turn could not be scheduled")
+        try:
+            accepted = future.result(timeout=30)
+        except TimeoutError:
+            future.cancel()
+            raise RuntimeError(
+                "session: main turn was not accepted within 30 seconds"
+            ) from None
+
+        output = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {run_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            "**Session:** main\n"
+            f"**Target:** {accepted.platform}:{accepted.chat_id}\n"
+            f"**Session Key:** `{accepted.session_key}`\n"
+            f"**Status:** {'queued' if accepted.queued else 'started'}\n\n"
+            "The scheduled instruction was accepted as a real turn in the "
+            "main conversation. Its response is handled by the normal gateway "
+            "delivery path.\n"
+        )
+        return True, output, None
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        logger.exception("Main-session cron job '%s' failed: %s", job_id, error)
+        output = (
+            f"# Cron Job: {job_name} (FAILED)\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {run_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            "**Session:** main\n\n"
+            f"## Error\n\n```\n{error}\n```\n"
+        )
+        return False, output, error
+
+
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -3944,9 +4100,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             set_secret_scope,
         )
 
+        # Resolve before installing the secret scope so an invalid hand-edited
+        # ``session`` value cannot leak a thread-local scope on this worker.
+        _session_mode = _cron_session_mode(job)
         _scope_token = set_secret_scope(
             build_profile_secret_scope(_get_hermes_home())
         )
+        if _session_mode == "main":
+            try:
+                success, output, error = _run_main_session_job(job, loop=loop)
+            finally:
+                reset_secret_scope(_scope_token)
+            output_file = save_job_output(job["id"], output)
+            if verbose:
+                logger.info("Output saved to: %s", output_file)
+            mark_job_run(job["id"], success, error)
+            return True
+
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
         # its finally block; doing that before _deliver_result runs means the

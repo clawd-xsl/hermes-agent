@@ -1261,6 +1261,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    session: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1305,6 +1306,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        session: Optional execution context: ``isolated`` keeps the historical
+                 ephemeral cron agent; ``main`` queues a real turn into the
+                 gateway home conversation and reuses its complete context.
+                 When omitted, ``cron.session`` in config.yaml decides (default
+                 ``isolated``).
 
     Returns:
         The created job dict
@@ -1337,6 +1343,11 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_session = None
+    if session is not None and str(session).strip():
+        from gateway.main_session import normalize_session_mode
+
+        normalized_session = normalize_session_mode(session)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1345,6 +1356,11 @@ def create_job(
         raise ValueError(
             "no_agent=True requires a script — with no agent and no script "
             "there is nothing for the job to run."
+        )
+    if normalized_no_agent and normalized_session == "main":
+        raise ValueError(
+            "session='main' requires an agent turn and cannot be combined "
+            "with no_agent=True"
         )
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -1432,6 +1448,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_session is not None:
+        job["session"] = normalized_session
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1530,8 +1548,23 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            if "session" in updates:
+                raw_session = updates["session"]
+                if raw_session in {None, ""}:
+                    updates.pop("session")
+                    job.pop("session", None)
+                else:
+                    from gateway.main_session import normalize_session_mode
+
+                    updates["session"] = normalize_session_mode(raw_session)
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if updated.get("no_agent") and updated.get("session") == "main":
+                raise ValueError(
+                    "session='main' requires an agent turn and cannot be combined "
+                    "with no_agent=True"
+                )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

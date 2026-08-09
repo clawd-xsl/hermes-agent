@@ -751,6 +751,24 @@ class TestWebhookToggleEndpoint:
         }
         save_config(cfg)
 
+    def test_create_main_session_webhook(self):
+        response = self.client.post(
+            "/api/webhooks",
+            json={"name": "context-hook", "deliver": "log", "session": "main"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["session"] == "main"
+        subscriptions = self.client.get("/api/webhooks").json()["subscriptions"]
+        assert subscriptions[0]["session"] == "main"
+
+    def test_rejects_invalid_webhook_session(self):
+        response = self.client.post(
+            "/api/webhooks",
+            json={"name": "bad-context-hook", "session": "fork"},
+        )
+
+        assert response.status_code == 400
 
 class TestAdminEndpointsAuthGate:
     """Every admin endpoint must sit behind the dashboard session-token gate."""

@@ -143,6 +143,7 @@ function emptyCronJobForm(): CronJobEditorState {
     context_from: "",
     enabled_toolsets: [],
     workdir: "",
+    session: "",
     scheduleState: { ...DEFAULT_SCHEDULE_STATE },
   };
 }
@@ -257,6 +258,23 @@ function CronAdvancedFields({
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
+          <div className="grid gap-1">
+            <Label htmlFor={`${idPrefix}-session`}>Conversation</Label>
+            <Select
+              id={`${idPrefix}-session`}
+              value={form.session}
+              onValueChange={(v) =>
+                update(
+                  "session",
+                  v === "main" || v === "isolated" ? v : "",
+                )
+              }
+            >
+              <SelectOption value="">Use config default</SelectOption>
+              <SelectOption value="isolated">Isolated cron agent</SelectOption>
+              <SelectOption value="main">Main conversation (full context)</SelectOption>
+            </Select>
+          </div>
           <label className="flex items-center gap-2 text-xs text-muted-foreground">
             <input
               type="checkbox"

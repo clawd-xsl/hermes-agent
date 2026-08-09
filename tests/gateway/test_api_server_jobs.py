@@ -122,6 +122,7 @@ class TestCreateJob:
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
                     "prompt": "do something",
+                    "session": "main",
                 }, headers={
                     "X-Forwarded-For": "203.0.113.11",
                     "User-Agent": "cron-client",
@@ -134,6 +135,7 @@ class TestCreateJob:
                 assert call_kwargs["name"] == "test-job"
                 assert call_kwargs["schedule"] == "*/5 * * * *"
                 assert call_kwargs["prompt"] == "do something"
+                assert call_kwargs["session"] == "main"
                 assert call_kwargs["origin"]["platform"] == "api_server"
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
@@ -184,6 +186,36 @@ class TestGetJob:
 # ---------------------------------------------------------------------------
 
 class TestUpdateJob:
+    @pytest.mark.asyncio
+    async def test_update_job(self, adapter):
+        """PATCH /api/jobs/{id} updates with whitelisted fields."""
+        app = _create_app(adapter)
+        updated_job = {**SAMPLE_JOB, "name": "updated-name"}
+        mock_update = MagicMock(return_value=updated_job)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={
+                        "name": "updated-name",
+                        "schedule": "0 * * * *",
+                        "session": "main",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["job"] == updated_job
+                mock_update.assert_called_once()
+                call_args = mock_update.call_args
+                assert call_args[0][0] == VALID_JOB_ID
+                sanitized = call_args[0][1]
+                assert "name" in sanitized
+                assert "schedule" in sanitized
+                assert sanitized["session"] == "main"
 
     @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):
@@ -468,5 +500,4 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-
 

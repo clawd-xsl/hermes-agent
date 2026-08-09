@@ -153,6 +153,7 @@ def cron_list(show_all: bool = False):
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
         print(f"    Deliver:   {deliver_str}")
+        print(f"    Session:   {job.get('session') or 'default'}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
         script = job.get("script")
@@ -352,6 +353,7 @@ def cron_create(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        session=getattr(args, "session", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -366,6 +368,7 @@ def cron_create(args):
         print(f"  Script: {job_data['script']}")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    print(f"  Session: {job_data.get('session') or 'default'}")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
     print(f"  Next run: {result['next_run_at']}")
@@ -417,6 +420,7 @@ def cron_edit(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", None),
+        session=getattr(args, "session", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -434,6 +438,7 @@ def cron_edit(args):
         print(f"  Script: {updated['script']}")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    print(f"  Session: {updated.get('session') or 'default'}")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
     return 0
