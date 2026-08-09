@@ -15,9 +15,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -95,7 +97,19 @@ MIGRATION_OPTION_METADATA: Dict[str, Dict[str, str]] = {
     },
     "signal-settings": {
         "label": "Signal settings",
-        "description": "Import Signal account, HTTP URL, and allowlist into Hermes .env.",
+        "description": "Import the direct signal-ts runtime, durable device state, account, and allowlist into Hermes config.yaml.",
+    },
+    "current-session": {
+        "label": "Current Signal conversation",
+        "description": "Continue the most recently active OpenClaw Signal conversation in Hermes without creating a summary.",
+    },
+    "main-session-defaults": {
+        "label": "Main-session automation defaults",
+        "description": "Route cron jobs and authenticated webhook turns through the real main conversation by default.",
+    },
+    "claude-runtime": {
+        "label": "Persistent Claude runtime",
+        "description": "Use one long-lived Claude Code backend for the personal assistant and preserve an existing Claude model choice.",
     },
     "provider-keys": {
         "label": "Provider API keys",
@@ -131,7 +145,7 @@ MIGRATION_OPTION_METADATA: Dict[str, Dict[str, str]] = {
     },
     "cron-jobs": {
         "label": "Cron / scheduled tasks",
-        "description": "Import cron job definitions. Archive for manual recreation via 'hermes cron'.",
+        "description": "Import compatible cron job definitions and archive the original store for audit.",
     },
     "hooks-config": {
         "label": "Hooks and webhooks",
@@ -187,6 +201,20 @@ MIGRATION_OPTION_METADATA: Dict[str, Dict[str, str]] = {
     },
 }
 MIGRATION_PRESETS: Dict[str, set[str]] = {
+    "personal-assistant": {
+        "soul",
+        "memory",
+        "user-profile",
+        "skills",
+        "shared-skills",
+        "daily-memory",
+        "signal-settings",
+        "current-session",
+        "main-session-defaults",
+        "claude-runtime",
+        "cron-jobs",
+        "hooks-config",
+    },
     "user-data": {
         "soul",
         "workspace-agents",
@@ -200,6 +228,7 @@ MIGRATION_PRESETS: Dict[str, set[str]] = {
         "slack-settings",
         "whatsapp-settings",
         "signal-settings",
+        "current-session",
         "model-config",
         "tts-config",
         "shared-skills",
@@ -222,7 +251,11 @@ MIGRATION_PRESETS: Dict[str, set[str]] = {
         "logging-config",
         "gateway-config",
     },
-    "full": set(MIGRATION_OPTION_METADATA),
+    # These two are opinionated personal-assistant runtime choices, not user
+    # data. Keep broad/full migration behavior-neutral unless explicitly
+    # included; the personal-assistant preset opts into both.
+    "full": set(MIGRATION_OPTION_METADATA)
+    - {"main-session-defaults", "claude-runtime"},
 }
 
 
@@ -294,7 +327,9 @@ def resolve_selected_options(
 
     if preset_name:
         selected = set(MIGRATION_PRESETS[preset_name])
-    elif not include_values or "all" in include_values:
+    elif not include_values:
+        selected = set(MIGRATION_PRESETS["full"])
+    elif "all" in include_values:
         selected = set(valid)
     else:
         selected = set(include_values)
@@ -543,6 +578,179 @@ def rebrand_text(text: str) -> str:
     for pattern, replacement in _REBRAND_PATTERNS:
         text = pattern.sub(_case_preserving_replacement(replacement), text)
     return text
+
+
+_OPENCLAW_INTERNAL_CONTEXT_RE = re.compile(
+    r"<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>.*?<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
+    re.DOTALL,
+)
+
+
+def _message_text(content: Any) -> str:
+    """Extract visible text while dropping reasoning/tool content blocks."""
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: List[str] = []
+    for part in content:
+        if isinstance(part, str):
+            text = part.strip()
+        elif isinstance(part, dict) and str(part.get("type") or "").lower() in {
+            "text",
+            "input_text",
+            "output_text",
+        }:
+            text = str(part.get("text") or "").strip()
+        else:
+            continue
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _clean_migrated_turn(text: str) -> str:
+    """Remove OpenClaw-only hidden prompt material from a visible chat turn."""
+    return _OPENCLAW_INTERNAL_CONTEXT_RE.sub("", text).strip()
+
+
+def _timestamp_seconds(value: Any, fallback: float) -> float:
+    """Normalize OpenClaw's ISO/epoch-ms/message timestamps to epoch seconds."""
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number / 1000.0 if number > 10_000_000_000 else number
+    if isinstance(value, str) and value.strip():
+        raw = value.strip()
+        try:
+            return _timestamp_seconds(float(raw), fallback)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+    return fallback
+
+
+def extract_current_conversation(transcript_path: Path) -> List[Dict[str, Any]]:
+    """Return a cache-safe user/assistant history from an OpenClaw transcript.
+
+    Only the active tree branch after the latest OpenClaw compaction marker is
+    imported. Tool traffic, reasoning blocks, hidden OpenClaw context, partial
+    turns, and abandoned rewrite branches stay behind. The result starts with a
+    user and ends with an assistant, with strict role alternation.
+    """
+    records: List[Dict[str, Any]] = []
+    with transcript_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                record = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+
+    last_compaction = -1
+    for index, record in enumerate(records):
+        if record.get("type") == "compaction":
+            last_compaction = index
+    active_records = records[last_compaction + 1 :]
+    message_records = [
+        record
+        for record in active_records
+        if record.get("type") == "message" and isinstance(record.get("message"), dict)
+    ]
+    if not message_records:
+        return []
+
+    by_id = {
+        str(record["id"]): record
+        for record in message_records
+        if isinstance(record.get("id"), str) and record.get("id")
+    }
+    leaf_targets = [
+        str(record.get("targetId"))
+        for record in active_records
+        if record.get("type") == "leaf" and record.get("targetId")
+    ]
+    has_parent_links = any(record.get("parentId") is not None for record in message_records)
+    target_id = leaf_targets[-1] if leaf_targets else None
+    if not target_id and has_parent_links:
+        target_id = str(message_records[-1].get("id") or "") or None
+
+    if target_id and target_id in by_id:
+        chain: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        current_id: Optional[str] = target_id
+        while current_id and current_id in by_id and current_id not in seen:
+            seen.add(current_id)
+            record = by_id[current_id]
+            chain.append(record)
+            parent = record.get("parentId")
+            current_id = str(parent) if parent else None
+        chain.reverse()
+        selected = chain
+    else:
+        selected = message_records
+
+    turns: List[Dict[str, Any]] = []
+    fallback_timestamp = time.time()
+    for record in selected:
+        message = record["message"]
+        role = str(message.get("role") or "").lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = _clean_migrated_turn(_message_text(message.get("content")))
+        if not content:
+            continue
+        timestamp_value = message.get("timestamp", record.get("timestamp"))
+        turn = {
+            "role": role,
+            "content": content,
+            "timestamp": _timestamp_seconds(timestamp_value, fallback_timestamp),
+        }
+        fallback_timestamp = max(fallback_timestamp + 0.000001, turn["timestamp"] + 0.000001)
+        if turns and turns[-1]["role"] == role:
+            turns[-1]["content"] = f"{turns[-1]['content']}\n\n{turn['content']}"
+            turns[-1]["timestamp"] = turn["timestamp"]
+        else:
+            turns.append(turn)
+
+    while turns and turns[0]["role"] != "user":
+        turns.pop(0)
+    # A dangling user message would become adjacent to the next real inbound
+    # Signal user turn. Leave incomplete work in the audit transcript instead.
+    if turns and turns[-1]["role"] == "user":
+        turns.pop()
+    return turns
+
+
+def _mapping_conflicts(
+    existing: Dict[str, Any], incoming: Dict[str, Any], prefix: str = ""
+) -> List[str]:
+    """Return leaf paths whose existing values differ from incoming values."""
+    conflicts: List[str] = []
+    for key, incoming_value in incoming.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if key not in existing:
+            continue
+        existing_value = existing[key]
+        if isinstance(existing_value, dict) and isinstance(incoming_value, dict):
+            conflicts.extend(_mapping_conflicts(existing_value, incoming_value, path))
+        elif existing_value != incoming_value:
+            conflicts.append(path)
+    return conflicts
+
+
+def _merge_mapping(existing: Dict[str, Any], incoming: Dict[str, Any]) -> None:
+    """Recursively merge *incoming* into *existing* in place."""
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(existing.get(key), dict):
+            _merge_mapping(existing[key], value)
+        else:
+            existing[key] = value
 
 
 def parse_existing_memory_entries(path: Path) -> List[str]:
@@ -842,7 +1050,11 @@ class Migrator:
         self.workspace_target = workspace_target
         self.overwrite = overwrite
         self.migrate_secrets = migrate_secrets
-        self.selected_options = set(selected_options or MIGRATION_OPTION_METADATA.keys())
+        self.selected_options = (
+            set(selected_options)
+            if selected_options is not None
+            else set(MIGRATION_PRESETS["full"])
+        )
         self.preset_name = preset_name.strip().lower()
         self.skill_conflict_mode = skill_conflict_mode.strip().lower() or "skip"
         self.timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -907,12 +1119,13 @@ class Migrator:
     # short-circuited to avoid partial writes.  Keep in sync with methods
     # that call load_yaml_file(target_root / "config.yaml") + dump_yaml_file.
     _CONFIG_MUTATING_OPTIONS = frozenset({
+        "signal-settings",
+        "main-session-defaults",
+        "claude-runtime",
         "model-config",
         "tts-config",
         "mcp-servers",
         "plugins-config",
-        "cron-jobs",
-        "hooks-config",
         "agent-config",
         "gateway-config",
         "session-config",
@@ -1039,6 +1252,9 @@ class Migrator:
         self.run_if_selected("slack-settings", lambda: self.migrate_slack_settings(config))
         self.run_if_selected("whatsapp-settings", lambda: self.migrate_whatsapp_settings(config))
         self.run_if_selected("signal-settings", lambda: self.migrate_signal_settings(config))
+        self.run_if_selected("current-session", lambda: self.migrate_current_session(config))
+        self.run_if_selected("main-session-defaults", self.migrate_main_session_defaults)
+        self.run_if_selected("claude-runtime", lambda: self.migrate_claude_runtime(config))
         self.run_if_selected("provider-keys", lambda: self.handle_provider_keys(config))
         self.run_if_selected("model-config", lambda: self.migrate_model_config(config))
         self.run_if_selected("tts-config", lambda: self.migrate_tts_config(config))
@@ -1202,6 +1418,31 @@ class Migrator:
                 "Re-run with --migrate-secrets to copy supported keys into the "
                 "Hermes env file."
             )
+        signal_migrated = any(
+            item.kind == "signal-settings" and item.status == STATUS_MIGRATED
+            for item in self.items
+        )
+        if signal_migrated:
+            warnings.append(
+                "Stop OpenClaw before starting Hermes. The direct Signal runtime "
+                "requires exclusive ownership of the migrated linked-device state."
+            )
+        claude_runtime = next(
+            (
+                item
+                for item in self.items
+                if item.kind == "claude-runtime" and item.status == STATUS_MIGRATED
+            ),
+            None,
+        )
+        if self.execute and claude_runtime is not None and not claude_runtime.details.get(
+            "claude_command_found", False
+        ):
+            warnings.append(
+                "The persistent Claude runtime was configured, but the `claude` "
+                "command was not found. Install Claude Code and log in before "
+                "starting the migrated assistant."
+            )
         return warnings
 
     def _build_next_steps(self, summary: Dict[str, int]) -> List[str]:
@@ -1220,9 +1461,20 @@ class Migrator:
                 if self.output_dir
                 else "Review the migration report."
             )
-            steps.append(
-                "Start a new Hermes session (or /reset) to pick up the imported config."
+            current_session_migrated = any(
+                item.kind == "current-session" and item.status == STATUS_MIGRATED
+                for item in self.items
             )
+            if current_session_migrated:
+                steps.append(
+                    "Restart the Hermes gateway, then send the next Signal message in "
+                    "the same chat. Do not use /reset: the imported conversation is "
+                    "already bound as the active main session."
+                )
+            else:
+                steps.append(
+                    "Restart the Hermes process to pick up imported config and skills."
+                )
         if summary.get("conflict", 0) > 0:
             steps.append(
                 "Re-run with --overwrite to apply items that were blocked by conflicts."
@@ -1622,24 +1874,559 @@ class Migrator:
 
     def migrate_signal_settings(self, config: Optional[Dict[str, Any]] = None) -> None:
         config = config or self.load_openclaw_config()
-        additions: Dict[str, str] = {}
         signal = config.get("channels", {}).get("signal", {})
-        if isinstance(signal, dict):
-            account = self._get_channel_field(signal, "account")
-            if isinstance(account, str) and account.strip():
-                additions["SIGNAL_ACCOUNT"] = account.strip()
-            http_url = self._get_channel_field(signal, "httpUrl")
-            if isinstance(http_url, str) and http_url.strip():
-                additions["SIGNAL_HTTP_URL"] = http_url.strip()
-            allow_from = self._get_channel_field(signal, "allowFrom") or []
-            if isinstance(allow_from, list):
-                users = [str(u).strip() for u in allow_from if str(u).strip()]
-                if users:
-                    additions["SIGNAL_ALLOWED_USERS"] = ",".join(users)
-        if additions:
-            self.merge_env_values(additions, "signal-settings", self.source_root / "openclaw.json")
+        source_config = self.source_root / "openclaw.json"
+        destination_config = self.target_root / "config.yaml"
+        if not isinstance(signal, dict) or not signal:
+            self.record(
+                "signal-settings", source_config, destination_config, "skipped",
+                "No Signal settings found",
+            )
+            return
+
+        account_raw = self._get_channel_field(signal, "account")
+        account = str(account_raw).strip() if account_raw is not None else ""
+        state_raw = self._get_channel_field(signal, "signalTsStatePath")
+        state_candidates: List[Path] = []
+        if isinstance(state_raw, str) and state_raw.strip():
+            configured = Path(state_raw.strip()).expanduser()
+            if not configured.is_absolute():
+                configured = self.source_root / configured
+            state_candidates.append(configured)
+        openclaw_env = self.load_openclaw_env()
+        env_state = str(openclaw_env.get("OPENCLAW_SIGNAL_TS_STATE") or "").strip()
+        if env_state:
+            state_candidates.append(Path(env_state).expanduser())
+        state_candidates.extend(
+            [
+                self.source_root / "signal-ts" / "default.json",
+                self.source_root / "signal-ts" / f"{account}.json" if account else self.source_root / "signal-ts" / "account.json",
+            ]
+        )
+        source_state = next((path.resolve() for path in state_candidates if path.is_file()), None)
+        if source_state is None:
+            self.record(
+                "signal-settings", source_config, destination_config, "skipped",
+                "Direct signal-ts state was not found; legacy signal-cli HTTP/RPC settings are intentionally not migrated",
+                checked_state_paths=[str(path) for path in state_candidates],
+            )
+            return
+
+        sdk_candidates: List[Path] = []
+        for env_key in ("SIGNAL_TS_SDK_PATH", "OPENCLAW_SIGNAL_TS_SDK"):
+            raw = str(openclaw_env.get(env_key) or os.environ.get(env_key) or "").strip()
+            if raw:
+                sdk_candidates.append(Path(raw).expanduser())
+        sdk_candidates.append(self.source_root.parent / "signal-ts")
+        try:
+            sdk_candidates.append(Path(__file__).resolve().parents[5] / "signal-ts")
+        except IndexError:
+            pass
+        sdk_path = next(
+            (
+                path.resolve()
+                for path in sdk_candidates
+                if (path / "package.json").is_file() and (path / "dist" / "index.js").is_file()
+            ),
+            None,
+        )
+        if sdk_path is None:
+            self.record(
+                "signal-settings", source_state, destination_config, "skipped",
+                "A built clawd-xsl/signal-ts checkout is required (package.json + dist/index.js)",
+                checked_sdk_paths=[str(path) for path in sdk_candidates],
+                next_step="Clone clawd-xsl/signal-ts beside Hermes and build it according to that repository's README",
+            )
+            return
+
+        allow_raw = self._get_channel_field(signal, "allowFrom") or []
+        allowed = (
+            [str(value).strip() for value in allow_raw if str(value).strip()]
+            if isinstance(allow_raw, list)
+            else []
+        )
+        if account and account not in allowed:
+            allowed.append(account)
+        groups_raw = self._get_channel_field(signal, "groupAllowFrom") or []
+        groups = (
+            [str(value).strip() for value in groups_raw if str(value).strip()]
+            if isinstance(groups_raw, list)
+            else []
+        )
+
+        target_state = self.target_root / "signal-ts" / "default.json"
+        incoming_signal: Dict[str, Any] = {
+            "enabled": True,
+            "extra": {
+                "node_command": shutil.which("node") or "node",
+                "sdk_path": str(sdk_path),
+                "state_path": str(target_state),
+                "allow_from": allowed,
+                "group_allow_from": groups,
+                "ignore_stories": True,
+            },
+        }
+        if account:
+            incoming_signal["extra"]["account"] = account
+            incoming_signal["home_channel"] = {
+                "platform": "signal",
+                "chat_id": account,
+                "name": "Signal home",
+            }
+
+        hermes_config = load_yaml_file(destination_config)
+        platforms = hermes_config.get("platforms")
+        existing_signal = (
+            platforms.get("signal")
+            if isinstance(platforms, dict) and isinstance(platforms.get("signal"), dict)
+            else {}
+        )
+        config_conflicts = _mapping_conflicts(existing_signal, incoming_signal, "platforms.signal")
+        state_conflict = (
+            target_state.exists() and sha256_file(source_state) != sha256_file(target_state)
+        )
+        if (config_conflicts or state_conflict) and not self.overwrite:
+            conflict_paths = list(config_conflicts)
+            if state_conflict:
+                conflict_paths.append(str(target_state))
+            self.record(
+                "signal-settings", source_state, destination_config, "conflict",
+                "Signal runtime already has different target values and overwrite is disabled",
+                conflicting_paths=conflict_paths,
+            )
+            return
+
+        if not self.execute:
+            self.record(
+                "signal-settings", source_state, destination_config, "migrated",
+                "Would copy linked-device state and configure Hermes' persistent direct signal-ts runtime",
+                state_destination=str(target_state),
+                sdk_path=str(sdk_path),
+                account=account or "validated from state at startup",
+                warning="Stop OpenClaw before starting Hermes; one process must exclusively own Signal protocol state",
+            )
+            return
+
+        config_backup = self.maybe_backup(destination_config)
+        state_backup = self.maybe_backup(target_state)
+        ensure_parent(target_state)
+        if not target_state.exists() or sha256_file(source_state) != sha256_file(target_state):
+            shutil.copy2(source_state, target_state)
+        try:
+            os.chmod(target_state, 0o600)
+        except OSError:
+            pass
+        platforms = hermes_config.setdefault("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+            hermes_config["platforms"] = platforms
+        current_signal = platforms.setdefault("signal", {})
+        if not isinstance(current_signal, dict):
+            current_signal = {}
+            platforms["signal"] = current_signal
+        _merge_mapping(current_signal, incoming_signal)
+        dump_yaml_file(destination_config, hermes_config)
+        self.record(
+            "signal-settings", source_state, destination_config, "migrated",
+            state_destination=str(target_state),
+            sdk_path=str(sdk_path),
+            account=account or "validated from state at startup",
+            backup=str(config_backup) if config_backup else "",
+            state_backup=str(state_backup) if state_backup else "",
+            warning="Stop OpenClaw before starting Hermes; one process must exclusively own Signal protocol state",
+        )
+
+    @staticmethod
+    def _signal_account(config: Dict[str, Any]) -> str:
+        signal = config.get("channels", {}).get("signal", {})
+        if not isinstance(signal, dict):
+            return ""
+        account = Migrator._get_channel_field(signal, "account")
+        return str(account).strip() if account is not None else ""
+
+    def _find_current_signal_transcript(
+        self, config: Dict[str, Any]
+    ) -> Tuple[Optional[Path], Optional[Dict[str, Any]], Optional[str]]:
+        sessions_dir = self.source_root / "agents" / "main" / "sessions"
+        store_path = sessions_dir / "sessions.json"
+        if not store_path.is_file():
+            return None, None, "OpenClaw main session index was not found"
+        try:
+            store = json.loads(store_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            return None, None, f"OpenClaw main session index is unreadable: {exc}"
+        if not isinstance(store, dict):
+            return None, None, "OpenClaw main session index has an invalid shape"
+
+        candidates: List[Tuple[float, str, Dict[str, Any]]] = []
+        for key, entry in store.items():
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                continue
+            lower_key = key.lower()
+            if any(marker in lower_key for marker in (":cron:", ":subagent:", ":heartbeat", ":dream")):
+                continue
+            try:
+                spawn_depth = int(entry.get("spawnDepth") or 0)
+            except (TypeError, ValueError):
+                spawn_depth = 0
+            if entry.get("spawnedBy") or spawn_depth > 0:
+                continue
+            delivery = entry.get("deliveryContext")
+            channel_values = {
+                str(entry.get("channel") or "").lower(),
+                str(entry.get("lastChannel") or "").lower(),
+                str(delivery.get("channel") or "").lower() if isinstance(delivery, dict) else "",
+            }
+            if ":signal:" not in lower_key and "signal" not in channel_values:
+                continue
+            candidates.append(
+                (_timestamp_seconds(entry.get("updatedAt"), 0.0), key, entry)
+            )
+        if not candidates:
+            return None, None, "No active OpenClaw Signal conversation was found"
+
+        _, session_key, entry = max(candidates, key=lambda item: item[0])
+        session_id = str(entry.get("sessionId") or "").strip()
+        if not session_id or any(part in session_id for part in ("..", "/", "\\")):
+            return None, None, "The selected OpenClaw Signal session has an invalid session ID"
+        configured_path = entry.get("sessionFile")
+        transcript = Path(configured_path).expanduser() if isinstance(configured_path, str) else None
+        if transcript is not None and not transcript.is_absolute():
+            transcript = sessions_dir / transcript
+        fallback = sessions_dir / f"{session_id}.jsonl"
+        if transcript is None or not transcript.is_file():
+            transcript = fallback
+        if not transcript.is_file():
+            return None, None, f"Transcript for OpenClaw session {session_id} was not found"
+        try:
+            transcript.resolve().relative_to(self.source_root.resolve())
+        except ValueError:
+            return None, None, "Refusing to import a transcript outside the OpenClaw state directory"
+        return transcript.resolve(), {"session_key": session_key, **entry}, None
+
+    def migrate_current_session(self, config: Optional[Dict[str, Any]] = None) -> None:
+        config = config or self.load_openclaw_config()
+        account = self._signal_account(config)
+        destination = self.target_root / "state.db"
+        if not account:
+            self.record(
+                "current-session", None, destination, "skipped",
+                "A Signal account is required to bind the imported conversation to Hermes' main DM",
+            )
+            return
+        transcript, source_entry, error = self._find_current_signal_transcript(config)
+        if error or transcript is None or source_entry is None:
+            self.record("current-session", None, destination, "skipped", error or "No transcript found")
+            return
+        try:
+            messages = extract_current_conversation(transcript)
+        except OSError as exc:
+            self.record("current-session", transcript, destination, "error", f"Could not read transcript: {exc}")
+            return
+        if not messages:
+            self.record(
+                "current-session", transcript, destination, "skipped",
+                "No complete visible user/assistant turns remained after filtering OpenClaw-only context and partial turns",
+            )
+            return
+
+        session_key = f"agent:main:signal:dm:{account}"
+        source_session_id = str(source_entry.get("sessionId") or "")
+        session_id = "openclaw_" + hashlib.sha256(source_session_id.encode("utf-8")).hexdigest()[:16]
+        scope = str((self.target_root / "sessions").resolve())
+        if not self.execute:
+            self.record(
+                "current-session", transcript, destination, "migrated",
+                "Would import the active, post-compaction conversation branch and bind it as the Signal main session",
+                session_id=session_id,
+                session_key=session_key,
+                message_count=len(messages),
+                summary_created=False,
+                provider_session_reused=False,
+            )
+            return
+
+        db = None
+        try:
+            from hermes_state import SessionDB
+
+            backup = self.maybe_backup(destination)
+            db = SessionDB(db_path=destination)
+            routes = db.load_gateway_routing_entries(scope=scope)
+            existing_route = routes.get(session_key)
+            existing_session_id = ""
+            if existing_route:
+                try:
+                    existing_session_id = str(json.loads(existing_route).get("session_id") or "")
+                except (json.JSONDecodeError, AttributeError):
+                    existing_session_id = ""
+            if existing_session_id and existing_session_id != session_id and not self.overwrite:
+                self.record(
+                    "current-session", transcript, destination, "conflict",
+                    "Hermes already has a different active Signal main session; use --overwrite to switch the route without deleting its history",
+                    existing_session_id=existing_session_id,
+                    incoming_session_id=session_id,
+                )
+                return
+
+            existing_messages = db.get_messages_as_conversation(session_id)
+            if existing_messages and not self.overwrite:
+                comparable = [
+                    {"role": message.get("role"), "content": message.get("content")}
+                    for message in existing_messages
+                ]
+                incoming_comparable = [
+                    {"role": message["role"], "content": message["content"]}
+                    for message in messages
+                ]
+                if comparable != incoming_comparable:
+                    self.record(
+                        "current-session", transcript, destination, "conflict",
+                        "The deterministic imported session already exists with different messages",
+                        session_id=session_id,
+                    )
+                    return
+                if existing_session_id == session_id:
+                    self.record(
+                        "current-session", transcript, destination, "skipped",
+                        "The active Signal main session already contains this imported conversation",
+                        session_id=session_id,
+                        session_key=session_key,
+                    )
+                    return
+
+            db.create_session(
+                session_id=session_id,
+                source="signal",
+                user_id=account,
+                session_key=session_key,
+                chat_id=account,
+                chat_type="dm",
+            )
+            if not existing_messages or self.overwrite:
+                db.replace_messages(session_id, messages)
+            origin = {
+                "platform": "signal",
+                "chat_id": account,
+                "chat_name": "Signal home",
+                "chat_type": "dm",
+                "user_id": account,
+                "user_name": account,
+                "thread_id": None,
+                "chat_topic": None,
+            }
+            now_iso = datetime.now().isoformat()
+            route_entry = {
+                "session_key": session_key,
+                "session_id": session_id,
+                "created_at": now_iso,
+                "updated_at": now_iso,
+                "display_name": "Signal home",
+                "platform": "signal",
+                "chat_type": "dm",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_tokens": 0,
+                "last_prompt_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "cost_status": "unknown",
+                "expiry_finalized": False,
+                "suspended": False,
+                "resume_pending": False,
+                "is_fresh_reset": False,
+                "was_auto_reset": False,
+                "reset_had_activity": bool(messages),
+                "origin": origin,
+            }
+            db.record_gateway_session_peer(
+                session_id,
+                source="signal",
+                user_id=account,
+                session_key=session_key,
+                chat_id=account,
+                chat_type="dm",
+                display_name="Signal home",
+                origin_json=json.dumps(origin),
+            )
+            db.save_gateway_routing_entry(
+                session_key, json.dumps(route_entry), scope=scope
+            )
+            self.record(
+                "current-session", transcript, destination, "migrated",
+                backup=str(backup) if backup else "",
+                session_id=session_id,
+                session_key=session_key,
+                message_count=len(messages),
+                summary_created=False,
+                provider_session_reused=False,
+                note="The first Hermes Claude turn seeds the persistent native backend from this transcript; later turns reuse that provider session",
+            )
+        except Exception as exc:
+            self.record(
+                "current-session", transcript, destination, "error",
+                f"Could not import the Signal conversation: {type(exc).__name__}: {exc}",
+            )
+        finally:
+            if db is not None:
+                db.close()
+
+    def migrate_main_session_defaults(self) -> None:
+        source = self.source_root / "openclaw.json"
+        destination = self.target_root / "config.yaml"
+        desired: Dict[str, Any] = {
+            "cron": {"session": "main"},
+            "platforms": {"webhook": {"extra": {"session": "main"}}},
+        }
+        openclaw_config = self.load_openclaw_config()
+        source_timezone = (
+            openclaw_config.get("agents", {}).get("defaults", {}).get("userTimezone")
+        )
+        if isinstance(source_timezone, str) and source_timezone.strip():
+            desired["timezone"] = source_timezone.strip()
+        config = load_yaml_file(destination)
+        conflicts = _mapping_conflicts(config, desired)
+        if conflicts and not self.overwrite:
+            self.record(
+                "main-session-defaults", source, destination, "conflict",
+                "Existing automation session defaults differ and overwrite is disabled",
+                conflicting_paths=conflicts,
+            )
+            return
+        if not conflicts:
+            probe = json.loads(json.dumps(config))
+            _merge_mapping(probe, desired)
+            if probe == config:
+                self.record(
+                    "main-session-defaults", source, destination, "skipped",
+                    "Cron and webhook turns already default to the main session",
+                )
+                return
+        if self.execute:
+            backup = self.maybe_backup(destination)
+            _merge_mapping(config, desired)
+            dump_yaml_file(destination, config)
+            self.record(
+                "main-session-defaults", source, destination, "migrated",
+                backup=str(backup) if backup else "",
+                cron_session="main",
+                webhook_session="main",
+            )
         else:
-            self.record("signal-settings", self.source_root / "openclaw.json", self.target_root / ".env", "skipped", "No Signal settings found")
+            self.record(
+                "main-session-defaults", source, destination, "migrated",
+                "Would make cron and authenticated webhook turns enter the real main-session FIFO by default",
+                cron_session="main",
+                webhook_session="main",
+            )
+
+    @staticmethod
+    def _claude_model_from_config(config: Dict[str, Any]) -> str:
+        """Extract a Claude model while discarding provider prefixes."""
+        configured = config.get("agents", {}).get("defaults", {}).get("model")
+        if isinstance(configured, dict):
+            configured = configured.get("primary") or configured.get("default")
+        if not isinstance(configured, str):
+            return ""
+        model = configured.strip()
+        if "claude" not in model.lower():
+            return ""
+        if "/" in model:
+            provider, remainder = model.split("/", 1)
+            if provider.lower() in {"anthropic", "claude", "claude-code"}:
+                model = remainder
+        return model
+
+    def migrate_claude_runtime(self, config: Optional[Dict[str, Any]] = None) -> None:
+        """Enable the cache-preserving Claude Code backend for this assistant."""
+        config = config or self.load_openclaw_config()
+        source = self.source_root / "openclaw.json"
+        destination = self.target_root / "config.yaml"
+        hermes_config = load_yaml_file(destination)
+        existing_model = hermes_config.get("model")
+
+        existing_claude_model = ""
+        scalar_claude = False
+        if isinstance(existing_model, str):
+            scalar = existing_model.strip()
+            scalar_provider = scalar.split("/", 1)[0].lower() if "/" in scalar else ""
+            scalar_claude = bool(
+                scalar
+                and "claude" in scalar.lower()
+                and scalar_provider in {"", "anthropic", "claude", "claude-code"}
+            )
+            if scalar_claude:
+                existing_claude_model = scalar.split("/", 1)[-1]
+        elif isinstance(existing_model, dict):
+            current_default = existing_model.get("default") or existing_model.get("model")
+            if isinstance(current_default, str) and "claude" in current_default.lower():
+                existing_claude_model = current_default.strip().split("/", 1)[-1]
+
+        model_name = (
+            existing_claude_model
+            or self._claude_model_from_config(config)
+            or "claude-sonnet-4-6"
+        )
+        desired_model: Dict[str, Any] = {
+            "provider": "anthropic",
+            "default": model_name,
+            "anthropic_runtime": "claude_cli",
+            "claude_cli": {
+                "command": "claude",
+                "turn_timeout_seconds": 600,
+            },
+        }
+        desired = {"model": desired_model}
+
+        if isinstance(existing_model, str):
+            conflicts = [] if not existing_model.strip() or scalar_claude else ["model"]
+        else:
+            conflicts = _mapping_conflicts(hermes_config, desired)
+        if conflicts and not self.overwrite:
+            self.record(
+                "claude-runtime", source, destination, "conflict",
+                "Hermes is configured for a different model/runtime and overwrite is disabled",
+                conflicting_paths=conflicts,
+                requested_model=model_name,
+            )
+            return
+
+        probe = json.loads(json.dumps(hermes_config))
+        if not isinstance(probe.get("model"), dict):
+            probe["model"] = {}
+        _merge_mapping(probe, desired)
+        command_found = bool(shutil.which("claude"))
+        if probe == hermes_config:
+            self.record(
+                "claude-runtime", source, destination, "skipped",
+                "The persistent Claude runtime is already configured",
+                model=model_name,
+                claude_command_found=command_found,
+            )
+            return
+
+        if self.execute:
+            backup = self.maybe_backup(destination)
+            hermes_config = probe
+            dump_yaml_file(destination, hermes_config)
+            self.record(
+                "claude-runtime", source, destination, "migrated",
+                backup=str(backup) if backup else "",
+                provider="anthropic",
+                model=model_name,
+                runtime="claude_cli",
+                claude_command_found=command_found,
+            )
+        else:
+            self.record(
+                "claude-runtime", source, destination, "migrated",
+                "Would configure one persistent Claude Code process for the main assistant",
+                provider="anthropic",
+                model=model_name,
+                runtime="claude_cli",
+                claude_command_found=command_found,
+            )
 
     def handle_provider_keys(self, config: Optional[Dict[str, Any]] = None) -> None:
         config = config or self.load_openclaw_config()
@@ -2364,6 +3151,201 @@ class Migrator:
                     self._set_env_var(env_key, api_key, f"plugins.entries.{plugin_name}.apiKey")
 
     # ── Cron jobs ─────────────────────────────────────────────
+    def _load_openclaw_cron_jobs(
+        self,
+    ) -> Tuple[Optional[Path], List[Dict[str, Any]], Optional[str]]:
+        """Load legacy JSON or current SQLite-backed OpenClaw cron jobs."""
+        json_path = self.source_root / "cron" / "jobs.json"
+        if json_path.is_file():
+            try:
+                payload = json.loads(json_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                return json_path, [], f"Invalid OpenClaw cron store: {exc}"
+            jobs = payload.get("jobs") if isinstance(payload, dict) else payload
+            if not isinstance(jobs, list):
+                return json_path, [], "OpenClaw cron store does not contain a jobs array"
+            return json_path, [job for job in jobs if isinstance(job, dict)], None
+
+        sqlite_path = self.source_root / "state" / "openclaw.sqlite"
+        if not sqlite_path.is_file():
+            return None, [], None
+        try:
+            connection = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+            try:
+                table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_jobs'"
+                ).fetchone()
+                if table is None:
+                    return sqlite_path, [], None
+                rows = connection.execute(
+                    "SELECT job_json, state_json FROM cron_jobs ORDER BY store_key, sort_order"
+                ).fetchall()
+            finally:
+                connection.close()
+        except sqlite3.Error as exc:
+            return sqlite_path, [], f"Could not read OpenClaw cron SQLite store: {exc}"
+
+        jobs: List[Dict[str, Any]] = []
+        for job_json, state_json in rows:
+            try:
+                job = json.loads(job_json)
+                state = json.loads(state_json) if state_json else {}
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(job, dict):
+                job["state"] = state if isinstance(state, dict) else {}
+                jobs.append(job)
+        return sqlite_path, jobs, None
+
+    @staticmethod
+    def _cron_datetime(value: Any) -> Optional[datetime]:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return parsed
+
+    def _convert_openclaw_cron_job(
+        self,
+        source_job: Dict[str, Any],
+        *,
+        target_timezone: str = "",
+    ) -> Dict[str, Any]:
+        """Convert one compatible OpenClaw agent/system turn to Hermes."""
+        payload = source_job.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("missing payload")
+        payload_kind = str(payload.get("kind") or "")
+        if payload_kind == "agentTurn":
+            prompt = str(payload.get("message") or "").strip()
+        elif payload_kind == "systemEvent":
+            prompt = str(payload.get("text") or "").strip()
+        else:
+            raise ValueError(f"payload kind {payload_kind or '<empty>'!r} has no safe Hermes mapping")
+        if not prompt:
+            raise ValueError("payload has no prompt text")
+
+        source_schedule = source_job.get("schedule")
+        if not isinstance(source_schedule, dict):
+            raise ValueError("missing schedule")
+        schedule_kind = str(source_schedule.get("kind") or "")
+        now = datetime.now().astimezone()
+        if schedule_kind == "at":
+            run_at = self._cron_datetime(source_schedule.get("at"))
+            if run_at is None:
+                raise ValueError("invalid one-shot timestamp")
+            if run_at < now - timedelta(seconds=120):
+                raise ValueError("one-shot time is already in the past")
+            schedule = {
+                "kind": "once",
+                "run_at": run_at.isoformat(),
+                "display": f"once at {run_at.strftime('%Y-%m-%d %H:%M')}",
+            }
+        elif schedule_kind == "every":
+            every_ms = source_schedule.get("everyMs")
+            if not isinstance(every_ms, (int, float)) or every_ms < 60_000:
+                raise ValueError("sub-minute intervals cannot be represented by Hermes cron")
+            minutes = float(every_ms) / 60_000.0
+            if not minutes.is_integer():
+                raise ValueError("non-whole-minute intervals cannot be represented by Hermes cron")
+            schedule = {
+                "kind": "interval",
+                "minutes": int(minutes),
+                "display": f"every {int(minutes)}m",
+            }
+        elif schedule_kind == "cron":
+            expression = str(source_schedule.get("expr") or "").strip()
+            if not expression:
+                raise ValueError("cron expression is empty")
+            source_timezone = str(source_schedule.get("tz") or "").strip()
+            if source_timezone and target_timezone and source_timezone != target_timezone:
+                raise ValueError(
+                    f"per-job timezone {source_timezone!r} differs from Hermes timezone {target_timezone!r}"
+                )
+            schedule = {"kind": "cron", "expr": expression, "display": expression}
+        else:
+            raise ValueError(f"schedule kind {schedule_kind or '<empty>'!r} is unsupported")
+
+        state = source_job.get("state") if isinstance(source_job.get("state"), dict) else {}
+        next_run_at: Optional[str] = None
+        next_run_ms = state.get("nextRunAtMs")
+        if isinstance(next_run_ms, (int, float)) and next_run_ms > 0:
+            next_run_at = datetime.fromtimestamp(
+                float(next_run_ms) / 1000.0, tz=timezone.utc
+            ).astimezone().isoformat()
+        if not next_run_at:
+            if schedule["kind"] == "once":
+                next_run_at = str(schedule["run_at"])
+            elif schedule["kind"] == "interval":
+                next_run_at = (now + timedelta(minutes=schedule["minutes"])).isoformat()
+            else:
+                try:
+                    from croniter import croniter
+
+                    next_run_at = croniter(schedule["expr"], now).get_next(datetime).isoformat()
+                except Exception as exc:
+                    raise ValueError(f"could not compute next cron occurrence: {exc}") from exc
+
+        source_id = str(source_job.get("id") or source_job.get("name") or prompt)
+        job_id = hashlib.sha256(f"openclaw:{source_id}".encode("utf-8")).hexdigest()[:12]
+        created_at_ms = source_job.get("createdAtMs")
+        created_at = (
+            datetime.fromtimestamp(float(created_at_ms) / 1000.0, tz=timezone.utc)
+            .astimezone()
+            .isoformat()
+            if isinstance(created_at_ms, (int, float)) and created_at_ms > 0
+            else now.isoformat()
+        )
+        force_main = self.preset_name == "personal-assistant"
+        source_session = str(source_job.get("sessionTarget") or "isolated")
+        session = "main" if force_main or source_session == "main" else "isolated"
+        enabled = bool(source_job.get("enabled", True))
+        one_shot = schedule["kind"] == "once" or bool(source_job.get("deleteAfterRun"))
+        name = str(source_job.get("name") or prompt[:50]).strip() or prompt[:50]
+        isolated_model = payload.get("model")
+        if not isinstance(isolated_model, str) or not isolated_model.strip():
+            isolated_model = None
+        return {
+            "id": job_id,
+            "name": name,
+            # Prompts are operational user data. Rebranding can silently break
+            # commands, paths, or instructions that intentionally mention OpenClaw.
+            "prompt": prompt,
+            "skills": [],
+            "skill": None,
+            "model": None if session == "main" else isolated_model,
+            "provider": None,
+            "provider_snapshot": None,
+            "model_snapshot": None,
+            "base_url": None,
+            "script": None,
+            "no_agent": False,
+            "context_from": None,
+            "schedule": schedule,
+            "schedule_display": schedule["display"],
+            "repeat": {"times": 1 if one_shot else None, "completed": 0},
+            "enabled": enabled,
+            "state": "scheduled" if enabled else "paused",
+            "paused_at": None if enabled else now.isoformat(),
+            "paused_reason": None if enabled else "Disabled in OpenClaw",
+            "created_at": created_at,
+            "next_run_at": next_run_at,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "last_delivery_error": None,
+            "deliver": "local",
+            "origin": None,
+            "enabled_toolsets": None,
+            "workdir": None,
+            "session": session,
+            "migration": {"source": "openclaw", "source_job_id": source_id},
+        }
+
     def migrate_cron_jobs(self, config: Optional[Dict[str, Any]] = None) -> None:
         config = config or self.load_openclaw_config()
         cron = config.get("cron") or {}
@@ -2378,12 +3360,14 @@ class Migrator:
                 dest = self.archive_dir / "cron-config.json"
                 dest.write_text(json.dumps(cron, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
                 self.record("cron-jobs", "openclaw.json cron.*", str(dest), "archived",
-                            "Cron config archived. Use 'hermes cron' to recreate jobs manually.")
+                            "Cron config archived for audit.")
             else:
                 self.record("cron-jobs", "openclaw.json cron.*", "archive/cron-config.json",
                             "archived", "Would archive cron config")
 
-        # Also check for cron store files even when config.cron is missing
+        # Preserve the original cron store even when compatible jobs are also
+        # converted. This is the lossless audit copy for fields Hermes does not
+        # map (delivery fallbacks, per-job thinking, failure alerts, etc.).
         if cron_store.is_dir() and self.archive_dir:
             found_any = True
             dest_cron = self.archive_dir / "cron-store"
@@ -2391,6 +3375,124 @@ class Migrator:
                 shutil.copytree(cron_store, dest_cron, dirs_exist_ok=True)
             self.record("cron-jobs", str(cron_store), str(dest_cron), "archived",
                         "Cron job store archived")
+
+        source_path, source_jobs, load_error = self._load_openclaw_cron_jobs()
+        if load_error:
+            self.record("cron-jobs", source_path, self.target_root / "cron" / "jobs.json", "error", load_error)
+            return
+        if source_path is not None:
+            found_any = True
+        if (
+            source_path is not None
+            and source_path.suffix in {".sqlite", ".db"}
+            and source_jobs
+            and self.archive_dir
+        ):
+            sqlite_archive = self.archive_dir / "cron-store" / "jobs-from-sqlite.json"
+            if self.execute:
+                ensure_parent(sqlite_archive)
+                sqlite_archive.write_text(
+                    json.dumps({"version": 1, "jobs": source_jobs}, indent=2, ensure_ascii=False)
+                    + "\n",
+                    encoding="utf-8",
+                )
+            self.record(
+                "cron-jobs", source_path, sqlite_archive, "archived",
+                "OpenClaw SQLite cron rows exported for lossless audit",
+            )
+        target_timezone = str(
+            load_yaml_file(self.target_root / "config.yaml").get("timezone")
+            or config.get("agents", {}).get("defaults", {}).get("userTimezone")
+            or ""
+        ).strip()
+        converted: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, str]] = []
+        for source_job in source_jobs:
+            try:
+                converted.append(
+                    self._convert_openclaw_cron_job(
+                        source_job, target_timezone=target_timezone
+                    )
+                )
+            except ValueError as exc:
+                skipped.append(
+                    {
+                        "id": str(source_job.get("id") or ""),
+                        "name": str(source_job.get("name") or ""),
+                        "reason": str(exc),
+                    }
+                )
+
+        destination = self.target_root / "cron" / "jobs.json"
+        existing_jobs: List[Dict[str, Any]] = []
+        if destination.exists():
+            try:
+                target_payload = json.loads(destination.read_text(encoding="utf-8"))
+                raw_existing = target_payload.get("jobs", []) if isinstance(target_payload, dict) else []
+                if not isinstance(raw_existing, list):
+                    raise ValueError("jobs must be an array")
+                existing_jobs = [job for job in raw_existing if isinstance(job, dict)]
+            except (json.JSONDecodeError, OSError, ValueError) as exc:
+                self.record("cron-jobs", source_path, destination, "error", f"Hermes cron store is unreadable: {exc}")
+                return
+
+        existing_by_id = {str(job.get("id") or ""): index for index, job in enumerate(existing_jobs)}
+        added: List[Dict[str, Any]] = []
+        replaced: List[Dict[str, Any]] = []
+        already_present: List[str] = []
+        for job in converted:
+            if job["id"] in existing_by_id:
+                if self.overwrite:
+                    existing_jobs[existing_by_id[job["id"]]] = job
+                    replaced.append(job)
+                else:
+                    already_present.append(job["id"])
+                continue
+            existing_by_id[job["id"]] = len(existing_jobs)
+            existing_jobs.append(job)
+            added.append(job)
+
+        if converted and not self.execute:
+            self.record(
+                "cron-jobs", source_path, destination, "migrated",
+                "Would import compatible scheduled agent turns",
+                compatible_jobs=len(converted),
+                new_jobs=len(added),
+                existing_jobs=len(already_present),
+                skipped_jobs=skipped,
+                default_session="main" if self.preset_name == "personal-assistant" else "preserved",
+            )
+        elif added or replaced:
+            backup = self.maybe_backup(destination)
+            ensure_parent(destination)
+            destination.write_text(
+                json.dumps(
+                    {"jobs": existing_jobs, "updated_at": datetime.now().astimezone().isoformat()},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            try:
+                os.chmod(destination, 0o600)
+            except OSError:
+                pass
+            self.record(
+                "cron-jobs", source_path, destination, "migrated",
+                backup=str(backup) if backup else "",
+                added_jobs=[job["id"] for job in added],
+                replaced_jobs=[job["id"] for job in replaced],
+                skipped_jobs=skipped,
+                default_session="main" if self.preset_name == "personal-assistant" else "preserved",
+            )
+        elif source_jobs:
+            reason = "Compatible cron jobs were already imported" if already_present else "No compatible cron jobs could be imported"
+            self.record(
+                "cron-jobs", source_path, destination, "skipped", reason,
+                existing_jobs=already_present,
+                skipped_jobs=skipped,
+            )
 
         if not found_any:
             self.record("cron-jobs", None, None, "skipped", "No cron configuration found")
@@ -3007,10 +4109,10 @@ class Migrator:
         archived = [i for i in self.items if i.status == "archived"]
         if archived:
             notes.extend([
-                "## Archived Items (Manual Review Needed)",
+                "## Archived Items (Audit / Manual Review)",
                 "",
-                "These OpenClaw configurations were archived because they don't have a",
-                "direct 1:1 mapping in Hermes. Review each file and recreate manually:",
+                "These OpenClaw configurations were preserved as lossless audit copies.",
+                "Review unsupported fields and recreate only items the report says were skipped:",
                 "",
             ])
             for item in archived:
@@ -3038,6 +4140,9 @@ class Migrator:
             i.kind == "cron-jobs" and i.status == "archived" and i.destination and i.destination.endswith("cron-store")
             for i in self.items
         )
+        has_cron_import = any(
+            i.kind == "cron-jobs" and i.status == "migrated" for i in self.items
+        )
 
         notes.extend([
             "## IMPORTANT: Archive the OpenClaw Directory",
@@ -3062,23 +4167,33 @@ class Migrator:
             "- Run `hermes mcp list` to verify MCP servers were imported correctly",
         ])
 
-        if has_cron_config_archive:
+        if has_cron_import:
+            notes.append("- Run `hermes cron list` to verify imported scheduled tasks; recreate only jobs listed as skipped")
+        elif has_cron_config_archive:
             notes.append("- Run `hermes cron` to recreate scheduled tasks (see archive/cron-config.json)")
         elif has_cron_store_archive:
             notes.append("- Run `hermes cron` to recreate scheduled tasks (see archived cron-store)")
 
         # Check if skills were imported
         has_skills = any(i.kind == "skills" and i.status == "migrated" for i in self.items)
+        has_current_session = any(
+            i.kind == "current-session" and i.status == "migrated"
+            for i in self.items
+        )
         if has_skills:
-            notes.extend([
-                "",
-                "## Imported Skills",
-                "",
-                "Imported skills require a new session to take effect. After migration,",
-                "restart your agent or start a new chat session, then run `/skills`",
-                "to verify they loaded correctly.",
-                "",
-            ])
+            notes.extend(["", "## Imported Skills", ""])
+            if has_current_session:
+                notes.extend([
+                    "Restart the Hermes gateway, then continue in the same Signal chat.",
+                    "Do not use `/reset`: the imported main session picks up the skills",
+                    "when its agent is first constructed. Run `/skills` to verify them.",
+                ])
+            else:
+                notes.extend([
+                    "Imported skills require a new agent instance to take effect. Restart",
+                    "the Hermes process or start a new chat, then run `/skills` to verify them.",
+                ])
+            notes.append("")
 
         # Check if WhatsApp was detected
         has_whatsapp = any(i.kind == "whatsapp-settings" and i.status == "migrated" for i in self.items)
@@ -3131,7 +4246,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preset",
         choices=sorted(MIGRATION_PRESETS),
-        help="Apply a named migration preset. 'user-data' excludes allowlisted secrets; 'full' includes all compatible groups.",
+        help="Apply a named migration preset. 'personal-assistant' is the minimal "
+             "single-Signal-agent continuity path with persistent Claude; "
+             "'user-data' imports the broad user footprint; 'full' includes "
+             "every compatible data/config group. Secrets always require "
+             "--migrate-secrets.",
     )
     parser.add_argument(
         "--include",
@@ -3265,8 +4384,17 @@ def main() -> int:
         print("  Next steps:")
         print("    1. Review ~/.hermes/config.yaml")
         print("    2. Run: hermes mcp list")
-        if any(i["kind"] == "cron-jobs" and i["status"] == "archived" for i in items):
-            print("    3. Recreate cron jobs: hermes cron")
+        next_step_number = 3
+        if any(i["kind"] == "claude-runtime" and i["status"] == "migrated" for i in items):
+            print(f"    {next_step_number}. Verify Claude Code is installed and logged in: claude --version")
+            next_step_number += 1
+        if any(i["kind"] == "current-session" and i["status"] == "migrated" for i in items):
+            print(f"    {next_step_number}. Restart the gateway and continue in the same Signal chat (do not /reset)")
+            next_step_number += 1
+        if any(i["kind"] == "cron-jobs" and i["status"] == "migrated" for i in items):
+            print(f"    {next_step_number}. Verify imported jobs: hermes cron list")
+        elif any(i["kind"] == "cron-jobs" and i["status"] == "archived" for i in items):
+            print(f"    {next_step_number}. Recreate only unsupported cron jobs: hermes cron")
         if report.get("output_dir"):
             print(f"    → Full report: {report['output_dir']}/MIGRATION_NOTES.md")
     elif not args.execute:

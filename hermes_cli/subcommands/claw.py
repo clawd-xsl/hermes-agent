@@ -35,10 +35,13 @@ def build_claw_parser(subparsers, *, cmd_claw: Callable) -> None:
     )
     claw_migrate.add_argument(
         "--preset",
-        choices=["user-data", "full"],
+        choices=["personal-assistant", "user-data", "full"],
         default="full",
-        help="Migration preset (default: full). Neither preset imports secrets — "
-        "pass --migrate-secrets to include API keys.",
+        help="Migration preset (default: full). personal-assistant imports the "
+        "single-agent persona/memory/skills, direct Signal state, current chat, "
+        "persistent Claude runtime, and main-context automations without broad "
+        "OpenClaw infrastructure. "
+        "No preset imports secrets unless --migrate-secrets is also passed.",
     )
     claw_migrate.add_argument(
         "--overwrite",

@@ -233,6 +233,15 @@ class TestGetSectionConfigSummary:
 
 
 
+    def test_gateway_recognises_direct_signal_runtime(self):
+        """Signal setup status comes from its config-owned direct runtime."""
+        import hermes_cli.gateway as gateway_mod
+        signal_platform = {"key": "signal", "label": "Signal", "emoji": "📡"}
+        with patch.object(gateway_mod, "_all_platforms", return_value=[signal_platform]), \
+             patch.object(gateway_mod, "_platform_status", return_value="configured"):
+            result = setup_mod._get_section_config_summary({}, "gateway")
+        assert result is not None
+        assert "Signal" in result
 
     def test_model_ignores_claude_code_oauth_token(self):
         """CLAUDE_CODE_OAUTH_TOKEN is set by Claude Code itself and must not
@@ -293,9 +302,8 @@ class TestSetupWizardSkipsConfiguredSections:
 
         # _platform_status (called by the gateway summary path) reads env
         # vars via hermes_cli.gateway.get_env_value, NOT setup_mod's. Patch
-        # both so xdist sibling tests can't leak a TELEGRAM_BOT_TOKEN /
-        # WHATSAPP_* / etc. through and trick the wizard into thinking the
-        # gateway section is already configured (which would skip it).
+        # both, and freeze the catalog so process-global plugin discovery from
+        # earlier tests cannot contribute a configured plugin platform.
         import hermes_cli.gateway as gateway_mod
 
         with (
@@ -307,6 +315,7 @@ class TestSetupWizardSkipsConfiguredSections:
             patch.object(setup_mod, "get_hermes_home", return_value=tmp_path),
             patch.object(setup_mod, "get_env_value", side_effect=env_side),
             patch.object(gateway_mod, "get_env_value", side_effect=env_side),
+            patch.object(gateway_mod, "_all_platforms", return_value=[]),
             patch.object(setup_mod, "is_interactive_stdin", return_value=True),
             patch("hermes_cli.auth.get_active_provider", return_value=None),
             patch("builtins.input", return_value=""),
