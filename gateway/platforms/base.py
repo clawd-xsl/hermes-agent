@@ -6440,6 +6440,7 @@ class BasePlatformAdapter(ABC):
                         len(text_content),
                         event.source.chat_id,
                     )
+                    _delivery_started_at = time.monotonic()
                     _reply_anchor = _reply_anchor_for_event(event)
                     # Delivery-obligation ledger: durably record the final
                     # response BEFORE the send attempt so a gateway crash
@@ -6490,6 +6491,13 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    logger.info(
+                        "[%s] Response delivery finished to %s in %.3fs (success=%s)",
+                        delivery_adapter.name,
+                        event.source.chat_id,
+                        time.monotonic() - _delivery_started_at,
+                        bool(getattr(result, "success", False)),
+                    )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (

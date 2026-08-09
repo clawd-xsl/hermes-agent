@@ -9072,6 +9072,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
+        logger.info(
+            "[Telegram] Queued text batch %s (chunk=%d chars, total=%d chars)",
+            key,
+            chunk_len,
+            len(self._pending_text_batches[key].text or ""),
+        )
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.

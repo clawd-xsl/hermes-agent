@@ -599,6 +599,13 @@ class ClaudeCliSession:
             session_reuse=reuse,
             latency_ms={"process_start": int((turn_started - launch_started) * 1000) if not was_alive else 0},
         )
+        logger.info(
+            "Claude CLI turn started (owner=%s model=%s reuse=%s process_start_ms=%d)",
+            self.owner_key,
+            self.model,
+            reuse,
+            result.latency_ms["process_start"],
+        )
         bootstrap = "" if self._resume or self._turns_completed else serialize_history_for_bootstrap(messages)
         prompt = bootstrap + user_input
         self.loopback.begin_turn(task_id=task_id, user_task=user_input, messages=messages)
@@ -638,6 +645,13 @@ class ClaudeCliSession:
                 if first_record_at is None:
                     first_record_at = now
                     result.latency_ms["first_record"] = int((now - turn_started) * 1000)
+                    logger.info(
+                        "Claude CLI first record (owner=%s reuse=%s latency_ms=%d type=%s)",
+                        self.owner_key,
+                        reuse,
+                        result.latency_ms["first_record"],
+                        event.get("type") or "unknown",
+                    )
                 event_session_id = event.get("session_id") or event.get("sessionId")
                 if event_session_id:
                     self.native_session_id = str(event_session_id)
@@ -660,6 +674,12 @@ class ClaudeCliSession:
                     if first_text_at is None:
                         first_text_at = now
                         result.latency_ms["first_text"] = int((now - turn_started) * 1000)
+                        logger.info(
+                            "Claude CLI first text (owner=%s reuse=%s latency_ms=%d)",
+                            self.owner_key,
+                            reuse,
+                            result.latency_ms["first_text"],
+                        )
                     if stream_callback is not None:
                         try:
                             stream_callback(delta)
@@ -746,6 +766,15 @@ class ClaudeCliSession:
                 result.latency_ms["process_age"] = int(
                     (time.monotonic() - self._process_started_at) * 1000
                 )
+            logger.info(
+                "Claude CLI turn complete (owner=%s model=%s reuse=%s latency_ms=%s interrupted=%s error=%s)",
+                self.owner_key,
+                self.model,
+                reuse,
+                result.latency_ms,
+                result.interrupted,
+                bool(result.error),
+            )
             return result
         finally:
             self.loopback.end_turn()
