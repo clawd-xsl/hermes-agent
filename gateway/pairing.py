@@ -72,7 +72,6 @@ _PLATFORM_ALLOWLIST_ENV = {
     "whatsapp": "WHATSAPP_ALLOWED_USERS",
     "whatsapp_cloud": "WHATSAPP_CLOUD_ALLOWED_USERS",
     "slack": "SLACK_ALLOWED_USERS",
-    "signal": "SIGNAL_ALLOWED_USERS",
     "email": "EMAIL_ALLOWED_USERS",
     "sms": "SMS_ALLOWED_USERS",
     "mattermost": "MATTERMOST_ALLOWED_USERS",

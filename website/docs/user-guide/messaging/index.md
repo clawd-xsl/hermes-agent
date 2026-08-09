@@ -323,7 +323,6 @@ Details:
 # Restrict to specific users (recommended):
 TELEGRAM_ALLOWED_USERS=123456789,987654321
 DISCORD_ALLOWED_USERS=123456789012345678
-SIGNAL_ALLOWED_USERS=+155****4567,+155****6543
 SMS_ALLOWED_USERS=+155****4567,+155****6543
 EMAIL_ALLOWED_USERS=trusted@example.com,colleague@work.com
 MATTERMOST_ALLOWED_USERS=3uo8dkh1p7g1mfk49ear5fzs5c
@@ -339,6 +338,18 @@ GATEWAY_ALLOWED_USERS=123456789,987654321
 
 # Or explicitly allow all users (NOT recommended for bots with terminal access):
 GATEWAY_ALLOW_ALL_USERS=true
+```
+
+Signal keeps its access policy in `config.yaml` because the persistent
+linked-device runtime has no `.env` credential:
+
+```yaml
+platforms:
+  signal:
+    extra:
+      allow_from:
+        - "+155****4567"
+        - "+155****6543"
 ```
 
 ### DM Pairing (Alternative to Allowlists)

@@ -1485,13 +1485,6 @@ export const en: Translations = {
         label: 'Allowed Matrix user IDs',
         help: 'Recommended. Comma-separated user IDs in @user:server format.'
       },
-      SIGNAL_HTTP_URL: {
-        label: 'Signal bridge URL',
-        placeholder: 'http://127.0.0.1:8080',
-        help: 'URL of a running signal-cli REST bridge.'
-      },
-      SIGNAL_ACCOUNT: { label: 'Phone number', help: 'The number registered with your signal-cli bridge.' },
-      SIGNAL_ALLOWED_USERS: { label: 'Allowed Signal users', help: 'Recommended. Comma-separated Signal identifiers.' },
       WHATSAPP_ENABLED: {
         label: 'Enable WhatsApp bridge',
         help: 'Set automatically by the toggle below. Leave alone unless you know you need it.'
