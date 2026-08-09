@@ -180,6 +180,8 @@ def _cmd_subscribe(args):
         "deliver": args.deliver or "log",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if getattr(args, "session", None):
+        route["session"] = args.session
 
     if getattr(args, "deliver_only", False):
         if route["deliver"] == "log":
@@ -211,6 +213,7 @@ def _cmd_subscribe(args):
     else:
         print("  Events: (all)")
     print(f"  Deliver: {route['deliver']}")
+    print(f"  Session: {route.get('session', 'default')}")
     if route.get("deliver_only"):
         print("  Mode: direct delivery (no agent, zero LLM cost)")
     if route.get("prompt"):
@@ -245,6 +248,7 @@ def _cmd_list(args):
         print(f"    URL:     {base_url}/webhooks/{name}")
         print(f"    Events:  {events}")
         print(f"    Deliver: {deliver}")
+        print(f"    Session: {route.get('session', 'default')}")
         if route.get("script"):
             print(f"    Script:  {route['script']}")
         print()

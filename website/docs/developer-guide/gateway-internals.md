@@ -200,7 +200,12 @@ Outgoing deliveries (`gateway/delivery.py`) handle:
 - **Explicit target delivery** — the send engine specifying `telegram:-1001234567890`, exposed via the [`hermes send` CLI](/guides/pipe-script-output) for shell scripts and via cron `deliver:` targets
 - **Cross-platform delivery** — deliver to a different platform than the originating message
 
-Cron job deliveries are NOT mirrored into gateway session history — they live in their own cron session only. This is a deliberate design choice to avoid message alternation violations.
+Isolated cron deliveries are not part of the main gateway history unless the
+optional continuable-delivery mirror is enabled. A `session: main` cron fire is
+different: it is created as an internal `MessageEvent` for the exact home
+session and enters the same turn-boundary FIFO as `/queue`. It therefore uses
+the live agent/history/provider session without mutating past messages or the
+system prompt, preserving role alternation and prompt caching.
 
 ## Hooks
 

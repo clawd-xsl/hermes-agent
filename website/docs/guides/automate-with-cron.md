@@ -11,7 +11,7 @@ The [daily briefing bot tutorial](/guides/daily-briefing-bot) covers the basics.
 For the full feature reference, see [Scheduled Tasks (Cron)](/user-guide/features/cron).
 
 :::info Key Concept
-Cron jobs run in fresh agent sessions with no memory of your current chat. Prompts must be **completely self-contained** — include everything the agent needs to know.
+Cron jobs use fresh isolated sessions by default, with no memory of your current chat. Those prompts must be **completely self-contained**. For a personal assistant task that should intentionally use the live home conversation, create it with `--session main` instead.
 :::
 
 :::tip Don't need the LLM? You have two zero-token options.

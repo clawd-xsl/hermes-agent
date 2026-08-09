@@ -1613,6 +1613,7 @@ export interface WebhookRoute {
   url: string;
   secret_set: boolean;
   enabled: boolean;
+  session: "isolated" | "main" | null;
 }
 
 export interface WebhooksResponse {
@@ -1641,6 +1642,7 @@ export interface WebhookCreate {
   deliver?: string;
   deliver_only?: boolean;
   deliver_chat_id?: string;
+  session?: "isolated" | "main";
 }
 
 export interface CredentialPoolEntry {
@@ -2202,6 +2204,7 @@ export interface CronJobMutation {
   context_from?: string[] | null;
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
+  session?: "isolated" | "main" | null;
 }
 
 export interface CronJob {
@@ -2227,6 +2230,7 @@ export interface CronJob {
   context_from?: string[] | string | null;
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
+  session?: "isolated" | "main" | null;
   last_run_at?: string | null;
   next_run_at?: string | null;
   last_status?: string | null;

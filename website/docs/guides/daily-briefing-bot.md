@@ -19,7 +19,7 @@ This recipe hits web search, summarization, and optional TTS — all bundled in 
 Here's the flow:
 
 1. **8:00 AM** — The cron scheduler triggers your job
-2. **Hermes spins up** a fresh agent session with your prompt
+2. **Hermes spins up** a fresh isolated agent session with your prompt (the default)
 3. **Web search** pulls the latest news on your topics
 4. **Summarization** distills it into a clean briefing format
 5. **Delivery** sends the briefing to your Telegram or Discord
@@ -119,7 +119,7 @@ Use the `/cron` command for more control:
 ### The Golden Rule: Self-Contained Prompts
 
 :::warning Critical concept
-Cron jobs run in a **completely fresh session** — no memory of your previous conversations, no context about what you "set up earlier." Your prompt must contain **everything** the agent needs to do the job.
+By default cron jobs run in a **completely fresh isolated session** — no memory of your previous conversations, no context about what you "set up earlier." That prompt must contain **everything** the agent needs. Use `session: main` only when the briefing should deliberately share the live home conversation's complete context.
 :::
 
 **Bad prompt:**
@@ -192,7 +192,7 @@ Get a morning overview and an evening recap:
 
 ### Adding Personal Context with Memory
 
-If you have [memory](/user-guide/features/memory) enabled, you can store preferences that persist across sessions. But remember — cron jobs run in fresh sessions without conversational memory. To add personal context, bake it directly into the prompt:
+If you have [memory](/user-guide/features/memory) enabled, you can store preferences that persist across sessions. Isolated cron jobs still lack conversational history, so bake personal context directly into their prompt (or choose `session: main` when sharing the live conversation is the intended behavior):
 
 ```
 /cron add "0 8 * * *" "You are creating a briefing for a senior ML engineer who cares about: PyTorch ecosystem, transformer architectures, open-weight models, and AI regulation in the EU. Skip stories about product launches or funding rounds unless they involve open source.

@@ -16,7 +16,7 @@ Cron jobs can:
 - pause, resume, edit, trigger, and remove jobs
 - attach zero, one, or multiple skills to a job
 - deliver results back to the origin chat, local files, or configured platform targets
-- run in fresh agent sessions with the normal static tool list
+- run in an isolated agent session (default) or as a real turn in the main conversation
 - run in **no-agent mode** — a script on a schedule, its stdout delivered verbatim, zero LLM involvement (see the [no-agent mode](#no-agent-mode-script-only-jobs) section below)
 
 All of this is available to Hermes itself through the `cronjob` tool, so you can create, pause, edit, and remove jobs by asking in plain language — no CLI required.
@@ -50,6 +50,7 @@ Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron
 
 ```bash
 hermes cron create "every 2h" "Check server status"
+hermes cron create "every 2h" "Check server status using what we discussed" --session main
 hermes cron create "every 1h" "Summarize new feed items" --skill blogwatcher
 hermes cron create "every 1h" "Use both skills and combine the result" \
   --skill blogwatcher \
@@ -289,7 +290,7 @@ over ones that create new jobs each run.
 
 ## How it works
 
-**Cron execution is handled by the gateway daemon.** The gateway ticks the scheduler every 60 seconds, running any due jobs in isolated agent sessions.
+**Cron execution is handled by the gateway daemon.** The gateway ticks the scheduler every 60 seconds. Jobs use isolated agent sessions by default; `session: main` jobs enter the live home conversation instead.
 
 ```bash
 hermes gateway install     # Install as a user service
@@ -306,8 +307,8 @@ On each tick Hermes:
 
 1. loads jobs from `~/.hermes/cron/jobs.json`
 2. checks `next_run_at` against the current time
-3. starts a fresh `AIAgent` session for each due job
-4. optionally injects one or more attached skills into that fresh session
+3. starts a fresh `AIAgent` for an isolated job, or enqueues a turn in the existing main agent
+4. optionally injects one or more attached skills into the task prompt
 5. runs the prompt to completion
 6. delivers the final response
 7. updates run metadata and the next scheduled time
@@ -327,6 +328,45 @@ automatically rerun.
 Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
+
+## Isolated vs main conversation
+
+`session` controls where an LLM-driven cron fire runs:
+
+| Value | Behavior |
+|-------|----------|
+| `isolated` | Default upstream behavior: create a standalone cron agent. The prompt must be self-contained. |
+| `main` | Enqueue a normal user turn in the configured gateway home conversation. It reuses that conversation's exact session key, complete history, memory, tool configuration, cached agent, and persistent provider session. |
+
+Set it per job:
+
+```bash
+hermes cron create "0 9 * * *" "Give me the morning brief using my current priorities" --session main
+```
+
+Or make it the default for all LLM-driven jobs:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  session: main       # default is isolated
+```
+
+Main turns use the same FIFO as messages sent by the user. If the agent is
+busy, each cron fire waits as a separate turn; it is never merged into another
+message or injected in the middle of a tool loop. The normal gateway path owns
+streaming, persistence, and response delivery.
+
+Main mode requires a running gateway and a configured `home_channel`. If more
+than one home channel is configured, create the job from the intended home
+conversation so Hermes can resolve it unambiguously. `no_agent: true` remains
+script-only and cannot be combined with an explicit `session: main`.
+
+Because main mode deliberately reuses the existing agent, standalone-job
+overrides such as a per-job provider/model, toolset, workdir, and `deliver`
+target do not replace the main conversation's settings. Use `isolated` when a
+job needs those overrides. `attach_to_session` / `cron.mirror_delivery` are
+only useful for isolated jobs; a main job is already part of the conversation.
 
 ## Delivery options
 
@@ -560,7 +600,7 @@ See the [Script-Only Cron Jobs guide](/guides/cron-script-only) for worked examp
 
 ## Chaining jobs with `context_from`
 
-Cron jobs run in isolated sessions with no memory of previous runs. But sometimes one job's output is exactly what the next job needs. The `context_from` parameter wires that connection automatically — Job B's prompt gets Job A's most recent output prepended as context at runtime.
+Isolated cron jobs have no memory of previous runs. But sometimes one job's output is exactly what the next job needs. The `context_from` parameter wires that connection automatically — Job B's prompt gets Job A's most recent output prepended as context at runtime.
 
 ```python
 # Job 1: Collect raw data
@@ -719,7 +759,7 @@ synchronous execution automatically.
 
 ## Toolsets available to cron jobs
 
-Cron runs each job in a fresh agent session with no chat platform attached. By default the cron agent gets **the toolset you configured for the `cron` platform in `hermes tools`** — not the CLI default, not everything under the sun.
+Cron runs each isolated job in a fresh agent session with no chat platform attached. By default that cron agent gets **the toolset you configured for the `cron` platform in `hermes tools`** — not the CLI default, not everything under the sun. Main-session jobs keep the main agent's tool configuration.
 
 ```bash
 hermes tools
@@ -872,7 +912,7 @@ The storage uses atomic file writes so interrupted writes do not leave a partial
 ## Self-contained prompts still matter
 
 :::warning Important
-Cron jobs run in a completely fresh agent session. The prompt must contain everything the agent needs that is not already provided by attached skills.
+Isolated cron jobs run in a completely fresh agent session. Their prompt must contain everything the agent needs that is not already provided by attached skills. A `session: main` job may intentionally rely on the complete main conversation instead.
 :::
 
 **BAD:** `"Check on that server issue"`
