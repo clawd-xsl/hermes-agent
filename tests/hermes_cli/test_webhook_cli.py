@@ -37,6 +37,7 @@ def _make_args(**kwargs):
         "secret": "",
         "payload": "",
         "script": "",
+        "session": None,
     }
     defaults.update(kwargs)
     return Namespace(**defaults)
@@ -60,6 +61,14 @@ class TestSubscribe:
         ))
         assert _load_subscriptions()["s"]["secret"] == "my-secret"
 
+    def test_main_session_route(self, capsys):
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="contextual", session="main"
+        ))
+
+        route = _load_subscriptions()["contextual"]
+        assert route["session"] == "main"
+        assert "Session: main" in capsys.readouterr().out
 
     def test_auto_secret(self):
         webhook_command(_make_args(webhook_action="subscribe", name="s"))
@@ -152,4 +161,3 @@ class TestWebhookEnabledGate:
         )
         import hermes_cli.webhook as wh_mod
         assert wh_mod._is_webhook_enabled() is False
-

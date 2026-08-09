@@ -257,6 +257,63 @@ def test_profile_call_cannot_retarget_ticker_store_mid_write(
 
 
 @pytest.mark.asyncio
+async def test_create_cron_job_persists_main_session(isolated_profiles):
+    from hermes_cli import web_server
+
+    job = await web_server.create_cron_job(
+        web_server.CronJobCreate(
+            prompt="Use the ongoing conversation",
+            schedule="every 1h",
+            session="main",
+        ),
+        profile="worker_alpha",
+    )
+
+    assert job["session"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_update_cron_job_rejects_invalid_session(isolated_profiles):
+    from fastapi import HTTPException
+    from hermes_cli import web_server
+
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="existing",
+        schedule="every 1h",
+    )
+
+    with pytest.raises(HTTPException, match="Invalid session mode"):
+        await web_server.update_cron_job(
+            job["id"],
+            web_server.CronJobUpdate(updates={"session": "fork"}),
+            profile="worker_alpha",
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_cron_job_null_session_restores_config_default(isolated_profiles):
+    from hermes_cli import web_server
+
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="existing",
+        schedule="every 1h",
+        session="main",
+    )
+
+    updated = await web_server.update_cron_job(
+        job["id"],
+        web_server.CronJobUpdate(updates={"session": None}),
+        profile="worker_alpha",
+    )
+
+    assert "session" not in updated
+
+
+@pytest.mark.asyncio
 async def test_cron_mutation_without_profile_finds_named_profile_job(isolated_profiles):
     from hermes_cli import web_server
 

@@ -384,6 +384,7 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    session: Optional[str] = None
 
 
 class CronJobUpdate(BaseModel):
@@ -465,6 +466,7 @@ class WebhookCreate(BaseModel):
     deliver_chat_id: Optional[str] = None
     # secret: omit to auto-generate
     secret: Optional[str] = None
+    session: Optional[str] = None
 
 
 # --- from web_server.py (originally lines 13930-13931) ---
@@ -734,4 +736,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

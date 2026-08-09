@@ -11,6 +11,7 @@ Each route defines:
   - secret: HMAC secret for signature validation (REQUIRED)
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
+  - session: isolated (default) or main (the real gateway home conversation)
   - deliver: where to send the response (github_comment, telegram, etc.)
   - deliver_extra: additional delivery config (repo, pr_number, chat_id)
   - deliver_only: if true, skip the agent — the rendered prompt IS the
@@ -192,6 +193,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._host: Optional[str] = _cfg_host or None
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
         self._global_secret: str = config.extra.get("secret", "")
+        self._default_session: Any = config.extra.get("session", "isolated")
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
@@ -251,6 +253,10 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
+            try:
+                self._route_session_mode(route)
+            except ValueError as exc:
+                raise ValueError(f"[webhook] Route '{name}': {exc}") from exc
             secret = route.get("secret", self._global_secret)
             if not secret:
                 raise ValueError(
@@ -518,6 +524,13 @@ class WebhookAdapter(BasePlatformAdapter):
                         self._host,
                     )
                     continue
+                try:
+                    self._route_session_mode(v)
+                except ValueError as exc:
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' skipped: %s", k, exc
+                    )
+                    continue
                 new_dynamic[k] = v
             self._dynamic_routes = new_dynamic
             self._routes = {**self._dynamic_routes, **self._static_routes}
@@ -529,6 +542,15 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.error("[webhook] Failed to reload dynamic routes: %s", e)
+
+    def _route_session_mode(self, route: Dict[str, Any]) -> str:
+        """Resolve a route override over the platform-wide default."""
+        from gateway.main_session import normalize_session_mode
+
+        configured = route.get("session")
+        if configured is None or str(configured).strip() == "":
+            configured = self._default_session
+        return normalize_session_mode(configured)
 
     def _resolve_request_profile(self, request: "web.Request"):
         """Resolve + validate the /p/<profile>/ URL prefix on a webhook request.
@@ -875,6 +897,70 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
                 status=502,
+            )
+
+        # Main mode is not an isolated webhook agent with copied context. It
+        # enters the exact home conversation's existing FIFO, so the normal
+        # agent cache/provider session/transcript and response delivery apply.
+        try:
+            session_mode = self._route_session_mode(route_config)
+        except ValueError as exc:
+            logger.error("[webhook] Invalid session mode for route %s: %s", route_name, exc)
+            self._seen_deliveries.pop(delivery_id, None)
+            return web.json_response(
+                {"status": "error", "error": "Webhook route is misconfigured"},
+                status=503,
+            )
+
+        if session_mode == "main":
+            try:
+                from gateway.main_session import (
+                    enqueue_main_session_turn,
+                    resolve_main_session_source,
+                )
+
+                source = await asyncio.to_thread(
+                    resolve_main_session_source,
+                    self.gateway_runner,
+                    profile=profile if isinstance(profile, str) else None,
+                )
+                accepted = await enqueue_main_session_turn(
+                    self.gateway_runner,
+                    source=source,
+                    text=f"[External event: {route_name} / {event_type}]\n\n{prompt}",
+                    event_id=f"webhook:{route_name}:{delivery_id}",
+                    raw_message=payload,
+                    metadata={
+                        "trigger": "webhook",
+                        "route": route_name,
+                        "event_type": event_type,
+                        "delivery_id": delivery_id,
+                    },
+                )
+            except Exception as exc:
+                # A live-home outage is retryable; do not poison idempotency.
+                self._seen_deliveries.pop(delivery_id, None)
+                logger.exception(
+                    "[webhook] Main-session enqueue failed route=%s delivery=%s: %s",
+                    route_name,
+                    delivery_id,
+                    exc,
+                )
+                return web.json_response(
+                    {"status": "error", "error": "Main conversation unavailable"},
+                    status=503,
+                )
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                    "session": "main",
+                    "session_key": accepted.session_key,
+                    "queued": accepted.queued,
+                },
+                status=202,
             )
 
         # Use delivery_id in session key so concurrent webhooks on the

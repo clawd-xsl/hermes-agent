@@ -89,7 +89,7 @@ This resolver is the main reason Hermes can share auth/runtime logic between:
 
 - `hermes chat`
 - gateway message handling
-- cron jobs running in fresh sessions
+- isolated cron jobs running in fresh sessions (main-session jobs reuse the live conversation runtime)
 - ACP editor sessions
 - auxiliary model tasks
 

@@ -260,6 +260,30 @@ class TestJobCRUD:
         )
         assert job["deliver"] == "origin"
 
+    def test_main_session_is_explicitly_persisted(self, tmp_cron_dir):
+        job = create_job(prompt="Use our conversation", schedule="every 1h", session="MAIN")
+
+        assert job["session"] == "main"
+        assert get_job(job["id"])["session"] == "main"
+
+    def test_session_is_absent_when_job_uses_config_default(self, tmp_cron_dir):
+        job = create_job(prompt="Use the configured default", schedule="every 1h")
+
+        assert "session" not in job
+
+    def test_rejects_invalid_session_mode(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="Invalid session mode"):
+            create_job(prompt="Bad mode", schedule="every 1h", session="fork")
+
+    def test_rejects_main_session_without_agent(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="cannot be combined"):
+            create_job(
+                prompt="",
+                schedule="every 1h",
+                script="watch.py",
+                no_agent=True,
+                session="main",
+            )
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
@@ -277,6 +301,14 @@ class TestUpdateJob:
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
 
+    def test_update_and_clear_session_override(self, tmp_cron_dir):
+        job = create_job(prompt="Original", schedule="every 1h")
+
+        updated = update_job(job["id"], {"session": "main"})
+        assert updated["session"] == "main"
+
+        cleared = update_job(job["id"], {"session": ""})
+        assert "session" not in cleared
 
 class TestPauseResumeJob:
     def test_pause_sets_state(self, tmp_cron_dir):

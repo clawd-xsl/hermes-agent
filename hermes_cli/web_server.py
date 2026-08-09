@@ -11803,6 +11803,15 @@ def _normalize_dashboard_cron_updates(
         normalized["context_from"] = _cron_string_list(normalized["context_from"])
     if "enabled_toolsets" in normalized:
         normalized["enabled_toolsets"] = _cron_string_list(normalized["enabled_toolsets"])
+    if "session" in normalized:
+        from gateway.main_session import normalize_session_mode
+
+        raw_session = normalized["session"]
+        normalized["session"] = (
+            None
+            if raw_session is None or str(raw_session).strip() == ""
+            else normalize_session_mode(raw_session)
+        )
     return normalized
 
 
@@ -12070,6 +12079,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            session=body.session,
         )
     except HTTPException:
         raise
@@ -12758,6 +12768,7 @@ def _webhook_route_summary(name: str, route: Dict[str, Any], base_url: str) -> D
         "events": list(route.get("events") or []),
         "deliver": route.get("deliver", "log"),
         "deliver_only": bool(route.get("deliver_only")),
+        "session": route.get("session"),
         "prompt": route.get("prompt", ""),
         "script": route.get("script", ""),
         "skills": list(route.get("skills") or []),
@@ -12832,6 +12843,13 @@ async def create_webhook(body: WebhookCreate):
             status_code=400,
             detail="Direct delivery requires a real target (telegram, discord, …), not 'log'.",
         )
+    if body.session is not None:
+        from gateway.main_session import normalize_session_mode
+
+        try:
+            normalize_session_mode(body.session)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     secret = body.secret or _secrets.token_urlsafe(32)
     route: Dict[str, Any] = {
@@ -12847,6 +12865,8 @@ async def create_webhook(body: WebhookCreate):
         route["script"] = body.script.strip()
     if body.deliver_only:
         route["deliver_only"] = True
+    if body.session:
+        route["session"] = body.session
     if body.deliver_chat_id:
         route["deliver_extra"] = {"chat_id": body.deliver_chat_id}
 

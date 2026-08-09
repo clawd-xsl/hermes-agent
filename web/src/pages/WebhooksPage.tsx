@@ -75,6 +75,7 @@ export default function WebhooksPage() {
   const [events, setEvents] = useState("");
   const [deliver, setDeliver] = useState("log");
   const [deliverOnly, setDeliverOnly] = useState(false);
+  const [session, setSession] = useState<"" | "isolated" | "main">("");
   const [prompt, setPrompt] = useState("");
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<CreatedWebhook | null>(null);
@@ -181,6 +182,7 @@ export default function WebhooksPage() {
     setEvents("");
     setDeliver("log");
     setDeliverOnly(false);
+    setSession("");
     setPrompt("");
   }, []);
 
@@ -201,6 +203,7 @@ export default function WebhooksPage() {
         events: eventsList.length ? eventsList : undefined,
         deliver,
         deliver_only: deliverOnly,
+        session: !deliverOnly && session ? session : undefined,
         prompt: prompt.trim() || undefined,
       });
       showToast("Created ✓", "success");
@@ -432,6 +435,25 @@ export default function WebhooksPage() {
                   </div>
                 </div>
 
+                {!deliverOnly && (
+                  <div className="grid gap-2">
+                    <Label htmlFor="webhook-session">Conversation</Label>
+                    <Select
+                      id="webhook-session"
+                      value={session}
+                      onValueChange={(v) =>
+                        setSession(
+                          v === "main" || v === "isolated" ? v : "",
+                        )
+                      }
+                    >
+                      <SelectOption value="">Use platform default</SelectOption>
+                      <SelectOption value="isolated">Isolated webhook agent</SelectOption>
+                      <SelectOption value="main">Main conversation (full context)</SelectOption>
+                    </Select>
+                  </div>
+                )}
+
                 <div className="grid gap-2">
                   <Label htmlFor="webhook-prompt">Prompt</Label>
                   <textarea
@@ -553,6 +575,9 @@ export default function WebhooksPage() {
                   <Badge tone="outline">{sub.deliver}</Badge>
                   {sub.deliver_only && (
                     <Badge tone="secondary">deliver only</Badge>
+                  )}
+                  {!sub.deliver_only && sub.session && (
+                    <Badge tone="outline">{sub.session} session</Badge>
                   )}
                   {!sub.enabled && <Badge tone="warning">disabled</Badge>}
                 </div>

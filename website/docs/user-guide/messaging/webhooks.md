@@ -85,6 +85,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `filters` | No | Declarative payload filters evaluated after auth/body/event filtering and before agent or direct delivery work. Non-matches return `{"status":"ignored","reason":"filter"}` with HTTP 200. |
 | `script` | No | Filter/transform script under `~/.hermes/scripts/`. The webhook payload is passed as JSON on stdin. JSON object stdout replaces the payload before templating; text stdout is exposed as `script_output`; empty stdout, `[SILENT]`, or a nonzero exit code ignores the webhook. |
 | `skills` | No | List of skill names to load for the agent run. |
+| `session` | No | `isolated` (default) starts a one-shot webhook session. `main` queues a real FIFO turn in the configured gateway home conversation with its complete context and persistent provider session. |
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
@@ -98,6 +99,7 @@ platforms:
     extra:
       port: 8644
       secret: "global-fallback-secret"
+      session: "isolated"       # platform-wide default; may be "main"
       routes:
         github-pr:
           events: ["pull_request"]
@@ -123,6 +125,44 @@ platforms:
             - field: "ref"
               equals: "refs/heads/main"
           deliver: "telegram"
+```
+
+### Route into the main conversation
+
+For a single-account personal assistant, external events often need the same
+context as the user's ongoing chat. Set `session: main` on the route, or once
+under `platforms.webhook.extra` as the default for all agent-backed routes:
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      session: main
+      routes:
+        personal-events:
+          secret: "route-secret"
+          prompt: "Handle this event using our current plans: {__raw__}"
+```
+
+Hermes resolves the configured `home_channel` and submits the event through
+that exact conversation's normal FIFO. An in-flight user turn is not
+interrupted, simultaneous events remain separate turns, and the normal IM
+streaming/delivery path sends the response. No webhook shadow session or
+copied history is created. The POST returns `202 Accepted` after the turn is
+accepted by the FIFO.
+
+Main mode requires the gateway and home-channel adapter to be live. On a
+temporary resolution/enqueue failure Hermes returns `503` and releases the
+delivery ID so the sender can retry. The route's standalone `deliver` target
+does not apply in main mode—the main conversation delivers its own response.
+
+Dynamic subscriptions expose the same choice:
+
+```bash
+hermes webhook subscribe personal-events \
+  --session main \
+  --prompt "Handle this event using our current plans: {__raw__}"
 ```
 
 ### Payload Filters
@@ -391,6 +431,7 @@ hermes webhook subscribe antenna-matches \
 
 - `deliver_only: true` requires `deliver` to be a real target. `deliver: log` (or omitting `deliver`) is rejected at startup — the adapter refuses to start if it finds a misconfigured route.
 - The `skills` field is ignored in direct delivery mode (no agent runs, so there's nothing to inject skills into).
+- `session` is ignored in direct delivery mode because no conversation or agent turn exists.
 - Template rendering uses the same `{dot.notation}` syntax as agent mode, including the `{__raw__}` token.
 - Idempotency uses the same `X-GitHub-Delivery` / `X-Request-ID` header — retries with the same ID return `status=duplicate` and do NOT re-deliver.
 

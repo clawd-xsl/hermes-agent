@@ -66,6 +66,51 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_session_mode_precedence_and_no_agent(monkeypatch):
+    monkeypatch.setattr(
+        s, "load_config", lambda: {"cron": {"session": "main"}}
+    )
+
+    assert s._cron_session_mode({"id": "default"}) == "main"
+    assert s._cron_session_mode({"id": "override", "session": "isolated"}) == "isolated"
+    assert s._cron_session_mode({"id": "script", "no_agent": True}) == "isolated"
+
+
+def test_run_one_job_main_uses_gateway_turn_not_isolated_pipeline(monkeypatch):
+    calls = []
+    monkeypatch.setattr(s, "claim_dispatch", lambda _jid: True)
+    monkeypatch.setattr(
+        s,
+        "_run_main_session_job",
+        lambda job, loop=None: calls.append(("main", job["id"], loop))
+        or (True, "accepted", None),
+    )
+    monkeypatch.setattr(
+        s, "run_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("isolated agent ran"))
+    )
+    monkeypatch.setattr(
+        s,
+        "save_job_output",
+        lambda jid, output: calls.append(("save", jid, output)) or "/tmp/output",
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, error=None: calls.append(("mark", jid, ok, error)),
+    )
+
+    marker_loop = object()
+    ok = s.run_one_job(
+        {"id": "main-job", "name": "contextual", "session": "main"},
+        loop=marker_loop,
+    )
+
+    assert ok is True
+    assert calls == [
+        ("main", "main-job", marker_loop),
+        ("save", "main-job", "accepted"),
+        ("mark", "main-job", True, None),
+    ]
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
@@ -107,5 +152,4 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
 
