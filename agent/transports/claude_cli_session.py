@@ -285,11 +285,10 @@ class ClaudeCliSession:
             "--mcp-config", str(mcp_path),
             "--strict-mcp-config",
         ]
-        # A resumed native history already owns its launch-time system prompt.
-        # Re-supplying a newly assembled prompt here would mutate the cached
-        # prefix and can duplicate identity/memory instructions.
-        if not self._resume:
-            args.extend(["--system-prompt-file", str(system_path)])
+        # Claude's native transcript does not persist a replacement system
+        # prompt across process restarts. Reapply the same stable prompt when
+        # resuming or Claude's built-in identity silently replaces Hermes.
+        args.extend(["--system-prompt-file", str(system_path)])
         if self.model:
             args.extend(["--model", self.model])
         if self._resume and self.native_session_id:
