@@ -388,6 +388,9 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    # Persistent Claude Code stream-json process with Hermes tools exposed
+    # through the authenticated in-process MCP loopback.
+    "claude_cli",
 }
 
 
@@ -435,6 +438,19 @@ def _maybe_apply_codex_app_server_runtime(
     if runtime == "codex_app_server":
         return "codex_app_server"
     return api_mode
+
+
+def _maybe_apply_claude_cli_runtime(
+    *,
+    provider: str,
+    api_mode: str,
+    model_cfg: Optional[Dict[str, Any]],
+) -> str:
+    """Route native Anthropic turns through persistent Claude Code when opted in."""
+    if provider != "anthropic" or not model_cfg:
+        return api_mode
+    runtime = str(model_cfg.get("anthropic_runtime") or "").strip().lower()
+    return "claude_cli" if runtime == "claude_cli" else api_mode
 
 
 def _resolve_runtime_from_pool_entry(
@@ -569,6 +585,19 @@ def _resolve_runtime_from_pool_entry(
     api_mode = _maybe_apply_codex_app_server_runtime(
         provider=provider, api_mode=api_mode, model_cfg=model_cfg
     )
+    api_mode = _maybe_apply_claude_cli_runtime(
+        provider=provider, api_mode=api_mode, model_cfg=model_cfg
+    )
+    if api_mode == "claude_cli":
+        return {
+            "provider": "anthropic",
+            "api_mode": "claude_cli",
+            "base_url": "",
+            "api_key": "",
+            "source": "claude-code",
+            "credential_pool": None,
+            "requested_provider": requested_provider,
+        }
 
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
@@ -2023,7 +2052,7 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
-    # Anthropic (native Messages API)
+    # Anthropic (native Messages API or persistent Claude CLI runtime)
     if provider == "anthropic":
         # Allow base URL override from config.yaml model.base_url, but only
         # when the configured provider is anthropic — otherwise a non-Anthropic
@@ -2035,6 +2064,21 @@ def resolve_runtime_provider(
             if not _anthropic_base_url_override_ok(cfg_base_url):
                 cfg_base_url = ""
         base_url = cfg_base_url or "https://api.anthropic.com"
+
+        runtime_mode = _maybe_apply_claude_cli_runtime(
+            provider=provider,
+            api_mode="anthropic_messages",
+            model_cfg=model_cfg,
+        )
+        if runtime_mode == "claude_cli":
+            return {
+                "provider": "anthropic",
+                "api_mode": "claude_cli",
+                "base_url": "",
+                "api_key": "",
+                "source": "claude-code",
+                "requested_provider": requested_provider,
+            }
 
         # For Microsoft Foundry endpoints, use ANTHROPIC_API_KEY directly —
         # Claude Code OAuth tokens (sk-ant-oat01) are not accepted by Azure.

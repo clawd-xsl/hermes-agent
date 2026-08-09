@@ -772,17 +772,20 @@ def build_turn_context(
         _preflight_deferred = _defer_preflight(_preflight_tokens)
         # Codex app-server threads are compacted by the codex agent itself;
         # Hermes only initiates compaction in "hermes" mode (#36801).
-        _codex_native_auto = (
-            getattr(agent, "api_mode", None) == "codex_app_server"
-            and str(
-                getattr(
-                    agent,
-                    "codex_app_server_auto_compaction",
-                    "native",
-                )
-                or "native"
-            ).lower()
-            in {"native", "off"}
+        _native_runtime_auto = (
+            getattr(agent, "api_mode", None) == "claude_cli"
+            or (
+                getattr(agent, "api_mode", None) == "codex_app_server"
+                and str(
+                    getattr(
+                        agent,
+                        "codex_app_server_auto_compaction",
+                        "native",
+                    )
+                    or "native"
+                ).lower()
+                in {"native", "off"}
+            )
         )
 
         if not _preflight_deferred:
@@ -819,11 +822,11 @@ def build_turn_context(
                 # summary-LLM cooldown — surface a warning (see block below).
                 _cooldown_secs = _compression_cooldown.get("remaining_seconds", 0.0)
                 _compress_block_reason = f"cooldown:{_cooldown_secs:.0f}"
-        elif _codex_native_auto:
+        elif _native_runtime_auto:
             logger.info(
-                "Skipping Hermes preflight compression for codex app-server "
-                "(mode=%s); Hermes will not start thread compaction here.",
-                getattr(agent, "codex_app_server_auto_compaction", "native"),
+                "Skipping Hermes preflight compression for native-history "
+                "runtime %s; the backend owns compaction.",
+                getattr(agent, "api_mode", ""),
             )
         else:
             _should_compress_now = _compressor.should_compress(_preflight_tokens)

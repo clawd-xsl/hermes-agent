@@ -49,6 +49,79 @@ def test_noauth_lmstudio_still_resolves(monkeypatch):
     assert resolved["api_key"]
 
 
+def test_anthropic_claude_cli_runtime_needs_no_copied_credential(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "anthropic",
+            "default": "claude-opus-4-6",
+            "anthropic_runtime": "claude_cli",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved == {
+        "provider": "anthropic",
+        "api_mode": "claude_cli",
+        "base_url": "",
+        "api_key": "",
+        "source": "claude-code",
+        "requested_provider": "anthropic",
+    }
+
+
+def test_anthropic_claude_cli_runtime_resolves_from_real_profile_config(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: anthropic\n"
+        "  default: claude-sonnet-4-6\n"
+        "  anthropic_runtime: claude_cli\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+
+    resolved = rp.resolve_runtime_provider()
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["api_mode"] == "claude_cli"
+    assert resolved["api_key"] == ""
+
+
+def test_anthropic_claude_cli_runtime_drops_pool_bearer(monkeypatch):
+    entry = SimpleNamespace(
+        access_token="secret-oauth-bearer",
+        source="manual",
+        base_url="https://api.anthropic.com",
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return entry
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "anthropic", "anthropic_runtime": "claude_cli"},
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved["api_mode"] == "claude_cli"
+    assert resolved["api_key"] == ""
+    assert resolved["base_url"] == ""
+    assert resolved["credential_pool"] is None
+
+
 def _fake_invoke_jwt(ttl_seconds=3600):
     header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
     payload = base64.urlsafe_b64encode(
