@@ -2,15 +2,15 @@
 Signal attachment rate-limit scheduler.
 
 Process-wide token-bucket simulator that mirrors the per-account
-attachment rate limit signal-cli/Signal-Server enforce. Producers
+attachment rate limit enforced by Signal Server. Producers
 (``SignalAdapter.send_multiple_images`` and the ``send_message`` tool's
 Signal path) call ``acquire(n)`` before an attachment send; on a 429
 they call ``feedback(retry_after, n)`` so the model recalibrates from
 the server's authoritative hint.
 
 The scheduler serializes concurrent calls through an ``asyncio.Lock``,
-giving FIFO fairness across agent sessions sharing one signal-cli
-daemon.
+giving FIFO fairness across agent sessions sharing one persistent
+signal-ts connection.
 """
 
 from __future__ import annotations
@@ -32,10 +32,10 @@ logger = logging.getLogger(__name__)
 
 SIGNAL_MAX_ATTACHMENTS_PER_MSG = 32  # per-message attachment cap (source: Signal-{Android,Desktop} source code)
 SIGNAL_RATE_LIMIT_BUCKET_CAPACITY = 50  # server-side token-bucket capacity for attachments rate limiting
-SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER = 4  # fallback token refill interval for signal-cli < v0.14.3
+SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER = 4  # fallback token refill interval when no server hint is available
 SIGNAL_RATE_LIMIT_MAX_ATTEMPTS = 2  # initial attempt + 1 retry
 SIGNAL_BATCH_PACING_NOTICE_THRESHOLD = 10.0  # if estimated waiting time > 10s, notify the user about the delay
-SIGNAL_RPC_ERROR_RATELIMIT = -5  # signal-cli (v0.14.3+) JSON-RPC error code for RateLimitException
+SIGNAL_RPC_ERROR_RATELIMIT = -5  # legacy normalized RateLimitException code
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +48,7 @@ class SignalRateLimitError(Exception):
     caller has opted in via ``raise_on_rate_limit=True``.
 
     Carries the server-supplied per-token Retry-After (in seconds) on
-    signal-cli ≥ v0.14.3
-    ``retry_after`` is None when the version doesn't expose it.
+    ``retry_after`` is None when the service error does not expose it.
     """
 
     def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
@@ -61,25 +60,22 @@ class SignalSchedulerError(Exception):
     pass
 
 # ---------------------------------------------------------------------------
-# Detection helpers — used to fish a 429 out of signal-cli's various error
-# shapes (typed code, [429] substring, libsignal-net RetryLaterException
-# leaked through AttachmentInvalidException).
+# Detection helpers for the structured and textual error shapes emitted by
+# Signal Server/libsignal.
 # ---------------------------------------------------------------------------
 
 # "Retry after 4 seconds" / "retry after 4 second" — libsignal-net's
 # RetryLaterException string form, surfaced when 429s hit during
-# attachment upload (signal-cli wraps these as AttachmentInvalidException
-# rather than RateLimitException, so the typed path doesn't fire).
+# attachment upload.
 _RETRY_AFTER_RE = re.compile(r"Retry after (\d+(?:\.\d+)?)\s*second", re.IGNORECASE)
 
 
 def _extract_retry_after_seconds(err: Any) -> Optional[float]:
-    """Pull the per-token Retry-After window from a signal-cli rate-limit error.
+    """Pull the per-token Retry-After window from a Signal rate-limit error.
 
     Tries two sources, in order:
     1. ``error.data.response.results[*].retryAfterSeconds`` — the
-       structured field signal-cli ≥ v0.14.3 surfaces for plain
-       RateLimitException.
+       structured field carried by normalized RateLimitException responses.
     2. ``"Retry after N seconds"`` parsed out of the message — covers
        libsignal-net's RetryLaterException that gets wrapped as
        AttachmentInvalidException during attachment upload, where the
@@ -109,16 +105,14 @@ def _extract_retry_after_seconds(err: Any) -> Optional[float]:
 
 
 def _is_signal_rate_limit_error(err: Any) -> bool:
-    """True if a signal-cli RPC error reflects a rate-limit failure.
+    """True if a normalized Signal error reflects a rate-limit failure.
 
     Matches three layers:
-    - typed ``RATELIMIT_ERROR`` code (signal-cli ≥ v0.14.3, plain
-      RateLimitException)
+    - typed ``RATELIMIT_ERROR`` code
     - legacy ``[429] / RateLimitException`` substrings
     - libsignal-net's ``RetryLaterException`` / ``Retry after N seconds``
       surfaced inside ``AttachmentInvalidException`` when the rate
-      limit is hit during attachment upload — signal-cli never re-tags
-      these as RateLimitException, so substring is the only signal.
+      limit is hit during attachment upload
     """
     if isinstance(err, dict) and err.get("code") == SIGNAL_RPC_ERROR_RATELIMIT:
         return True
@@ -150,13 +144,11 @@ def _format_wait(seconds: float) -> str:
 
 
 def _signal_send_timeout(num_attachments: int) -> float:
-    """HTTP timeout for a Signal ``send`` RPC.
+    """Timeout for one persistent Signal ``send`` operation.
 
-    signal-cli uploads attachments serially during the call, so the
-    server-side time scales with batch size. Default 30s is fine for
+    Attachment upload time scales with batch size. Default 30s is fine for
     text-only sends but truncates large attachment batches mid-upload —
-    we then log a phantom failure even though signal-cli completes the
-    send a few seconds later. Scale at 5s/attachment with a 60s floor.
+    scale at 5s/attachment with a 60s floor.
     """
     if num_attachments <= 0:
         return 30.0
@@ -179,7 +171,7 @@ class SignalAttachmentScheduler:
 
     Concurrent ``acquire(n)`` calls serialize through an
     ``asyncio.Lock`` — natural FIFO across agent sessions hitting the
-    same daemon.
+    same persistent account connection.
     """
 
     def __init__(
@@ -309,8 +301,7 @@ class SignalAttachmentScheduler:
         """Apply server feedback after a 429.
 
         ``retry_after`` is the per-*token* refill window the server
-        reports (None when signal-cli is older than v0.14.3 and didn't
-        surface it).
+        reports (None when the error did not surface it).
 
         When present we calibrate ``refill_rate`` from it:
         the server is authoritative.
