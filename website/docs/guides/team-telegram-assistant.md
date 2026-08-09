@@ -361,7 +361,7 @@ hermes cron status        # Check if scheduler is running
 ```
 
 :::warning
-Cron job prompts run in completely fresh sessions with no memory of prior conversations. Make sure each prompt contains **all** the context the agent needs — file paths, URLs, server addresses, and clear instructions.
+Cron job prompts run in completely fresh isolated sessions by default. Make sure each such prompt contains **all** the context the agent needs. `session: main` is available for the different case where a task should intentionally share the configured home conversation.
 :::
 
 ---

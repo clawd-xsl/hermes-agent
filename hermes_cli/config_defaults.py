@@ -2271,6 +2271,12 @@ DEFAULT_CONFIG = {
         # with ONE alert (no re-alert every tick) and NO LLM call is made.
         # Set to false to restore the old behavior (fail during the run).
         "preflight": True,
+        # Conversation used for LLM-driven cron fires. ``isolated`` preserves
+        # the historical ephemeral cron-agent behavior. ``main`` queues every
+        # fire into the configured gateway home conversation, reusing that
+        # session's full history and persistent provider runtime. Individual
+        # jobs can override this with their ``session`` field.
+        "session": "isolated",
         # Fail closed when an unpinned job's current global model/provider
         # differs from its creation-time snapshot. This prevents unattended
         # jobs from silently inheriting a paid default. Set to false only when

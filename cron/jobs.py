@@ -1586,6 +1586,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    session: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1643,6 +1644,11 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        session: Optional execution context: ``isolated`` keeps the historical
+                 ephemeral cron agent; ``main`` queues a real turn into the
+                 gateway home conversation and reuses its complete context.
+                 When omitted, ``cron.session`` in config.yaml decides (default
+                 ``isolated``).
 
     Returns:
         The created job dict
@@ -1679,6 +1685,11 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_session = None
+    if session is not None and str(session).strip():
+        from gateway.main_session import normalize_session_mode
+
+        normalized_session = normalize_session_mode(session)
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -1692,6 +1703,11 @@ def create_job(
         normalized_no_agent,
         normalized_script,
     )
+    if normalized_no_agent and normalized_session == "main":
+        raise ValueError(
+            "session='main' requires an agent turn and cannot be combined "
+            "with no_agent=True"
+        )
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1783,6 +1799,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_session is not None:
+        job["session"] = normalized_session
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1889,6 +1907,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
 
+            if "session" in updates:
+                raw_session = updates["session"]
+                if raw_session in {None, ""}:
+                    updates.pop("session")
+                    job.pop("session", None)
+                else:
+                    from gateway.main_session import normalize_session_mode
+
+                    updates["session"] = normalize_session_mode(raw_session)
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
 
@@ -1907,6 +1935,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updated.get("monitor_url") or None,
                     bool(updated.get("no_agent")),
                     _upd_script or None,
+                )
+            if updated.get("no_agent") and updated.get("session") == "main":
+                raise ValueError(
+                    "session='main' requires an agent turn and cannot be combined "
+                    "with no_agent=True"
                 )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(

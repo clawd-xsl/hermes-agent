@@ -173,7 +173,7 @@ agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 
 ### Fresh Session Isolation
 
-Each cron job runs in a completely fresh agent session:
+Each isolated cron job runs in a completely fresh agent session. Jobs resolved to `session: main` instead enqueue an internal turn into the live home conversation FIFO:
 
 - No conversation history from previous runs
 - No memory of previous cron executions (unless persisted to memory/files)

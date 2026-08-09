@@ -24,6 +24,8 @@ from gateway.config import (
 )
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
+from gateway.main_session import MainSessionEnqueueResult
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +143,92 @@ class TestGitHubPRWebhook:
         assert event.source.platform == Platform.WEBHOOK
         assert "github-pr" in event.source.chat_id
         assert event.message_id == "gh-delivery-001"
+
+
+class TestMainSessionWebhook:
+
+    @pytest.mark.asyncio
+    async def test_main_route_enters_home_fifo_without_webhook_session(self):
+        routes = {
+            "personal-alert": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Please handle: {message}",
+                "session": "main",
+            }
+        }
+        adapter = _make_adapter(routes)
+        runner = MagicMock()
+        adapter.gateway_runner = runner
+        adapter.handle_message = AsyncMock()
+        home_source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="+15551234567",
+            chat_type="dm",
+            user_id="+15551234567",
+        )
+
+        with patch(
+            "gateway.main_session.resolve_main_session_source",
+            return_value=home_source,
+        ) as resolve, patch(
+            "gateway.main_session.enqueue_main_session_turn",
+            new=AsyncMock(
+                return_value=MainSessionEnqueueResult(
+                    session_key="agent:main:signal:dm:+15551234567",
+                    platform="signal",
+                    chat_id="+15551234567",
+                    queued=True,
+                )
+            ),
+        ) as enqueue:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/personal-alert",
+                    json={"message": "Build finished"},
+                    headers={"X-GitHub-Delivery": "main-hook-001"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 202
+        assert data["session"] == "main"
+        assert data["queued"] is True
+        resolve.assert_called_once_with(runner, profile=None)
+        queued = enqueue.await_args.kwargs
+        assert queued["source"] == home_source
+        assert "Build finished" in queued["text"]
+        assert queued["metadata"]["trigger"] == "webhook"
+        adapter.handle_message.assert_not_awaited()
+        assert adapter._delivery_info == {}
+
+    @pytest.mark.asyncio
+    async def test_main_route_failure_is_retryable(self):
+        adapter = _make_adapter({
+            "personal-alert": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message}",
+                "session": "main",
+            }
+        })
+        adapter.gateway_runner = MagicMock()
+
+        with patch(
+            "gateway.main_session.resolve_main_session_source",
+            side_effect=RuntimeError("gateway down"),
+        ):
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                first = await cli.post(
+                    "/webhooks/personal-alert",
+                    json={"message": "retry me"},
+                    headers={"X-GitHub-Delivery": "retry-main-001"},
+                )
+                second = await cli.post(
+                    "/webhooks/personal-alert",
+                    json={"message": "retry me"},
+                    headers={"X-GitHub-Delivery": "retry-main-001"},
+                )
+
+        assert first.status == 503
+        assert second.status == 503
 
 
 # ===================================================================

@@ -634,6 +634,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
+        "session": job.get("session"),
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
@@ -1116,6 +1117,7 @@ def cronjob(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    session: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1206,6 +1208,7 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    session=session,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1463,6 +1466,8 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if session is not None:
+                updates["session"] = session
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1519,7 +1524,9 @@ action='run' fires the job immediately in the BACKGROUND (like delegate_task): t
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
+By default jobs run in a fresh isolated session, so prompts must be self-contained.
+Set session='main' only when the task should be a real turn in the configured
+gateway home conversation and use that main agent's complete context.
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
 On update, passing skills=[] clears attached skills.
 
@@ -1620,6 +1627,11 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
             },
+            "session": {
+                "type": "string",
+                "enum": ["isolated", "main"],
+                "description": "Execution conversation. 'isolated' creates the historical standalone cron agent. 'main' queues a FIFO user turn into the live configured gateway home conversation, reusing its exact agent, full history, memory, tools, and persistent provider session; normal gateway streaming and delivery handle the response. Main mode requires the gateway/home channel to be live and cannot be combined with no_agent=True. Per-job value overrides config.yaml cron.session (default isolated)."
+            },
         },
         "required": ["action"]
     }
@@ -1679,6 +1691,7 @@ registry.register(
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        session=args.get("session"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),
