@@ -22,6 +22,7 @@ For a quick, non-interactive migration, use the built-in CLI command:
 ```bash
 hermes claw migrate              # Full interactive migration
 hermes claw migrate --dry-run    # Preview what would be migrated
+hermes claw migrate --preset personal-assistant  # Single Signal account + one agent
 hermes claw migrate --preset user-data   # Migrate without secrets
 hermes claw migrate --overwrite  # Overwrite existing conflicts
 hermes claw migrate --source /custom/path/.openclaw  # Custom source
@@ -40,6 +41,10 @@ It uses `scripts/openclaw_to_hermes.py` to:
 - merge OpenClaw command approval patterns into Hermes `command_allowlist`
 - migrate Hermes-compatible messaging settings such as `TELEGRAM_ALLOWED_USERS`, and map OpenClaw workspace settings to Hermes working-directory configuration
 - copy OpenClaw skills into `~/.hermes/skills/openclaw-imports/`
+- copy direct `signal-ts` linked-device state into Hermes and configure the persistent local runtime (never the legacy Signal HTTP/RPC path)
+- continue the latest complete Signal conversation in Hermes without creating a session summary or importing tool/reasoning traffic
+- configure the long-lived Claude Code backend for the personal assistant, preserving an existing Anthropic Claude model and reporting missing runtime prerequisites
+- import compatible cron agent turns and default cron/authenticated webhook turns to the real main-session FIFO under the `personal-assistant` preset
 - optionally copy the OpenClaw workspace instructions file into a chosen Hermes workspace
 - mirror compatible workspace assets such as `workspace/tts/` into `~/.hermes/tts/`
 - archive non-secret docs that do not have a direct Hermes destination
@@ -74,7 +79,7 @@ With `--migrate-secrets`, it will also import a small allowlisted set of Hermes-
 2. Present a simple summary of what can be migrated, what cannot be migrated, and what would be archived.
 3. If the `clarify` tool is available, use it for user decisions instead of asking for a free-form prose reply.
 4. If the dry run finds imported skill directory conflicts, ask how those should be handled before executing.
-5. Ask the user to choose between the two supported migration modes before executing.
+5. Ask the user to choose between the three supported migration modes before executing.
 6. Ask for a target workspace path only if the user wants the workspace instructions file brought over.
 7. Execute the migration with the matching preset and flags.
 8. Summarize the results, especially:
@@ -138,13 +143,14 @@ Because of that limitation, use this simplified decision flow:
    - `decide later`
 4. If the user chooses to copy workspace instructions, ask a follow-up open-ended `clarify` question requesting an **absolute path**.
 5. If the user chooses `skip workspace instructions` or `decide later`, proceed without `--workspace-target`.
-5. For migration mode, use `clarify` with these 3 choices:
+6. For migration mode, use `clarify` with these 3 choices:
+   - `personal assistant continuity`
    - `user-data only`
    - `full compatible migration`
-   - `cancel`
-6. `user-data only` means: migrate user data and compatible config, but do **not** import allowlisted secrets.
-7. `full compatible migration` means: migrate the same compatible user data plus the allowlisted secrets when present.
-8. If `clarify` is not available, ask the same question in normal text, but still constrain the answer to `user-data only`, `full compatible migration`, or `cancel`.
+7. `personal assistant continuity` means: migrate persona, memory, skills, direct Signal state, the current Signal conversation, persistent Claude runtime, compatible cron jobs, and main-context automation defaults; omit broad OpenClaw infrastructure and secrets.
+8. `user-data only` means: migrate the broader user data and compatible config, but do **not** import allowlisted secrets.
+9. `full compatible migration` means: migrate every compatible data category plus the allowlisted secrets when present; it does not silently opt into the personal-assistant runtime defaults.
+10. If `clarify` is not available, ask the same question in normal text, constrained to those three modes (the user can cancel in free text).
 
 Execution gate:
 
@@ -160,7 +166,7 @@ Use these exact `clarify` payload shapes as the default pattern:
 
 - `{"question":"Your existing SOUL.md conflicts with the imported one. What should I do?","choices":["keep existing","overwrite with backup","review first"]}`
 - `{"question":"One or more imported OpenClaw skills already exist in Hermes. How should I handle those skill conflicts?","choices":["keep existing skills","overwrite conflicting skills with backup","import conflicting skills under renamed folders"]}`
-- `{"question":"Choose migration mode: migrate only user data, or run the full compatible migration including allowlisted secrets?","choices":["user-data only","full compatible migration","cancel"]}`
+- `{"question":"Choose migration mode.","choices":["personal assistant continuity","user-data only","full compatible migration"]}`
 - `{"question":"Do you want to copy the OpenClaw workspace instructions file into a Hermes workspace?","choices":["skip workspace instructions","copy to a workspace path","decide later"]}`
 - `{"question":"Please provide an absolute path where the workspace instructions should be copied."}`
 
@@ -174,6 +180,7 @@ Map user decisions to command flags exactly:
 - If the user chooses `keep existing skills`, add `--skill-conflict skip`.
 - If the user chooses `overwrite conflicting skills with backup`, add `--skill-conflict overwrite`.
 - If the user chooses `import conflicting skills under renamed folders`, add `--skill-conflict rename`.
+- If the user chooses `personal assistant continuity`, execute with `--preset personal-assistant` and do **not** add `--migrate-secrets`.
 - If the user chooses `user-data only`, execute with `--preset user-data` and do **not** add `--migrate-secrets`.
 - If the user chooses `full compatible migration`, execute with `--preset full --migrate-secrets`.
 - Only add `--workspace-target` if the user explicitly provided an absolute workspace path.
@@ -201,26 +208,26 @@ After execution, treat the script's JSON output as the source of truth.
 
 ## Migration presets
 
-Prefer these two presets in normal use:
+Prefer these three presets in normal use:
 
+- `personal-assistant`
 - `user-data`
 - `full`
 
-`user-data` includes:
+`personal-assistant` is the minimal continuity preset for one IM account and one
+agent. It imports persona, memory, skills, direct Signal state, the latest
+complete Signal conversation, compatible cron jobs, archived hook config, and
+the persistent Claude backend plus main-session defaults for cron/webhooks. It
+deliberately omits generic model/provider import, session-summary machinery,
+dreaming, slash commands, and broad provider/plugin infrastructure.
 
-- `soul`
-- `workspace-agents`
-- `memory`
-- `user-profile`
-- `messaging-settings`
-- `command-allowlist`
-- `skills`
-- `tts-assets`
-- `archive`
+`user-data` selects the broader persona, workspace, memory, skills, messaging,
+model/session behavior, compatible integrations, and audit archives. It does
+not select `secret-settings`.
 
-`full` includes everything in `user-data` plus:
-
-- `secret-settings`
+`full` selects every compatible data/config category while leaving the two
+opinionated personal-assistant runtime defaults opt-in. It still does not copy
+any secret unless the user also explicitly passes `--migrate-secrets`.
 
 The helper script still supports category-level `--include` / `--exclude`, but treat that as an advanced fallback rather than the default UX.
 
@@ -242,6 +249,12 @@ Dry run with the user-data preset:
 
 ```bash
 python ~/.hermes/skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py --preset user-data
+```
+
+Execute the single-agent Signal continuity migration:
+
+```bash
+python3 ~/.hermes/skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py --execute --preset personal-assistant --skill-conflict skip
 ```
 
 Execute a user-data migration:
@@ -273,7 +286,7 @@ Do not use `$PWD` or the home directory as the workspace target by default. Ask 
 5. Prefer the primary OpenClaw workspace (`~/.openclaw/workspace/`) over `workspace.default/`. Only use the default workspace as fallback when the primary files are missing.
 6. Even in secret-migration mode, only migrate secrets with a clean Hermes destination. Unsupported auth blobs must still be reported as skipped.
 7. If the dry run shows a large asset copy, a conflicting `SOUL.md`, or overflowed memory entries, call those out separately before execution.
-8. Default to `user-data only` if the user is unsure.
+8. Default to `personal assistant continuity` for a single-account personal assistant; otherwise default to `user-data only` if the user is unsure.
 9. Only include `workspace-agents` when the user has explicitly provided a destination workspace path.
 10. Treat category-level `--include` / `--exclude` as an advanced escape hatch, not the normal flow.
 11. Do not end the dry-run summary with a vague “What would you like to do?” if `clarify` is available. Use structured follow-up prompts instead.
@@ -295,4 +308,7 @@ After a successful run, the user should have:
 - Hermes persona state imported
 - Hermes memory files populated with converted OpenClaw knowledge
 - OpenClaw skills available under `~/.hermes/skills/openclaw-imports/`
+- the direct Signal linked-device state owned by Hermes after OpenClaw is stopped
+- the latest complete Signal conversation bound to Hermes' main session, with no generated migration summary
+- compatible scheduled tasks entering the same serialized main conversation when the personal-assistant preset is used
 - a migration report showing any conflicts, omissions, or unsupported data
