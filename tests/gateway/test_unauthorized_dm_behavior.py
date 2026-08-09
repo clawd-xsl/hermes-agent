@@ -272,25 +272,31 @@ async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_signal_with_allowlist_ignores_unauthorized_dm(monkeypatch):
-    """When SIGNAL_ALLOWED_USERS is set, unauthorized DMs are silently dropped.
+    """A config-owned Signal allowlist silently drops unauthorized DMs.
 
     This is the primary regression test for #9337: before the fix, Signal
     would send pairing codes to ANY sender even when a strict allowlist was
     configured, spamming personal contacts with cryptic bot messages.
+
+    Signal now enforces this before gateway dispatch; the adapter intake test
+    covers the actual drop.  Here we verify the gateway's user-facing fallback
+    policy remains silent if an event is inspected downstream.
     """
     _clear_auth_env(monkeypatch)
-    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+15550000001")  # allowlist set
 
     config = GatewayConfig(
-        platforms={Platform.SIGNAL: PlatformConfig(enabled=True)},
+        platforms={
+            Platform.SIGNAL: PlatformConfig(
+                enabled=True,
+                extra={"allow_from": ["+15550000001"]},
+            )
+        },
     )
     runner, adapter = _make_runner(Platform.SIGNAL, config)
+    adapter._dm_policy = "allowlist"
+    adapter.enforces_own_access_policy = True
 
-    result = await runner._handle_message(
-        _make_event(Platform.SIGNAL, "+15559999999", "+15559999999")  # not in allowlist
-    )
-
-    assert result is None
+    assert runner._get_unauthorized_dm_behavior(Platform.SIGNAL) == "ignore"
     runner.pairing_store.generate_code.assert_not_called()
     adapter.send.assert_not_awaited()
 
@@ -335,6 +341,103 @@ async def test_global_allowlist_ignores_unauthorized_dm(monkeypatch):
     adapter.send.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_no_allowlist_still_pairs_by_default(monkeypatch):
+    """Without any allowlist, pairing behavior is preserved (open gateway)."""
+    _clear_auth_env(monkeypatch)
+    # No SIGNAL_ALLOWED_USERS, no GATEWAY_ALLOWED_USERS
+
+    config = GatewayConfig(
+        platforms={Platform.SIGNAL: PlatformConfig(enabled=True)},
+    )
+    runner, adapter = _make_runner(Platform.SIGNAL, config)
+    runner.pairing_store.generate_code.return_value = "PAIR1234"
+
+    result = await runner._handle_message(
+        _make_event(Platform.SIGNAL, "+15559999999", "+15559999999")
+    )
+
+    assert result is None
+    runner.pairing_store.generate_code.assert_called_once()
+    adapter.send.assert_awaited_once()
+    assert "PAIR1234" in adapter.send.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_email_no_allowlist_ignores_unknown_senders_by_default(monkeypatch):
+    """Email should not send pairing codes to arbitrary unread inbox senders."""
+    _clear_auth_env(monkeypatch)
+
+    config = GatewayConfig(
+        platforms={Platform.EMAIL: PlatformConfig(enabled=True)},
+    )
+    runner, adapter = _make_runner(Platform.EMAIL, config)
+    runner.pairing_store.generate_code.return_value = "EMAIL123"
+
+    result = await runner._handle_message(
+        _make_event(Platform.EMAIL, "stranger@example.com", "stranger@example.com")
+    )
+
+    assert result is None
+    runner.pairing_store.generate_code.assert_not_called()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_email_pairing_requires_explicit_platform_opt_in(monkeypatch):
+    _clear_auth_env(monkeypatch)
+
+    config = GatewayConfig(
+        platforms={
+            Platform.EMAIL: PlatformConfig(
+                enabled=True,
+                extra={"unauthorized_dm_behavior": "pair"},
+            ),
+        },
+    )
+    runner, adapter = _make_runner(Platform.EMAIL, config)
+    runner.pairing_store.generate_code.return_value = "EMAIL123"
+
+    result = await runner._handle_message(
+        _make_event(Platform.EMAIL, "stranger@example.com", "stranger@example.com")
+    )
+
+    assert result is None
+    runner.pairing_store.generate_code.assert_called_once_with(
+        "email",
+        "stranger@example.com",
+        "tester",
+    )
+    adapter.send.assert_awaited_once()
+    assert "EMAIL123" in adapter.send.await_args.args[1]
+
+
+def test_explicit_pair_config_overrides_allowlist_default(monkeypatch):
+    """Explicit unauthorized_dm_behavior='pair' overrides the allowlist default.
+
+    Operators can opt back in to pairing even with an allowlist by setting
+    unauthorized_dm_behavior: pair in their platform config.  We test the
+    _get_unauthorized_dm_behavior resolver directly to avoid the full
+    _handle_message pipeline which requires extensive runner state.
+    """
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={
+            Platform.SIGNAL: PlatformConfig(
+                enabled=True,
+                extra={
+                    "allow_from": ["+15550000001"],
+                    "unauthorized_dm_behavior": "pair",
+                },
+            ),
+        },
+    )
+    runner, _adapter = _make_runner(Platform.SIGNAL, config)
+
+    # The per-platform explicit config should beat the allowlist-derived default
+    behavior = runner._get_unauthorized_dm_behavior(Platform.SIGNAL)
+    assert behavior == "pair"
+
 def test_allowlist_authorized_user_returns_ignore_for_unauthorized(monkeypatch):
     """_get_unauthorized_dm_behavior returns 'ignore' when allowlist is set.
 
@@ -342,12 +445,17 @@ def test_allowlist_authorized_user_returns_ignore_for_unauthorized(monkeypatch):
     authorized users is covered by the integration tests in this module.
     """
     _clear_auth_env(monkeypatch)
-    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+15550000001")
-
     config = GatewayConfig(
-        platforms={Platform.SIGNAL: PlatformConfig(enabled=True)},
+        platforms={
+            Platform.SIGNAL: PlatformConfig(
+                enabled=True,
+                extra={"allow_from": ["+15550000001"]},
+            )
+        },
     )
-    runner, _adapter = _make_runner(Platform.SIGNAL, config)
+    runner, adapter = _make_runner(Platform.SIGNAL, config)
+    adapter._dm_policy = "allowlist"
+    adapter.enforces_own_access_policy = True
 
     behavior = runner._get_unauthorized_dm_behavior(Platform.SIGNAL)
     assert behavior == "ignore"

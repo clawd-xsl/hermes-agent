@@ -470,7 +470,7 @@ def show_status(args):
         "Telegram": ("TELEGRAM_BOT_TOKEN", "TELEGRAM_HOME_CHANNEL"),
         "Discord": ("DISCORD_BOT_TOKEN", "DISCORD_HOME_CHANNEL"),
         "WhatsApp": ("WHATSAPP_ENABLED", None),
-        "Signal": ("SIGNAL_HTTP_URL", "SIGNAL_HOME_CHANNEL"),
+        "Signal": (None, None),
         "Slack": ("SLACK_BOT_TOKEN", None),
         "Email": ("EMAIL_ADDRESS", "EMAIL_HOME_ADDRESS"),
         "SMS": ("TWILIO_ACCOUNT_SID", "SMS_HOME_CHANNEL"),
@@ -485,12 +485,20 @@ def show_status(args):
     }
 
     for name, (token_var, home_var) in platforms.items():
-        token = os.getenv(token_var, "")
-        has_token = bool(token)
-        
         home_channel = ""
-        if home_var:
-            home_channel = os.getenv(home_var, "")
+        if name == "Signal":
+            from gateway.config import PlatformConfig, _signal_direct_runtime_configured
+
+            signal_raw = (config.get("platforms") or {}).get("signal") or {}
+            signal_config = PlatformConfig.from_dict(signal_raw)
+            has_token = _signal_direct_runtime_configured(signal_config)
+            if signal_config.home_channel:
+                home_channel = signal_config.home_channel.chat_id
+        else:
+            token = os.getenv(token_var or "", "")
+            has_token = bool(token)
+            if home_var:
+                home_channel = os.getenv(home_var, "")
         # Back-compat: QQBot home channel was renamed from QQ_HOME_CHANNEL to QQBOT_HOME_CHANNEL
         if not home_channel and home_var == "QQBOT_HOME_CHANNEL":
             home_channel = os.getenv("QQ_HOME_CHANNEL", "")

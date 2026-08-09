@@ -12,9 +12,9 @@ import re
 def markdown_to_signal(text: str) -> tuple[str, list[str]]:
     """Convert markdown to plain text + Signal textStyles list.
 
-    Signal doesn't render markdown. Instead it uses ``bodyRanges`` (exposed by
-    signal-cli as ``textStyle`` / ``textStyles`` params) with the format
-    ``start:length:STYLE``.
+    Signal doesn't render markdown.  Hermes represents native ``bodyRanges``
+    as ``start:length:STYLE`` strings on the Python side; the persistent
+    signal-ts runtime turns those strings into the SDK's structured ranges.
 
     Positions are measured in UTF-16 code units because that's what the Signal
     protocol uses.

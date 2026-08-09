@@ -296,6 +296,11 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 
 ## Messaging
 
+Signal is the exception in this section: its direct `signal-ts` runtime has no
+user-entered environment variables. Configure linked-device state, SDK path,
+account validation, access policy, and home channel under
+`platforms.signal` in `config.yaml`; see [Signal setup](../user-guide/messaging/signal.md).
+
 | Variable | Description |
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token (from @BotFather) |
@@ -384,13 +389,6 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `WHATSAPP_CLOUD_ALLOW_FROM` | Comma-separated senders allowed when `dm_policy: allowlist` (bare `wa_id`s; Baileys-style JIDs are normalized) |
 | `WHATSAPP_CLOUD_GROUP_POLICY` | Group gating for the Cloud adapter (`open`/`allowlist`/`disabled`); falls back to `WHATSAPP_GROUP_POLICY` when unset |
 | `WHATSAPP_CLOUD_GROUP_ALLOW_FROM` | Comma-separated group chat IDs allowed when `group_policy: allowlist` |
-| `SIGNAL_HTTP_URL` | signal-cli daemon HTTP endpoint (for example `http://127.0.0.1:8080`) |
-| `SIGNAL_ACCOUNT` | Bot phone number in E.164 format |
-| `SIGNAL_ALLOWED_USERS` | Comma-separated E.164 phone numbers or UUIDs |
-| `SIGNAL_GROUP_ALLOWED_USERS` | Comma-separated group IDs, or `*` for all groups |
-| `SIGNAL_HOME_CHANNEL_NAME` | Display name for the Signal home channel |
-| `SIGNAL_IGNORE_STORIES` | Ignore Signal stories/status updates |
-| `SIGNAL_ALLOW_ALL_USERS` | Allow all Signal users without an allowlist |
 | `TWILIO_ACCOUNT_SID` | Twilio Account SID (shared with telephony skill) |
 | `TWILIO_AUTH_TOKEN` | Twilio Auth Token (shared with telephony skill; also used for webhook signature validation) |
 | `TWILIO_PHONE_NUMBER` | Twilio phone number in E.164 format (shared with telephony skill) |

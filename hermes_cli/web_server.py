@@ -7644,10 +7644,15 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
     },
     "signal": {
         "name": "Signal",
-        "description": "Connect through a signal-cli REST bridge.",
-        "docs_url": "https://github.com/bbernhard/signal-cli-rest-api",
-        "env_vars": ("SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT", "SIGNAL_ALLOWED_USERS"),
-        "required_env": ("SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT"),
+        "description": (
+            "Use the persistent direct signal-ts runtime. Configure its SDK and "
+            "linked-device state with `hermes setup gateway`; no external daemon is used."
+        ),
+        "docs_url": (
+            "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/signal"
+        ),
+        "env_vars": (),
+        "required_env": (),
     },
     "whatsapp": {
         "name": "WhatsApp",
@@ -7874,19 +7879,6 @@ _PLATFORM_ORDER: tuple[str, ...] = (
 # toggles, Twilio, HASS, Email, etc.). Anything missing from OPTIONAL_ENV_VARS
 # falls back here so the UI can still render a friendly label.
 _MESSAGING_ENV_FALLBACKS: dict[str, dict[str, Any]] = {
-    "SIGNAL_HTTP_URL": {
-        "description": "signal-cli REST API base URL, e.g. http://127.0.0.1:8080",
-        "prompt": "Signal bridge URL",
-        "url": "https://github.com/bbernhard/signal-cli-rest-api",
-    },
-    "SIGNAL_ACCOUNT": {
-        "description": "Signal account phone number registered with the bridge",
-        "prompt": "Signal account",
-    },
-    "SIGNAL_ALLOWED_USERS": {
-        "description": "Comma-separated Signal users allowed to use the bot",
-        "prompt": "Allowed Signal users",
-    },
     "WHATSAPP_ENABLED": {
         "description": "Enable the WhatsApp gateway adapter",
         "prompt": "Enable WhatsApp",
@@ -8125,6 +8117,11 @@ from hermes_cli.setup_hidden_env import (  # noqa: E402
 
 def _discover_platform_env_vars(platform_id: str) -> tuple[str, ...]:
     """All messaging-category env vars for a platform (override + plugin + prefix)."""
+    # Signal's direct linked-device runtime has no user-entered secret.  Paths,
+    # account validation and access policy belong in config.yaml and are managed
+    # by ``hermes setup gateway``, not by the dashboard's .env editor.
+    if platform_id == "signal":
+        return ()
     prefixes = _platform_env_prefixes(platform_id)
     keys: list[str] = []
     for name, info in OPTIONAL_ENV_VARS.items():
@@ -8285,6 +8282,7 @@ def _messaging_platform_payload(
         # profile's config.yaml + .env only. load_gateway_config()'s
         # env-override layer reads os.environ and would leak the root
         # install's tokens into the profile's reported state.
+        plat_cfg: dict[str, Any] = {}
         try:
             cfg = load_config()
             platforms_cfg = cfg.get("platforms") or {}
@@ -8297,7 +8295,14 @@ def _messaging_platform_payload(
         except Exception:
             enabled = False
             home_channel = None
-        configured = all(env_on_disk.get(key) for key in entry["required_env"])
+        if platform_id == "signal":
+            from gateway.config import PlatformConfig, _signal_direct_runtime_configured
+
+            configured = _signal_direct_runtime_configured(
+                PlatformConfig.from_dict(plat_cfg)
+            )
+        else:
+            configured = all(env_on_disk.get(key) for key in entry["required_env"])
     else:
         try:
             gateway_config, platform, platform_config = _gateway_platform_config(

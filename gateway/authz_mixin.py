@@ -510,7 +510,6 @@ class GatewayAuthorizationMixin:
             Platform.WHATSAPP: "WHATSAPP_ALLOWED_USERS",
             Platform.WHATSAPP_CLOUD: "WHATSAPP_CLOUD_ALLOWED_USERS",
             Platform.SLACK: "SLACK_ALLOWED_USERS",
-            Platform.SIGNAL: "SIGNAL_ALLOWED_USERS",
             Platform.EMAIL: "EMAIL_ALLOWED_USERS",
             Platform.SMS: "SMS_ALLOWED_USERS",
             Platform.MATTERMOST: "MATTERMOST_ALLOWED_USERS",
@@ -537,7 +536,6 @@ class GatewayAuthorizationMixin:
             Platform.WHATSAPP: "WHATSAPP_ALLOW_ALL_USERS",
             Platform.WHATSAPP_CLOUD: "WHATSAPP_CLOUD_ALLOW_ALL_USERS",
             Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
-            Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
             Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
             Platform.SMS: "SMS_ALLOW_ALL_USERS",
             Platform.MATTERMOST: "MATTERMOST_ALLOW_ALL_USERS",
@@ -742,8 +740,7 @@ class GatewayAuthorizationMixin:
         if global_allowlist:
             allowed_ids.update(uid.strip() for uid in global_allowlist.split(",") if uid.strip())
 
-        # "*" in any allowlist means allow everyone (consistent with
-        # SIGNAL_GROUP_ALLOWED_USERS precedent)
+        # "*" in any allowlist means allow everyone across platform policies.
         if "*" in allowed_ids:
             return True
 
@@ -856,7 +853,6 @@ class GatewayAuthorizationMixin:
                 Platform.WHATSAPP: "WHATSAPP_ALLOWED_USERS",
                 Platform.WHATSAPP_CLOUD: "WHATSAPP_CLOUD_ALLOWED_USERS",
                 Platform.SLACK:    "SLACK_ALLOWED_USERS",
-                Platform.SIGNAL:   "SIGNAL_ALLOWED_USERS",
                 Platform.EMAIL:    "EMAIL_ALLOWED_USERS",
                 Platform.SMS:      "SMS_ALLOWED_USERS",
                 Platform.MATTERMOST: "MATTERMOST_ALLOWED_USERS",

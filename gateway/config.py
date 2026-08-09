@@ -835,6 +835,23 @@ def _has_usable_api_server_key(key: object) -> bool:
     return has_usable_secret(key, min_length=16)
 
 
+def _signal_direct_runtime_configured(config: PlatformConfig) -> bool:
+    """Return whether Signal's config-owned direct runtime can start locally."""
+    from gateway.platforms.signal_ts import expand_runtime_path, resolve_node_executable
+
+    extra = config.extra or {}
+    state_path = str(extra.get("state_path") or "").strip()
+    sdk_path = str(extra.get("sdk_path") or "").strip()
+    node_command = str(extra.get("node_command") or "node").strip()
+    return bool(
+        state_path
+        and sdk_path
+        and expand_runtime_path(state_path).is_file()
+        and expand_runtime_path(sdk_path).exists()
+        and resolve_node_executable(node_command)
+    )
+
+
 _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] = {
     Platform.WEIXIN: lambda cfg: bool(
         cfg.extra.get("account_id") and (cfg.token or cfg.extra.get("token"))
@@ -842,7 +859,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.WHATSAPP_CLOUD: lambda cfg: bool(
         cfg.extra.get("phone_number_id") and cfg.extra.get("access_token")
     ),
-    Platform.SIGNAL: lambda cfg: bool(cfg.extra.get("http_url")),
+    Platform.SIGNAL: lambda cfg: _signal_direct_runtime_configured(cfg),
     Platform.API_SERVER: lambda cfg: _has_usable_api_server_key(
         cfg.extra.get("key") if cfg else None
     ),
@@ -1710,12 +1727,6 @@ def load_gateway_config() -> GatewayConfig:
             # apply_yaml_config_fn hook (plugins/platforms/whatsapp/adapter.py).
             # #41112 / #3823.
 
-            # Signal settings → env vars (env vars take precedence)
-            signal_cfg = yaml_cfg.get("signal", {})
-            if isinstance(signal_cfg, dict):
-                if "require_mention" in signal_cfg and not os.getenv("SIGNAL_REQUIRE_MENTION"):
-                    os.environ["SIGNAL_REQUIRE_MENTION"] = str(signal_cfg["require_mention"]).lower()
-
             # DingTalk settings → env vars: migrated to the dingtalk plugin's
             # apply_yaml_config_fn hook (plugins/platforms/dingtalk/adapter.py).
             # #41112 / #3823.
@@ -2004,25 +2015,6 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             scope_id=existing_home.scope_id if existing_home and same_home else None,
         )
     
-    # Signal
-    signal_url = getenv("SIGNAL_HTTP_URL")
-    signal_account = getenv("SIGNAL_ACCOUNT")
-    if signal_url and signal_account:
-        signal_config = _enable_from_env(Platform.SIGNAL)
-        signal_config.extra.update({
-            "http_url": signal_url,
-            "account": signal_account,
-            "ignore_stories": is_truthy_value(getenv("SIGNAL_IGNORE_STORIES", "true")),
-        })
-    signal_home = getenv("SIGNAL_HOME_CHANNEL")
-    if signal_home and Platform.SIGNAL in config.platforms:
-        config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
-            platform=Platform.SIGNAL,
-            chat_id=signal_home,
-            name=getenv("SIGNAL_HOME_CHANNEL_NAME", "Home"),
-            thread_id=getenv("SIGNAL_HOME_CHANNEL_THREAD_ID") or None,
-        )
-
     # Mattermost
     mattermost_token = getenv("MATTERMOST_TOKEN")
     if mattermost_token:

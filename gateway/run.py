@@ -2306,6 +2306,23 @@ _OWN_POLICY_OPEN_ENV = {
 }
 
 
+def _config_has_user_allowlist(config) -> bool:
+    """Return whether any platform has a non-empty config-owned allowlist."""
+    for platform_config in getattr(config, "platforms", {}).values():
+        extra = getattr(platform_config, "extra", {}) or {}
+        if not isinstance(extra, dict):
+            continue
+        for key in ("allow_from", "group_allow_from"):
+            value = extra.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+            if isinstance(value, (list, tuple, set)) and any(
+                str(item).strip() for item in value
+            ):
+                return True
+    return False
+
+
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
     for platform, platform_config in getattr(config, "platforms", {}).items():
@@ -10708,7 +10725,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
             "WHATSAPP_ALLOWED_USERS", "WHATSAPP_CLOUD_ALLOWED_USERS",
             "SLACK_ALLOWED_USERS",
-            "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_CHATS",
             "EMAIL_ALLOWED_USERS",
@@ -10727,7 +10743,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
             "WHATSAPP_ALLOW_ALL_USERS", "WHATSAPP_CLOUD_ALLOW_ALL_USERS",
             "SLACK_ALLOW_ALL_USERS",
-            "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
+            "EMAIL_ALLOW_ALL_USERS",
             "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
             "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
             "FEISHU_ALLOW_ALL_USERS",
@@ -10758,15 +10774,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _any_allowlist = any(
             os.getenv(v) for v in _builtin_allowed_vars + _plugin_allowed_vars
         )
+        if not _any_allowlist:
+            _any_allowlist = _config_has_user_allowlist(self.config)
         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"} or any(
             os.getenv(v, "").lower() in {"true", "1", "yes"}
             for v in _builtin_allow_all_vars + _plugin_allow_all_vars
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(
-                "No env user allowlists configured. Messaging platforms default to "
+                "No user allowlists configured. Messaging platforms default to "
                 "pairing/allowlist policies and will deny unknown senders unless you "
-                "configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id) "
+                "configure a platform allowlist in config.yaml or its credential setup "
                 "or explicitly opt in with GATEWAY_ALLOW_ALL_USERS=true plus "
                 "dm_policy/group_policy: open on the platform."
             )
@@ -13650,16 +13668,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return WhatsAppCloudAdapter(config)
         
         elif platform == Platform.SIGNAL:
-            from gateway.platforms.signal import (
-                SignalAdapter,
-                check_signal_requirements,
-                validate_signal_config,
-            )
-            if not check_signal_requirements():
-                logger.warning("Signal: runtime requirements not met")
-                return None
-            if not validate_signal_config(config):
-                logger.warning("Signal: SIGNAL_HTTP_URL or SIGNAL_ACCOUNT not configured")
+            from gateway.platforms.signal import SignalAdapter, check_signal_requirements
+            if not check_signal_requirements(config):
+                logger.warning(
+                    "Signal: configure existing state_path, sdk_path, and node_command "
+                    "under platforms.signal.extra"
+                )
                 return None
             return SignalAdapter(config)
 

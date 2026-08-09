@@ -185,7 +185,6 @@ def _configured_platforms() -> list[str]:
         "discord": "DISCORD_BOT_TOKEN",
         "slack": "SLACK_BOT_TOKEN",
         "whatsapp": "WHATSAPP_ENABLED",
-        "signal": "SIGNAL_HTTP_URL",
         "email": "EMAIL_ADDRESS",
         "sms": "TWILIO_ACCOUNT_SID",
         "matrix": "MATRIX_HOMESERVER_URL",
@@ -198,7 +197,21 @@ def _configured_platforms() -> list[str]:
         "weixin": "WEIXIN_ACCOUNT_ID",
         "qqbot": "QQ_APP_ID",
     }
-    return [name for name, env in checks.items() if os.getenv(env)]
+    configured = [name for name, env in checks.items() if os.getenv(env)]
+    try:
+        from gateway.config import (
+            Platform,
+            _signal_direct_runtime_configured,
+            load_gateway_config,
+        )
+
+        gateway_config = load_gateway_config()
+        signal_config = gateway_config.platforms.get(Platform.SIGNAL)
+        if signal_config and _signal_direct_runtime_configured(signal_config):
+            configured.append("signal")
+    except Exception:
+        pass
+    return configured
 
 
 def _memory_provider(config: dict) -> str:
