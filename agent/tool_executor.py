@@ -1600,12 +1600,24 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    persist_progress: bool = True,
+) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
     and /steer injection — used when this call is one segment of a larger
     mixed batch and the segmented dispatcher owns the turn-end work.
+
+    ``persist_progress=False`` is used by the Claude loopback bridge, whose
+    outer native turn owns persistence of the canonical transcript.
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
@@ -1642,12 +1654,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     error_type="user_interrupt",
                     error_message="Tool execution skipped due to user interrupt",
                 )
-                if not _flush_session_db_after_tool_progress(
-                    agent,
-                    messages,
-                    stage=f"cancelled tool result {skipped_name}",
-                ):
-                    return
+                if persist_progress:
+                    if not _flush_session_db_after_tool_progress(
+                        agent,
+                        messages,
+                        stage=f"cancelled tool result {skipped_name}",
+                    ):
+                        return
             break
 
         function_name = tool_call.function.name
@@ -1674,12 +1687,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call.id,
                 )
             )
-            if not _flush_session_db_after_tool_progress(
-                agent,
-                messages,
-                stage=f"invalid tool arguments {function_name}",
-            ):
-                return
+            if persist_progress:
+                if not _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"invalid tool arguments {function_name}",
+                ):
+                    return
             continue
 
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
@@ -2266,12 +2280,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
-        if not _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage=f"tool result {function_name}",
-        ):
-            return
+        if persist_progress:
+            if not _flush_session_db_after_tool_progress(
+                agent,
+                messages,
+                stage=f"tool result {function_name}",
+            ):
+                return
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
@@ -2337,12 +2352,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skipped_tc.id,
                     effect_disposition="none",
                 ))
-                if not _flush_session_db_after_tool_progress(
-                    agent,
-                    messages,
-                    stage=f"skipped tool result {skipped_name}",
-                ):
-                    return
+                if persist_progress:
+                    if not _flush_session_db_after_tool_progress(
+                        agent,
+                        messages,
+                        stage=f"skipped tool result {skipped_name}",
+                    ):
+                        return
             break
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────

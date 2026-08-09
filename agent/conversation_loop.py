@@ -1631,6 +1631,20 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    # Claude Code stream-json runtime. Like codex_app_server, Claude owns the
+    # model/tool loop; Hermes tools are called through an authenticated MCP
+    # loopback bound to this live AIAgent. The child and its native history are
+    # retained across turns for low first-token latency.
+    if agent.api_mode == "claude_cli":
+        return agent._run_claude_cli_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            active_system_prompt=active_system_prompt or "",
+            should_review_memory=_should_review_memory,
+        )
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:

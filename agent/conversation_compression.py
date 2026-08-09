@@ -2227,6 +2227,13 @@ def compress_context(
     except Exception:
         pass
 
+    # Claude CLI owns the native conversation and performs its own compaction.
+    # Rewriting Hermes' local mirror cannot shrink that live context and would
+    # make crash-recovery history diverge from what Claude actually saw.
+    if getattr(agent, "api_mode", None) == "claude_cli":
+        logger.info("Claude CLI owns native context compaction; Hermes compression skipped")
+        return messages, getattr(agent, "_cached_system_prompt", None) or system_message
+
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking
     # the actual thread (#36801). Route compaction to the app server's own

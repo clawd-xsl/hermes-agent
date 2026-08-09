@@ -169,6 +169,21 @@ model:
   default: "claude-sonnet-4-6"
 ```
 
+If Hermes is your always-on personal assistant and first-token latency matters,
+you can let a persistent Claude Code process own the model session while Hermes
+continues to own channels, memory, skills, approvals, and tools:
+
+```yaml
+model:
+  provider: "anthropic"
+  default: "claude-sonnet-4-6"
+  anthropic_runtime: "claude_cli"
+```
+
+This path uses Claude Code's own login and subscription allowance; Hermes does
+not copy its OAuth bearer or run a second HTTP model client. See
+[Persistent Claude CLI Runtime](/user-guide/features/claude-cli-runtime).
+
 :::tip Aliases
 `--provider claude` and `--provider claude-code` also work as shorthand for `--provider anthropic`.
 :::

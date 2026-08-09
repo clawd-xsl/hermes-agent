@@ -3178,6 +3178,16 @@ class AIAgent:
                 _abort_active_request("interrupt_abort")
             except Exception:
                 logger.debug("Failed to abort active inline request", exc_info=True)
+
+        # The Claude stream-json runtime owns a persistent subprocess rather
+        # than an interruptible HTTP request. Terminate that child immediately;
+        # the runtime retires it and resumes native history on the next turn.
+        _claude_session = getattr(self, "_claude_cli_session", None)
+        if _claude_session is not None:
+            try:
+                _claude_session.interrupt()
+            except Exception:
+                logger.debug("Failed to interrupt Claude CLI session", exc_info=True)
         # Signal all tools to abort any in-flight operations immediately.
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
@@ -4384,6 +4394,17 @@ class AIAgent:
             if codex_session is not None:
                 self._codex_session = None
                 codex_session.close()
+        except Exception:
+            pass
+
+        # 6d. A hard conversation boundary (/new, /reset, expiry) also owns
+        # the persistent Claude native process. Soft cache eviction deliberately
+        # leaves it pooled so rebuilding the AIAgent does not add cold-start
+        # latency; close() must remove it so the new session gets clean history.
+        try:
+            from agent.claude_cli_runtime import release_claude_cli_session
+
+            release_claude_cli_session(self)
         except Exception:
             pass
 
@@ -8083,6 +8104,29 @@ class AIAgent:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+
+    def _run_claude_cli_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+        active_system_prompt: str,
+        should_review_memory: bool = False,
+    ) -> Dict[str, Any]:
+        """Forward one turn to the persistent Claude Code runtime."""
+        from agent.claude_cli_runtime import run_claude_cli_turn
+
+        return run_claude_cli_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            active_system_prompt=active_system_prompt,
+            should_review_memory=should_review_memory,
+        )
 
 def main(
     query: str = None,
