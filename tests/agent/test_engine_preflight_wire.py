@@ -117,6 +117,18 @@ def test_default_false_hook_is_byte_identical_noop():
     assert ctx.preflight_compression_blocked is False
 
 
+def test_native_history_runtime_skips_engine_preflight():
+    hook = MagicMock(return_value=True)
+    agent = _make_agent(_stub_compressor(preflight=hook))
+    agent.api_mode = "claude_cli"
+
+    ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    hook.assert_not_called()
+    agent._compress_context.assert_not_called()
+
+
 
 
 

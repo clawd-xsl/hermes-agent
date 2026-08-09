@@ -967,7 +967,7 @@ def build_turn_context(
             # cooldown, deferred estimate, or codex-native route must keep
             # the engine hook un-consulted (#20316 contract — the cooldown
             # exists precisely because compression recently failed).
-            if _compression_cooldown or _preflight_deferred or _codex_native_auto:
+            if _compression_cooldown or _preflight_deferred or _native_runtime_auto:
                 _engine_preflight = None
             else:
                 _engine_preflight = getattr(
