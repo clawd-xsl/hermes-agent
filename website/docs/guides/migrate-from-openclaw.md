@@ -25,6 +25,9 @@ hermes claw migrate
 # Preview only, no changes
 hermes claw migrate --dry-run
 
+# Minimal one-account personal-assistant continuity
+hermes claw migrate --preset personal-assistant
+
 # Full migration including API keys, skip confirmation
 hermes claw migrate --preset full --migrate-secrets --yes
 ```
@@ -38,7 +41,7 @@ Reads from `~/.openclaw/` by default. Legacy `~/.clawdbot/` or `~/.moltbot/` dir
 | Option | Description |
 |--------|-------------|
 | `--dry-run` | Preview only — stop after showing what would be migrated. |
-| `--preset <name>` | `full` (all compatible settings) or `user-data` (excludes infrastructure config). Neither preset imports secrets by default — pass `--migrate-secrets` explicitly. |
+| `--preset <name>` | `personal-assistant` (persona/memory/skills + direct Signal + current chat + persistent Claude + main-context automation), `user-data` (broader user footprint), or `full` (all compatible data categories). No preset imports secrets by default. |
 | `--overwrite` | Overwrite existing Hermes files on conflicts (default: refuse to apply when the plan has conflicts). |
 | `--migrate-secrets` | Include API keys. Required even under `--preset full` — no preset imports secrets silently. |
 | `--no-backup` | Skip the pre-migration zip snapshot of `~/.hermes/` (by default a single restore-point archive is written before apply, under `~/.hermes/backups/pre-migration-*.zip`; restorable with `hermes import`). |
@@ -60,6 +63,34 @@ Reads from `~/.openclaw/` by default. Legacy `~/.clawdbot/` or `~/.moltbot/` dir
 | Daily memory files | `workspace/memory/*.md` | `~/.hermes/memories/MEMORY.md` | All daily files merged into main memory. |
 
 Workspace files are also checked at `workspace.default/` and `workspace-main/` as fallback paths (OpenClaw renamed `workspace/` to `workspace-main/` in recent versions, and uses `workspace-{agentId}` for multi-agent setups).
+
+### Current Signal conversation
+
+The `personal-assistant` preset imports the latest complete user/assistant branch
+from the OpenClaw main Signal transcript and binds it to Hermes' real Signal DM
+session. It does not generate a migration summary and does not import tool
+results, reasoning blocks, hidden OpenClaw prompt context, abandoned rewrite
+branches, or an incomplete trailing user turn. If OpenClaw compacted the
+transcript, only the complete visible conversation after the latest compaction
+boundary is carried over; long-term facts come from the separately migrated
+memory files.
+
+Provider-native session IDs are intentionally not copied across runtimes. On the
+first Hermes Claude turn, the imported transcript seeds Hermes' persistent
+native backend; subsequent turns reuse that live provider session.
+
+### Persistent Claude runtime
+
+The `personal-assistant` preset configures `model.anthropic_runtime:
+claude_cli`. An existing Anthropic Claude model is preserved; otherwise the
+preset uses `claude-sonnet-4-6`. A non-Claude Hermes model is treated as a
+conflict and is never replaced without `--overwrite`.
+
+This runtime keeps one Claude Code process and native session alive across
+turns and gateway restarts. Claude owns native history rollover and compaction,
+so Hermes does not add a second session summary. Install Claude Code, run
+`claude login`, and install the Hermes MCP extra before starting the migrated
+assistant. See [Persistent Claude CLI Runtime](/user-guide/features/claude-cli-runtime).
 
 ### Skills (4 sources)
 
@@ -148,9 +179,9 @@ TTS settings are read from **two** OpenClaw config locations with this priority:
 | Slack | `channels.slack.appToken` or `.accounts.default.appToken` | `SLACK_APP_TOKEN` | |
 | Slack | `channels.slack.allowFrom` or `.accounts.default.allowFrom` | `SLACK_ALLOWED_USERS` | |
 | WhatsApp | `channels.whatsapp.allowFrom` or `.accounts.default.allowFrom` | `WHATSAPP_ALLOWED_USERS` | Auth via Baileys QR pairing — requires re-pairing after migration |
-| Signal | `channels.signal.account` or `.accounts.default.account` | `SIGNAL_ACCOUNT` | |
-| Signal | `channels.signal.httpUrl` or `.accounts.default.httpUrl` | `SIGNAL_HTTP_URL` | |
-| Signal | `channels.signal.allowFrom` or `.accounts.default.allowFrom` | `SIGNAL_ALLOWED_USERS` | |
+| Signal account and allowlist | `channels.signal.account`, `.allowFrom` | `config.yaml` → `platforms.signal.extra` | Configures Hermes' persistent direct runtime and Signal home channel. |
+| Signal linked-device state | `channels.signal.signalTsStatePath` or `~/.openclaw/signal-ts/default.json` | `~/.hermes/signal-ts/default.json` | Copied with owner-only permissions. Stop OpenClaw before starting Hermes; only one process may own this protocol state. |
+| Signal SDK | Built `clawd-xsl/signal-ts` checkout beside OpenClaw/Hermes | `config.yaml` → `platforms.signal.extra.sdk_path` | Must contain `package.json` and built `dist/index.js`. Legacy `httpUrl` / signal-cli RPC settings are not migrated. |
 | Matrix | `channels.matrix.accessToken` or `.accounts.default.accessToken` | `MATRIX_ACCESS_TOKEN` | Uses `accessToken` (not `botToken`) |
 | Mattermost | `channels.mattermost.botToken` or `.accounts.default.botToken` | `MATTERMOST_BOT_TOKEN` | |
 
@@ -166,6 +197,22 @@ TTS settings are read from **two** OpenClaw config locations with this priority:
 | Gateway auth token | `gateway.auth.token` | `.env` → `HERMES_GATEWAY_TOKEN` | Requires `--migrate-secrets` |
 | Working directory | `agents.defaults.workspace` | `config.yaml` → `terminal.cwd` | Legacy migrations may still emit `MESSAGING_CWD` as a compatibility fallback |
 
+### Scheduled tasks and external pushes
+
+Compatible OpenClaw `agentTurn` and `systemEvent` cron jobs using one-shot,
+whole-minute interval, or cron schedules are converted into Hermes jobs. The
+original cron store is also archived for audit because delivery fallbacks,
+failure alerts, and other OpenClaw-specific fields are not one-to-one.
+
+Under `personal-assistant`, imported jobs use `session: main`, and the migration
+sets both `cron.session: main` and
+`platforms.webhook.extra.session: main`. A fire or authenticated webhook request
+therefore enters the exact Signal main-session FIFO with its full conversation,
+memory, skills, model choice, and persistent provider backend. Per-job or
+per-route `session: isolated` remains available when isolation is intentional.
+OpenClaw hook definitions are archived rather than mechanically translated;
+recreate only the external routes you still need with `hermes webhook`.
+
 ### Archived (no direct Hermes equivalent)
 
 These are saved to `~/.hermes/migration/openclaw/<timestamp>/archive/` for manual review:
@@ -176,7 +223,7 @@ These are saved to `~/.hermes/migration/openclaw/<timestamp>/archive/` for manua
 | `TOOLS.md` | `archive/workspace/TOOLS.md` | Hermes has built-in tool instructions |
 | `HEARTBEAT.md` | `archive/workspace/HEARTBEAT.md` | Use cron jobs for periodic tasks |
 | `BOOTSTRAP.md` | `archive/workspace/BOOTSTRAP.md` | Use context files or skills |
-| Cron jobs | `archive/cron-config.json` | Recreate with `hermes cron create` |
+| Unsupported cron fields/jobs | `archive/cron-config.json` / `archive/cron-store/` | Review skipped-job reasons; recreate only unsupported jobs with `hermes cron create` |
 | Plugins | `archive/plugins-config.json` | See [plugins guide](/user-guide/features/hooks) |
 | Hooks/webhooks | `archive/hooks-config.json` | Use `hermes webhook` or gateway hooks |
 | Memory backend | `archive/memory-backend-config.json` | Configure via `hermes honcho` |
@@ -227,17 +274,19 @@ The migration resolves all three formats. For env templates and SecretRef object
 
 2. **Review archived files** — anything in `~/.hermes/migration/openclaw/<timestamp>/archive/` needs manual attention.
 
-3. **Start a new session** — imported skills and memory entries take effect in new sessions, not the current one.
+3. **Stop OpenClaw before starting Hermes** — the direct Signal runtime requires exclusive ownership of the copied linked-device state.
 
-4. **Verify API keys** — run `hermes status` to check provider authentication.
+4. **Check Claude Code** — make sure `claude` is installed and logged in and the Hermes MCP extra is installed. The migration report warns when the command is not on `PATH`.
 
-5. **Test messaging** — if you migrated platform tokens, restart the gateway: `systemctl --user restart hermes-gateway`
+5. **Start Hermes** — with `personal-assistant`, the imported Signal conversation is already the active main session. Do not `/reset`; its first turn establishes the new provider-native Claude session and later turns reuse it.
 
-6. **Check session policies** — run `hermes config show` and verify the `session_reset` value matches your expectations.
+6. **Verify authentication** — run `hermes status`, then send one Signal message and verify the existing conversation continues.
 
-7. **Re-pair WhatsApp** — WhatsApp uses QR code pairing (Baileys), not token migration. Run `hermes whatsapp` to pair.
+7. **Check session policies** — run `hermes config show` and verify the `session_reset` value matches your expectations.
 
-8. **Archive cleanup** — after confirming everything works, run `hermes claw cleanup` to rename leftover OpenClaw directories to `.pre-migration/` (prevents state confusion).
+8. **Re-pair WhatsApp** — WhatsApp uses QR code pairing (Baileys), not token migration. Run `hermes whatsapp` to pair.
+
+9. **Archive cleanup** — after confirming everything works, run `hermes claw cleanup` to rename leftover OpenClaw directories to `.pre-migration/` (prevents state confusion).
 
 ## Troubleshooting
 
