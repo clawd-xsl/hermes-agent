@@ -168,7 +168,7 @@ plugins/platforms/                  # plugin-packaged adapters (one dir each)
 
 gateway/platforms/                  # core base + legacy direct adapters
 ├── base.py              # BasePlatformAdapter — shared logic for all platforms
-├── signal.py            # Signal via signal-cli REST API
+├── signal.py            # Signal via a persistent direct signal-ts sidecar
 ├── weixin.py            # Weixin (personal WeChat) via iLink Bot API
 ├── bluebubbles.py       # Apple iMessage via BlueBubbles macOS server
 ├── qqbot/               # QQ Bot (Tencent QQ) via Official API v2 (sub-package)

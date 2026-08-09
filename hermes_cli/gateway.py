@@ -48,6 +48,7 @@ from hermes_cli.config import (
     is_managed,
     managed_error,
     read_raw_config,
+    save_config,
     save_env_value,
     write_platform_config_field,
 )
@@ -5447,7 +5448,7 @@ _PLATFORMS = [
         "key": "signal",
         "label": "Signal",
         "emoji": "📡",
-        "token_var": "SIGNAL_HTTP_URL",
+        "token_var": "",
     },
     # Email and SMS moved to plugins/platforms/{email,sms}/ — setup metadata
     # discovered dynamically via the platform registry entries registered by
@@ -5635,6 +5636,56 @@ def _all_platforms() -> list[dict]:
     return platforms
 
 
+def _read_signal_runtime_config() -> dict:
+    """Read Signal's config-owned runtime settings from config.yaml."""
+    raw = read_raw_config()
+    merged: dict = {}
+    gateway_section = raw.get("gateway")
+    sources = []
+    if isinstance(gateway_section, dict):
+        sources.append(gateway_section.get("platforms"))
+    sources.append(raw.get("platforms"))
+    for platforms in sources:
+        if not isinstance(platforms, dict):
+            continue
+        signal_config = platforms.get("signal")
+        if not isinstance(signal_config, dict):
+            continue
+        merged.update({key: value for key, value in signal_config.items() if key != "extra"})
+        extra = signal_config.get("extra")
+        if isinstance(extra, dict):
+            merged.update(extra)
+    return merged
+
+
+def _write_signal_runtime_config(
+    values: dict, *, home_channel: str | None = None
+) -> None:
+    """Persist Signal settings under ``platforms.signal.extra``."""
+    config = read_raw_config()
+    platforms = config.setdefault("platforms", {})
+    if not isinstance(platforms, dict):
+        platforms = {}
+        config["platforms"] = platforms
+    signal_config = platforms.setdefault("signal", {})
+    if not isinstance(signal_config, dict):
+        signal_config = {}
+        platforms["signal"] = signal_config
+    signal_config["enabled"] = True
+    extra = signal_config.setdefault("extra", {})
+    if not isinstance(extra, dict):
+        extra = {}
+        signal_config["extra"] = extra
+    extra.update(values)
+    if home_channel:
+        signal_config["home_channel"] = {
+            "platform": "signal",
+            "chat_id": home_channel,
+            "name": "Signal home",
+        }
+    save_config(config)
+
+
 def _platform_status(platform: dict) -> str:
     """Return a plain-text status string for a platform.
 
@@ -5666,6 +5717,25 @@ def _platform_status(platform: dict) -> str:
                 configured = False
         return "configured" if configured else "not configured"
 
+    if platform.get("key") == "signal":
+        signal_config = _read_signal_runtime_config()
+        state_path = str(signal_config.get("state_path") or "").strip()
+        sdk_path = str(signal_config.get("sdk_path") or "").strip()
+        node_command = str(signal_config.get("node_command") or "node").strip()
+        from gateway.platforms.signal_ts import resolve_node_executable
+
+        if (
+            state_path
+            and sdk_path
+            and Path(state_path).expanduser().is_file()
+            and Path(sdk_path).expanduser().exists()
+            and resolve_node_executable(node_command)
+        ):
+            return "configured"
+        if state_path or sdk_path:
+            return "partially configured"
+        return "not configured"
+
     token_var = platform.get("token_var", "")
     if not token_var:
         return "not configured"
@@ -5676,13 +5746,6 @@ def _platform_status(platform: dict) -> str:
             if session_file.exists():
                 return "configured + paired"
             return "enabled, not paired"
-        return "not configured"
-    if platform.get("key") == "signal":
-        account = get_env_value("SIGNAL_ACCOUNT")
-        if val and account:
-            return "configured"
-        if val or account:
-            return "partially configured"
         return "not configured"
     if platform.get("key") == "email":
         pwd = get_env_value("EMAIL_PASSWORD")
@@ -6353,134 +6416,118 @@ def _setup_qqbot():
 
 
 def _setup_signal():
-    """Interactive setup for Signal messenger."""
-    import shutil
+    """Configure Hermes' persistent direct signal-ts runtime."""
+    from gateway.platforms.signal_ts import resolve_node_executable
 
     print()
     print(color("  ─── 📡 Signal Setup ───", Colors.CYAN))
 
-    existing_url = get_env_value("SIGNAL_HTTP_URL")
-    existing_account = get_env_value("SIGNAL_ACCOUNT")
-    if existing_url and existing_account:
+    existing = _read_signal_runtime_config()
+    if existing.get("state_path") and existing.get("sdk_path"):
         print()
         print_success("Signal is already configured.")
         if not prompt_yes_no("  Reconfigure Signal?", False):
             return
 
-    # Check if signal-cli is available
+    print_info("  Hermes embeds signal-ts directly; no signal-cli daemon or Java process is used.")
+    print_info("  The SDK checkout must be built once (`pnpm install && pnpm build`).")
+
+    default_node = str(existing.get("node_command") or shutil.which("node") or "node")
+    node_command = prompt("  Node executable", default=default_node).strip() or default_node
+    resolved_node = resolve_node_executable(node_command)
+    if not resolved_node:
+        print_error(f"  Node executable is not runnable: {node_command}")
+        return
+    node_command = resolved_node
+
+    sibling_sdk = PROJECT_ROOT.parent / "signal-ts"
+    default_sdk = str(existing.get("sdk_path") or (sibling_sdk if sibling_sdk.exists() else ""))
     print()
-    if shutil.which("signal-cli"):
-        print_success("signal-cli found on PATH.")
+    print_info("  Path to the clawd-xsl/signal-ts checkout (package.json directory).")
+    sdk_path = Path(prompt("  signal-ts SDK path", default=default_sdk).strip()).expanduser()
+    if not (sdk_path / "package.json").is_file() or not (sdk_path / "dist" / "index.js").is_file():
+        print_error("  SDK path must contain package.json and built dist/index.js.")
+        print_info("  Build it with: pnpm install --frozen-lockfile && pnpm build")
+        return
+
+    default_state = str(
+        existing.get("state_path") or (get_hermes_home() / "signal-ts" / "default.json")
+    )
+    print()
+    print_info("  Path to durable linked-device state created by signal-ts/OpenClaw.")
+    state_path = Path(prompt("  Signal state file", default=default_state).strip()).expanduser()
+    if not state_path.is_file():
+        print_error(f"  Signal state file does not exist: {state_path}")
+        return
+
+    account = prompt(
+        "  Expected Signal number (E.164, optional)",
+        default=str(existing.get("account") or ""),
+    ).strip()
+
+    existing_home = existing.get("home_channel")
+    existing_home_id = (
+        str(existing_home.get("chat_id") or "")
+        if isinstance(existing_home, dict)
+        else ""
+    )
+    home_channel = prompt(
+        "  Home conversation for cron/notifications (optional)",
+        default=existing_home_id or account,
+    ).strip()
+
+    existing_allowed = existing.get("allow_from") or []
+    if isinstance(existing_allowed, list):
+        existing_allowed_text = ",".join(str(value) for value in existing_allowed)
     else:
-        print_warning("signal-cli not found on PATH.")
-        print_info("  Signal requires signal-cli running as an HTTP daemon.")
-        print_info("  Install options:")
-        print_info(
-            "    Linux:  download from https://github.com/AsamK/signal-cli/releases"
-        )
-        print_info("    macOS:  brew install signal-cli")
-        print_info("    Docker: bbernhard/signal-cli-rest-api")
-        print()
-        print_info("  After installing, link your account and start the daemon:")
-        print_info('    signal-cli link -n "HermesAgent"')
-        print_info("    signal-cli --account +YOURNUMBER daemon --http 127.0.0.1:8080")
-        print()
-
-    # HTTP URL
+        existing_allowed_text = str(existing_allowed)
+    default_allowed = existing_allowed_text or account
     print()
-    print_info("  Enter the URL where signal-cli HTTP daemon is running.")
-    default_url = existing_url or "http://127.0.0.1:8080"
-    try:
-        url = input(f"  HTTP URL [{default_url}]: ").strip() or default_url
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Setup cancelled.")
-        return
-
-    # Test connectivity
-    print_info("  Testing connection...")
-    try:
-        import httpx
-
-        resp = httpx.get(f"{url.rstrip('/')}/api/v1/check", timeout=10.0)
-        if resp.status_code == 200:
-            print_success("  signal-cli daemon is reachable!")
-        else:
-            print_warning(f"  signal-cli responded with status {resp.status_code}.")
-            if not prompt_yes_no("  Continue anyway?", False):
-                return
-    except Exception as e:
-        print_warning(f"  Could not reach signal-cli at {url}: {e}")
-        if not prompt_yes_no(
-            "  Save this URL anyway? (you can start signal-cli later)", True
-        ):
-            return
-
-    save_env_value("SIGNAL_HTTP_URL", url)
-
-    # Account phone number
-    print()
-    print_info("  Enter your Signal account phone number in E.164 format.")
-    print_info("  Example: +15551234567")
-    default_account = existing_account or ""
-    try:
-        account = input(
-            f"  Account number{f' [{default_account}]' if default_account else ''}: "
-        ).strip()
-        if not account:
-            account = default_account
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Setup cancelled.")
-        return
-
-    if not account:
-        print_error("  Account number is required.")
-        return
-
-    save_env_value("SIGNAL_ACCOUNT", account)
-
-    # Allowed users
-    print()
-    print_info("  The gateway DENIES all users by default for security.")
-    print_info("  Enter phone numbers or UUIDs of allowed users (comma-separated).")
-    existing_allowed = get_env_value("SIGNAL_ALLOWED_USERS") or ""
-    default_allowed = existing_allowed or account
-    try:
-        allowed = (
-            input(f"  Allowed users [{default_allowed}]: ").strip() or default_allowed
-        )
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Setup cancelled.")
-        return
-
-    save_env_value("SIGNAL_ALLOWED_USERS", allowed)
+    print_info("  Enter phone numbers or ACIs allowed to use this personal assistant.")
+    allowed_text = prompt("  Allowed users (comma-separated)", default=default_allowed).strip()
+    allowed = [value.strip() for value in allowed_text.split(",") if value.strip()]
+    if not allowed:
+        print_warning("  No allowlist saved; unknown DMs will use Hermes pairing mode.")
 
     # Group messaging
     print()
-    if prompt_yes_no(
-        "  Enable group messaging? (disabled by default for security)", False
-    ):
+    groups: list[str] = []
+    existing_groups = existing.get("group_allow_from") or []
+    groups_enabled = bool(existing_groups)
+    if prompt_yes_no("  Enable group messaging? (disabled by default)", groups_enabled):
         print()
         print_info("  Enter group IDs to allow, or * for all groups.")
-        existing_groups = get_env_value("SIGNAL_GROUP_ALLOWED_USERS") or ""
-        try:
-            groups = (
-                input(f"  Group IDs [{existing_groups or '*'}]: ").strip()
-                or existing_groups
-                or "*"
-            )
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Setup cancelled.")
-            return
-        save_env_value("SIGNAL_GROUP_ALLOWED_USERS", groups)
+        existing_groups_text = (
+            ",".join(str(value) for value in existing_groups)
+            if isinstance(existing_groups, list)
+            else str(existing_groups)
+        )
+        groups_text = prompt(
+            "  Allowed group IDs",
+            default=existing_groups_text or "*",
+        ).strip()
+        groups = [value.strip() for value in groups_text.split(",") if value.strip()]
+
+    values = {
+        "node_command": node_command,
+        "sdk_path": str(sdk_path.resolve()),
+        "state_path": str(state_path.resolve()),
+        "allow_from": allowed,
+        "group_allow_from": groups,
+        "ignore_stories": True,
+    }
+    if account:
+        values["account"] = account
+    _write_signal_runtime_config(values, home_channel=home_channel or None)
 
     print()
     print_success("Signal configured!")
-    print_info(f"  URL: {url}")
-    print_info(f"  Account: {account}")
-    print_info("  DM auth: via SIGNAL_ALLOWED_USERS + DM pairing")
-    print_info(
-        f"  Groups: {'enabled' if get_env_value('SIGNAL_GROUP_ALLOWED_USERS') else 'disabled'}"
-    )
+    print_info(f"  Runtime: {node_command} + {sdk_path}")
+    print_info(f"  State: {state_path}")
+    print_info(f"  Account: {account or 'validated from state at startup'}")
+    print_info(f"  DM auth: {'allowlist' if allowed else 'pairing'}")
+    print_info(f"  Groups: {'enabled' if groups else 'disabled'}")
+    print_info(f"  Home: {home_channel or 'set later with /set-home'}")
 
 
 def _builtin_setup_fn(key: str):
