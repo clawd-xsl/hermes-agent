@@ -314,6 +314,9 @@ class GatewayStreamConsumer:
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
         self._before_finalize_notified = False
+        self._trace_started_at = time.monotonic()
+        self._first_delta_at: Optional[float] = None
+        self._first_visible_at: Optional[float] = None
 
     def _metadata_for_send(
         self,
@@ -362,6 +365,33 @@ class GatewayStreamConsumer:
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
 
+    def _record_platform_delivery(
+        self,
+        *,
+        kind: str,
+        started_at: float,
+        final: bool = False,
+    ) -> None:
+        """Log model-to-platform visibility without recording message content."""
+        now = time.monotonic()
+        if self._first_visible_at is None:
+            self._first_visible_at = now
+            logger.info(
+                "Stream first visible (chat=%s transport=%s elapsed_ms=%d api_ms=%d)",
+                self.chat_id,
+                kind,
+                int((now - self._trace_started_at) * 1000),
+                int((now - started_at) * 1000),
+            )
+        if final:
+            logger.info(
+                "Stream final visible (chat=%s transport=%s elapsed_ms=%d api_ms=%d)",
+                self.chat_id,
+                kind,
+                int((now - self._trace_started_at) * 1000),
+                int((now - started_at) * 1000),
+            )
+
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
         if self._before_finalize_notified:
@@ -403,7 +433,15 @@ class GatewayStreamConsumer:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        started_at = time.monotonic()
+        result = await self.adapter.edit_message(**kwargs)
+        if getattr(result, "success", False):
+            self._record_platform_delivery(
+                kind="edit",
+                started_at=started_at,
+                final=finalize,
+            )
+        return result
 
     def _record_turn_final_payload(self, text: str) -> None:
         """Record the exact cleaned payload of a turn-final delivery.
@@ -573,6 +611,13 @@ class GatewayStreamConsumer:
         appears below any tool-progress messages the gateway sent in between.
         """
         if text:
+            if self._first_delta_at is None:
+                self._first_delta_at = time.monotonic()
+                logger.info(
+                    "Stream first delta (chat=%s elapsed_ms=%d)",
+                    self.chat_id,
+                    int((self._first_delta_at - self._trace_started_at) * 1000),
+                )
             self._queue.put(text)
         elif text is None:
             self.on_segment_break()
@@ -1220,6 +1265,7 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
+            started_at = time.monotonic()
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
@@ -1227,6 +1273,11 @@ class GatewayStreamConsumer:
                 metadata=self._metadata_for_send(final=final, expect_edits=True),
             )
             if result.success and result.message_id:
+                self._record_platform_delivery(
+                    kind="send",
+                    started_at=started_at,
+                    final=final,
+                )
                 self._message_id = str(result.message_id)
                 self._track_preview_ids_from_result(result)
                 self._already_sent = True
@@ -1674,6 +1725,7 @@ class GatewayStreamConsumer:
             self._use_draft_streaming = False
             return False
         try:
+            started_at = time.monotonic()
             result = await self.adapter.send_draft(
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
@@ -1695,6 +1747,10 @@ class GatewayStreamConsumer:
             self._draft_failures += 1
             self._use_draft_streaming = False
             return False
+        self._record_platform_delivery(
+            kind="draft",
+            started_at=started_at,
+        )
         # Frame delivered.  Track text for parity with edit-based no-op skip.
         self._last_sent_text = text
         return True
@@ -2302,6 +2358,7 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
+                started_at = time.monotonic()
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
@@ -2312,6 +2369,11 @@ class GatewayStreamConsumer:
                     ),
                 )
                 if result.success:
+                    self._record_platform_delivery(
+                        kind="send",
+                        started_at=started_at,
+                        final=finalize,
+                    )
                     if result.message_id:
                         self._message_id = result.message_id
                         # Track when the preview first became visible to
