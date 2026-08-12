@@ -1549,7 +1549,18 @@ def restore_primary_runtime(agent) -> bool:
             agent._use_native_cache_layout = False
 
         # ── Rebuild client for the primary provider ──
-        if agent.provider == "moa":
+        if agent.api_mode == "claude_cli":
+            # Subscription-backed Claude Code has no HTTP inference client or
+            # credential by design. Reconstructing OpenAI from the empty
+            # client_kwargs snapshot raises and leaves fallback restoration
+            # half-applied on every subsequent turn.
+            agent.client = None
+            agent._anthropic_client = None
+            agent.api_key = ""
+            agent._client_kwargs = {}
+            agent._claude_cli_command = rt.get("claude_cli_command")
+            agent._claude_cli_args = list(rt.get("claude_cli_args") or [])
+        elif agent.provider == "moa":
             # MoA is a virtual chat-completions provider.  It never has real
             # OpenAI client kwargs; restoring it after a fallback must recreate
             # the facade, not call OpenAI() with an empty api_key.  Use the
@@ -1840,17 +1851,27 @@ def dump_api_request_debug(
         except Exception as e:
             _ra().logger.debug("Could not extract API key for debug dump: %s", e)
 
+        if getattr(agent, "api_mode", None) == "claude_cli":
+            request_url = "claude-cli://local/stream-json"
+            request_headers = {"Content-Type": "application/jsonl"}
+        else:
+            request_url = (
+                f"{agent.base_url.rstrip('/')}"
+                f"{'/responses' if agent.api_mode == 'codex_responses' else '/chat/completions'}"
+            )
+            request_headers = {
+                "Authorization": f"Bearer {agent._mask_api_key_for_logs(api_key)}",
+                "Content-Type": "application/json",
+            }
+
         dump_payload: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "session_id": agent.session_id,
             "reason": reason,
             "request": {
                 "method": "POST",
-                "url": f"{agent.base_url.rstrip('/')}{'/responses' if agent.api_mode == 'codex_responses' else '/chat/completions'}",
-                "headers": {
-                    "Authorization": f"Bearer {agent._mask_api_key_for_logs(api_key)}",
-                    "Content-Type": "application/json",
-                },
+                "url": request_url,
+                "headers": request_headers,
                 "body": body,
             },
         }
@@ -2415,6 +2436,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_api_key",
             "_anthropic_base_url",
             "_is_anthropic_oauth",
+            "_claude_cli_command",
+            "_claude_cli_args",
             "_config_context_length",
         )
     }
@@ -2465,7 +2488,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # to keep the current URL. See #47828.
         old_norm_provider = (old_provider or "").strip().lower()
         new_norm_provider = (new_provider or "").strip().lower()
-        if base_url:
+        if api_mode == "claude_cli":
+            # Subscription-backed Claude Code owns its transport and auth. It
+            # deliberately has neither an HTTP endpoint nor a copied bearer,
+            # so the normal cross-provider base_url guard must not reject it.
+            agent.base_url = ""
+        elif base_url:
             agent.base_url = base_url
         elif old_norm_provider != new_norm_provider:
             raise ValueError(
@@ -2474,10 +2502,17 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "refusing to keep the previous provider's endpoint"
             )
         agent.api_mode = api_mode
+        if api_mode == "claude_cli" and _snapshot.get("api_mode") != "claude_cli":
+            # A live switch/fallback into Claude uses model.claude_cli config.
+            # Do not inherit another subprocess transport's command/args.
+            agent._claude_cli_command = None
+            agent._claude_cli_args = []
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
-        if api_key:
+        if api_mode == "claude_cli":
+            agent.api_key = ""
+        elif api_key:
             agent.api_key = api_key
 
         # ── Reload credential pool for the new provider (issue #52727) ──
@@ -2490,7 +2525,13 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # logged + swallowed: the switch itself must still complete.
         old_norm = (old_provider or "").strip().lower()
         new_norm = (new_provider or "").strip().lower()
-        if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
+        if api_mode == "claude_cli":
+            # The Claude child authenticates from its own login. Attaching an
+            # Anthropic HTTP pool here both exposes irrelevant credentials and
+            # lets HTTP recovery paths mistake them for the active transport.
+            agent._credential_pool = None
+            agent._credential_pool_entry_id = None
+        elif old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
             # A pool bound to the old provider is worse than no pool: the
             # recovery guard rejects it and every later 401/429 skips rotation.
             agent._credential_pool = None
@@ -2505,7 +2546,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                     new_provider, _pool_exc,
                 )
         # ── Build new client ──
-        if (new_provider or "").strip().lower() == "moa":
+        if api_mode == "claude_cli":
+            agent.client = None
+            agent._anthropic_client = None
+            agent._anthropic_api_key = ""
+            agent._anthropic_base_url = ""
+            agent._is_anthropic_oauth = False
+            agent._client_kwargs = {}
+        elif (new_provider or "").strip().lower() == "moa":
             from agent.moa_loop import build_moa_facade
 
             # The MoA virtual provider speaks only chat.completions via the
@@ -2609,6 +2657,20 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # it and print "Agent swap failed; change applied to next session".
         _restore_snapshot()
         raise
+
+    # A persistent native child is scoped to the exact model/runtime. Retire it
+    # only after the swap has committed so rollback can keep the old working
+    # session. This covers both leaving Claude CLI and changing native models.
+    if _snapshot.get("api_mode") == "claude_cli" or api_mode == "claude_cli":
+        try:
+            from agent.claude_cli_runtime import release_claude_cli_session
+
+            release_claude_cli_session(agent)
+        except Exception:
+            logger.debug(
+                "switch_model: failed to retire prior Claude CLI session",
+                exc_info=True,
+            )
 
     # ── LM Studio: preload before probing context length ──
     _sm_custom_providers = None
@@ -2722,6 +2784,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "requested_provider": agent.requested_provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "claude_cli_command": getattr(agent, "_claude_cli_command", None),
+        "claude_cli_args": list(getattr(agent, "_claude_cli_args", []) or []),
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,

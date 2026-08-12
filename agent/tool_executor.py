@@ -626,7 +626,16 @@ def _begin_tool_execution(
             pass
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    persist_progress: bool = True,
+) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -635,6 +644,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
     and /steer injection — used when this call is one segment of a larger
     mixed batch and the segmented dispatcher owns the turn-end work.
+
+    ``persist_progress=False`` is used by the Claude loopback bridge, whose
+    outer native turn owns persistence of the canonical transcript.
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
@@ -653,11 +665,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 tc.id,
                 effect_disposition="none",
             ))
-            _flush_session_db_after_tool_progress(
-                agent,
-                messages,
-                stage=f"cancelled tool result {tc.function.name}",
-            )
+            if persist_progress:
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"cancelled tool result {tc.function.name}",
+                )
         return
 
     # ── Parse args + pre-execution bookkeeping ───────────────────────
@@ -1233,12 +1246,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
-        if not _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage=f"tool result {name}",
-        ):
-            return
+        if persist_progress:
+            if not _flush_session_db_after_tool_progress(
+                agent,
+                messages,
+                stage=f"tool result {name}",
+            ):
+                return
 
         # Every completion surface is downstream of the canonical append. If
         # the UI bridge or process dies while projecting one of these events,
@@ -2038,7 +2052,16 @@ def execute_tool_calls_sequential(
 
 
 
-def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
+def execute_tool_calls_segmented(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    segments=None,
+    *,
+    persist_progress: bool = True,
+) -> None:
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 
     ``segments`` is the ``(kind, calls)`` plan from
@@ -2060,6 +2083,10 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     result per call, so an interrupt during segment *k* drains segments
     *k+1..n* without executing them while preserving one result per
     tool_call_id.
+
+    ``persist_progress=False`` delegates the single canonical persistence
+    boundary to the caller while retaining the exact same batch planner and
+    execution semantics.
     """
     from types import SimpleNamespace
 
@@ -2076,11 +2103,13 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             execute_tool_calls_concurrent(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                persist_progress=persist_progress,
             )
         else:
             execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                persist_progress=persist_progress,
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):

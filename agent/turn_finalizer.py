@@ -50,6 +50,11 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
 _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # Empty-response recovery and a cross-provider native fallback use
+    # private assistant/user pairs to preserve provider role alternation.
+    # They are loop control, not conversation content.
+    "_empty_recovery_synthetic",
+    "_provider_fallback_synthetic",
 )
 
 
@@ -90,6 +95,30 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    # A persistent Claude child owns a second, physical transcript.  Capture
+    # the exact logical history it represents before finalization removes any
+    # request-only recovery/verification scaffolding or synthesizes a closing
+    # assistant row.  If the effective history changes below, that native
+    # thread can no longer be truthfully resumed on the next user turn.  The
+    # current logical turn is already complete, so retiring it at the end keeps
+    # all same-turn latency wins while making the next cold bootstrap reproduce
+    # the cleaned Hermes transcript exactly.
+    _native_history_signature_before_finalize = None
+    if getattr(agent, "api_mode", None) == "claude_cli":
+        try:
+            from agent.transports.claude_cli_session import (
+                _hermes_history_signature,
+            )
+
+            _native_history_signature_before_finalize = (
+                _hermes_history_signature(messages)
+            )
+        except Exception:
+            logger.debug(
+                "Claude native pre-finalize transcript signature failed",
+                exc_info=True,
+            )
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -374,6 +403,10 @@ def finalize_turn(
                     and getattr(_compressor, '_micro_compact_enabled', False) is True
                     and callable(getattr(_compressor, '_micro_compact', None))
                     and final_response
+                    # Native-history runtimes must compact their authoritative
+                    # provider thread. Rewriting only Hermes' mirror would make
+                    # restart/bootstrap history diverge from what Claude saw.
+                    and getattr(agent, "api_mode", None) != "claude_cli"
                     # Persistence-isolated agents (background review fork)
                     # must not micro-compact: the pass burns a real aux-LLM
                     # call on a throwaway replay transcript, and if the
@@ -752,5 +785,47 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+
+    # Native Claude owns a separate conversation thread. Publish the final,
+    # post-cleanup Hermes transcript signature only when finalization left the
+    # effective history unchanged.  Removing request-only recovery /
+    # verification scaffolding (or synthesizing a terminal assistant row)
+    # changes what a future cold bootstrap would contain while the warm Claude
+    # thread still retains the old bytes.  Retire that divergent thread instead
+    # of falsely blessing it with the cleaned signature.  This also makes
+    # /undo, /retry, regenerate, and cross-process rewrites provable on the next
+    # ordinary turn.
+    if getattr(agent, "api_mode", None) == "claude_cli":
+        try:
+            from agent.transports.claude_cli_session import (
+                _hermes_history_signature,
+            )
+
+            native_session = getattr(agent, "_claude_cli_session", None)
+            finalized_signature = _hermes_history_signature(messages)
+            if (
+                _native_history_signature_before_finalize is not None
+                and finalized_signature
+                != _native_history_signature_before_finalize
+            ):
+                from agent.claude_cli_runtime import (
+                    _invalidate_persistent_native_history,
+                )
+
+                _invalidate_persistent_native_history(agent, native_session)
+                logger.info(
+                    "Claude native history retired after finalizer changed "
+                    "the effective transcript"
+                )
+            else:
+                sync_history = getattr(
+                    native_session, "sync_history_signature", None
+                )
+                if callable(sync_history):
+                    sync_history(messages)
+        except Exception:
+            logger.debug(
+                "Claude native transcript signature sync failed", exc_info=True
+            )
 
     return result

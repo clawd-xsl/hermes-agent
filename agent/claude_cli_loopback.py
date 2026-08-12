@@ -30,11 +30,17 @@ import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 _MAX_REQUEST_BYTES = 8 * 1024 * 1024
+_HOUSEKEEPING_TOOLS = frozenset({
+    "memory",
+    "todo",
+    "skill_manage",
+    "session_search",
+})
 
 
 @dataclass
@@ -43,11 +49,96 @@ class _TurnBinding:
     user_task: str
     messages: list[dict[str, Any]]
     context: contextvars.Context
+    projection_callback: Optional[Callable[[list[dict[str, Any]]], None]] = None
+    execute_tools: bool = True
+    tool_executor: Optional[Callable[..., Any]] = None
+    before_next_model_callback: Optional[
+        Callable[[], Optional[dict[str, Any]]]
+    ] = None
+
+
+@dataclass
+class _ToolProjection:
+    signature: str
+    local_id: str
+    name: str = ""
+    arguments: Optional[dict[str, Any]] = None
+    claude_id: Optional[str] = None
+    batch_id: Optional[str] = None
+    authoritative_seen: bool = False
+    claimed: bool = False
+    intent_persisted: bool = False
+    intent_persistence_failed: bool = False
+    result_projected: bool = False
+    result_content: Any = None
+
+
+@dataclass
+class _ToolBatch:
+    batch_id: str
+    projections: list[_ToolProjection]
+    started: bool = False
+    completed: bool = False
+    execution_error: Optional[str] = None
+
+
+def _tool_signature(name: str, arguments: Any) -> str:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (TypeError, ValueError):
+            pass
+    try:
+        encoded = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        encoded = str(arguments)
+    return f"{name}\0{encoded}"
+
+
+def _normalized_arguments(arguments: Any) -> dict[str, Any]:
+    if isinstance(arguments, dict):
+        return dict(arguments)
+    if isinstance(arguments, str):
+        try:
+            decoded = json.loads(arguments)
+        except (TypeError, ValueError):
+            return {}
+        if isinstance(decoded, dict):
+            return decoded
+    return {}
 
 
 def _schema_fingerprint(tools: list[dict[str, Any]]) -> str:
     payload = json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _unique_projection_id(
+    raw_id: str,
+    projections: list[_ToolProjection],
+) -> str:
+    """Return the standard deterministic duplicate-id repair for one turn."""
+    base = str(raw_id or "").strip() or secrets.token_hex(12)
+    used = {entry.local_id for entry in projections}
+    if base not in used:
+        return base
+    suffix = 2
+    candidate = f"{base}_d{suffix}"
+    while candidate in used:
+        suffix += 1
+        candidate = f"{base}_d{suffix}"
+    logger.warning(
+        "Claude reused tool call id %s within one native turn; renamed the "
+        "duplicate to %s to keep Hermes call/result pairing lossless.",
+        base,
+        candidate,
+    )
+    return candidate
 
 
 class _LoopbackTCPServer(socketserver.ThreadingTCPServer):
@@ -58,12 +149,21 @@ class _LoopbackTCPServer(socketserver.ThreadingTCPServer):
 class ClaudeToolLoopback:
     """Expose one live AIAgent's exact tool surface to a Claude MCP proxy."""
 
-    def __init__(self, agent: Any, *, serve: bool = True) -> None:
+    def __init__(
+        self,
+        agent: Any,
+        *,
+        serve: bool = True,
+        tool_definitions: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
         self._agent = agent
+        self._tool_definitions_override = tool_definitions
         self._token = secrets.token_urlsafe(32)
         self._lock = threading.RLock()
-        self._call_lock = threading.Lock()
+        self._projection_condition = threading.Condition(self._lock)
         self._turn: Optional[_TurnBinding] = None
+        self._tool_projections: list[_ToolProjection] = []
+        self._tool_batches: dict[str, _ToolBatch] = {}
         owner = self
 
         class Handler(socketserver.StreamRequestHandler):
@@ -109,28 +209,293 @@ class ClaudeToolLoopback:
         with self._lock:
             self._agent = agent
 
+    def _tool_batch_timeout(self) -> float:
+        """Use the owning native turn deadline for MCP batch coordination."""
+        session = getattr(self._agent, "_claude_cli_session", None)
+        try:
+            timeout = float(getattr(session, "turn_timeout", 600.0))
+        except (TypeError, ValueError):
+            timeout = 600.0
+        return max(1.0, timeout)
+
     def begin_turn(
         self,
         *,
         task_id: str,
         user_task: str,
         messages: list[dict[str, Any]],
+        projection_callback: Optional[
+            Callable[[list[dict[str, Any]]], None]
+        ] = None,
+        execute_tools: bool = True,
+        before_next_model_callback: Optional[
+            Callable[[], Optional[dict[str, Any]]]
+        ] = None,
     ) -> None:
+        tool_executor = None
+        if execute_tools:
+            # Capture this on the originating agent-turn thread, before the
+            # MCP server hop. In addition to ContextVars, Hermes' standard
+            # wrapper carries the CLI/ACP approval and sudo callbacks that are
+            # deliberately thread-local for cross-session isolation.
+            from tools.thread_context import propagate_context_to_thread
+
+            tool_executor = propagate_context_to_thread(
+                self._agent._execute_tool_calls
+            )
         with self._lock:
+            self._tool_projections = []
+            self._tool_batches = {}
             self._turn = _TurnBinding(
                 task_id=task_id,
                 user_task=user_task,
                 messages=messages,
                 context=contextvars.copy_context(),
+                projection_callback=projection_callback,
+                execute_tools=execute_tools,
+                tool_executor=tool_executor,
+                before_next_model_callback=before_next_model_callback,
             )
 
     def end_turn(self) -> None:
         with self._lock:
             self._turn = None
+            self._tool_projections = []
+            self._tool_batches = {}
+            self._projection_condition.notify_all()
+
+    def reconcile_authoritative_projection(
+        self, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Deduplicate Claude events against pre-execution durable rows.
+
+        Claude's stream and its MCP request travel on different threads. The
+        assistant tool-use event can arrive either before or after the MCP
+        call. This registry makes both orders converge on one Hermes tool pair.
+        """
+        reconciled: list[dict[str, Any]] = []
+        with self._lock:
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("role") == "assistant" and row.get("tool_calls"):
+                    self._classify_assistant_tool_narration(row)
+                    kept_calls: list[dict[str, Any]] = []
+                    row_projections: list[_ToolProjection] = []
+                    matched_projection_ids: set[int] = set()
+                    for call in row.get("tool_calls") or []:
+                        function = call.get("function") or {}
+                        name = str(function.get("name") or "")
+                        arguments = _normalized_arguments(
+                            function.get("arguments") or "{}"
+                        )
+                        signature = _tool_signature(
+                            name, arguments
+                        )
+                        claude_id = str(call.get("id") or "")
+                        match = next(
+                            (
+                                entry
+                                for entry in self._tool_projections
+                                if entry.claude_id == claude_id
+                                and entry.signature == signature
+                                and id(entry) not in matched_projection_ids
+                            ),
+                            None,
+                        )
+                        if match is None:
+                            match = next(
+                                (
+                                    entry
+                                    for entry in self._tool_projections
+                                    if entry.signature == signature
+                                    and entry.claude_id is None
+                                    and id(entry) not in matched_projection_ids
+                                ),
+                                None,
+                            )
+                        if match is not None:
+                            matched_projection_ids.add(id(match))
+                            match.claude_id = claude_id
+                            match.name = name
+                            match.arguments = arguments
+                            match.authoritative_seen = True
+                            if match.intent_persisted:
+                                continue
+                            kept_call = dict(call)
+                            kept_call["id"] = match.local_id
+                            kept_calls.append(kept_call)
+                            row_projections.append(match)
+                            continue
+                        local_id = _unique_projection_id(
+                            claude_id, self._tool_projections
+                        )
+                        match = _ToolProjection(
+                            signature=signature,
+                            local_id=local_id,
+                            name=name,
+                            arguments=arguments,
+                            claude_id=claude_id or None,
+                            authoritative_seen=True,
+                        )
+                        self._tool_projections.append(match)
+                        kept_call = dict(call)
+                        kept_call["id"] = local_id
+                        kept_calls.append(kept_call)
+                        row_projections.append(match)
+                    if kept_calls:
+                        existing_batch_id = next(
+                            (
+                                entry.batch_id
+                                for entry in row_projections
+                                if entry.batch_id is not None
+                            ),
+                            None,
+                        )
+                        batch_id = existing_batch_id or secrets.token_hex(12)
+                        batch = self._tool_batches.get(batch_id)
+                        if batch is None:
+                            batch = _ToolBatch(
+                                batch_id=batch_id,
+                                projections=list(row_projections),
+                            )
+                            self._tool_batches[batch_id] = batch
+                        for entry in row_projections:
+                            entry.batch_id = batch_id
+                        kept = dict(row)
+                        kept["tool_calls"] = kept_calls
+                        reconciled.append(kept)
+                    continue
+
+                if row.get("role") == "assistant":
+                    # Match the standard loop's final text branch. A previous
+                    # answer+housekeeping batch may have muted post-response
+                    # diagnostics; a new text-only response restores them.
+                    try:
+                        self._agent._mute_post_response = False
+                    except Exception:
+                        pass
+
+                if row.get("role") == "tool":
+                    claude_id = str(row.get("tool_call_id") or "")
+                    match = next(
+                        (
+                            entry
+                            for entry in self._tool_projections
+                            if entry.claude_id == claude_id
+                        ),
+                        None,
+                    )
+                    if match is not None and match.result_projected:
+                        continue
+                    if match is not None and match.local_id != claude_id:
+                        kept = dict(row)
+                        kept["tool_call_id"] = match.local_id
+                        reconciled.append(kept)
+                    else:
+                        reconciled.append(row)
+                    continue
+
+                reconciled.append(row)
+            self._projection_condition.notify_all()
+        return reconciled
+
+    def _classify_assistant_tool_narration(self, row: dict[str, Any]) -> None:
+        """Mirror standard-loop answer+housekeeping output semantics.
+
+        Claude streams assistant text before its authoritative assistant event
+        arrives. Once that event shows the complete tool batch, Hermes can
+        distinguish a delivered answer followed only by housekeeping from
+        narration before substantive work. The distinction controls both
+        empty-follow-up recovery and IM/tool-progress noise.
+        """
+        agent = self._agent
+        calls = row.get("tool_calls") or []
+        names = {
+            str((call.get("function") or {}).get("name") or "")
+            for call in calls
+            if isinstance(call, dict)
+        }
+        all_housekeeping = bool(names) and names.issubset(_HOUSEKEEPING_TOOLS)
+
+        if not all_housekeeping:
+            agent._last_content_with_tools = None
+            agent._last_content_tools_all_housekeeping = False
+            agent._mute_post_response = False
+            return
+
+        content = row.get("content")
+        has_visible_content = bool(content)
+        content_check = getattr(agent, "_has_content_after_think_block", None)
+        if callable(content_check):
+            try:
+                has_visible_content = bool(content_check(content))
+            except Exception:
+                has_visible_content = bool(content)
+        if not has_visible_content:
+            return
+
+        agent._last_content_with_tools = content
+        agent._last_content_tools_all_housekeeping = True
+        has_stream_consumers = getattr(agent, "_has_stream_consumers", None)
+        if callable(has_stream_consumers):
+            try:
+                agent._mute_post_response = bool(has_stream_consumers())
+            except Exception:
+                pass
+
+    def register_tool_request(
+        self, *, name: str, arguments: dict[str, Any], claude_id: str
+    ) -> None:
+        """Capture the native tool id exposed by Claude's permission event."""
+        if not claude_id:
+            return
+        signature = _tool_signature(name, arguments)
+        with self._lock:
+            if any(
+                entry.claude_id == claude_id and entry.signature == signature
+                for entry in self._tool_projections
+            ):
+                return
+            local_id = _unique_projection_id(
+                claude_id, self._tool_projections
+            )
+            self._tool_projections.append(
+                _ToolProjection(
+                    signature=signature,
+                    local_id=local_id,
+                    name=name,
+                    arguments=dict(arguments),
+                    claude_id=claude_id,
+                )
+            )
+
+    def mark_authoritative_projection_persisted(
+        self, rows: list[dict[str, Any]], *, succeeded: bool
+    ) -> None:
+        """Release any MCP call waiting for its streamed intent to persist."""
+        with self._projection_condition:
+            ids = {
+                str(call.get("id") or "")
+                for row in rows
+                if isinstance(row, dict) and row.get("role") == "assistant"
+                for call in (row.get("tool_calls") or [])
+            }
+            for entry in self._tool_projections:
+                if entry.local_id in ids or entry.claude_id in ids:
+                    if succeeded:
+                        entry.intent_persisted = True
+                    else:
+                        entry.intent_persistence_failed = True
+            self._projection_condition.notify_all()
 
     def tool_definitions(self) -> list[dict[str, Any]]:
         with self._lock:
-            tools = getattr(self._agent, "tools", None) or []
+            tools = (
+                self._tool_definitions_override
+                if self._tool_definitions_override is not None
+                else getattr(self._agent, "tools", None) or []
+            )
             return [dict(tool) for tool in tools if isinstance(tool, dict)]
 
     def fingerprint(self) -> str:
@@ -193,7 +558,7 @@ class ClaudeToolLoopback:
             )
         return result
 
-    def _call_tool(self, params: dict[str, Any]) -> str:
+    def _call_tool(self, params: dict[str, Any]) -> Any:
         name = str(params.get("name") or "").strip()
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
@@ -209,57 +574,303 @@ class ClaudeToolLoopback:
         if turn is None:
             raise RuntimeError("no active Claude turn is bound to the loopback")
 
-        tool_call_id = str(params.get("tool_call_id") or "") or secrets.token_hex(12)
-        # A contextvars.Context cannot be entered by two threads concurrently.
-        # Claude may issue parallel MCP calls, while AIAgent's stateful tools
-        # are intentionally serialized, so one lock protects both invariants.
-        #
-        # Use Hermes' standard sequential executor instead of calling
-        # ``_invoke_tool`` directly.  The executor is the contract boundary
-        # for guardrails, approvals, checkpoints, middleware, result budgets,
-        # progress callbacks, mutation verification, and agent-owned tools.
-        # A scratch message list prevents the executor from projecting the
-        # tool result into Hermes history before Claude emits its authoritative
-        # assistant/tool protocol records.
-        with self._call_lock:
-            call_context = turn.context.copy()
-            scratch_messages = list(turn.messages)
-            tool_call = SimpleNamespace(
-                id=tool_call_id,
-                function=SimpleNamespace(
+        # Auxiliary callers sometimes ask the model to *propose* a tool call
+        # (MCP sampling and the MoA acting aggregator) and must receive that
+        # structured call back for their own host loop to execute.  The
+        # transient Claude session is stopped as soon as its authoritative
+        # assistant tool-use record arrives; this fail-closed response covers
+        # the small stream/MCP race before that stop and guarantees the
+        # proposal can never execute inside Hermes as a side effect.
+        if not turn.execute_tools:
+            return (
+                "Tool proposal captured by the host. Do not continue or "
+                "attempt to execute it inside this auxiliary session."
+            )
+
+        # A halt decision is turn-scoped and terminal. If Claude asks for a
+        # call without first emitting a new authoritative tool batch, answer
+        # immediately and never allow the follow-up side effect. Normal
+        # authoritative batches run through Hermes' executor below, which
+        # applies the same guardrail semantics as the standard loop.
+        halt_decision = getattr(agent, "_tool_guardrail_halt_decision", None)
+        with self._lock:
+            has_pending_projection = any(
+                entry.signature == _tool_signature(name, arguments)
+                and not entry.claimed
+                for entry in self._tool_projections
+            )
+        if halt_decision is not None and not has_pending_projection:
+            return agent._guardrail_block_result(halt_decision)
+
+        # Claude's MCP requests and its stream-json assistant event travel on
+        # different threads. The complete assistant event is authoritative: it
+        # carries narration/reasoning and, crucially, the whole tool-call
+        # batch. Once that batch is durable, the first arriving MCP request is
+        # its leader and runs the entire batch through Hermes' normal planner.
+        # Safe calls retain standard parallelism; interactive/stateful calls
+        # retain their sequential barriers. Later MCP requests only collect
+        # their already-computed result.
+        signature = _tool_signature(name, arguments)
+        with self._projection_condition:
+            projection = next(
+                (
+                    entry
+                    for entry in self._tool_projections
+                    if entry.signature == signature
+                    and entry.claude_id is not None
+                    and not entry.claimed
+                ),
+                None,
+            )
+            if projection is None:
+                raw_local_id = str(params.get("tool_call_id") or "")
+                projection = _ToolProjection(
+                    signature=signature,
+                    local_id=_unique_projection_id(
+                        raw_local_id, self._tool_projections
+                    ),
                     name=name,
-                    arguments=json.dumps(arguments, ensure_ascii=False),
+                    arguments=dict(arguments),
+                    claimed=True,
+                )
+                self._tool_projections.append(projection)
+            else:
+                projection.name = name
+                projection.arguments = dict(arguments)
+                projection.claimed = True
+            self._projection_condition.notify_all()
+
+            intent_deadline = time.monotonic() + 30.0
+            batch: Optional[_ToolBatch] = None
+            while time.monotonic() < intent_deadline:
+                if projection.batch_id is not None:
+                    batch = self._tool_batches.get(projection.batch_id)
+                if (
+                    batch is not None
+                    and all(item.intent_persisted for item in batch.projections)
+                ):
+                    break
+                batch_persistence_failed = (
+                    batch is not None
+                    and any(
+                        item.intent_persistence_failed
+                        for item in batch.projections
+                    )
+                )
+                if (
+                    projection.intent_persistence_failed
+                    or batch_persistence_failed
+                ):
+                    break
+                if getattr(agent, "_incremental_persistence_failed", False):
+                    break
+                self._projection_condition.wait(timeout=0.1)
+
+            batch_ready = batch is not None and all(
+                item.intent_persisted for item in batch.projections
+            )
+            if (
+                not batch_ready
+                or projection.intent_persistence_failed
+                or getattr(agent, "_incremental_persistence_failed", False)
+            ):
+                # Give the native-session owner its final host-controlled stop
+                # boundary before the MCP error is returned.  In particular,
+                # persistence failure must terminate the child now instead of
+                # allowing Claude to turn the error into another paid request.
+                before_next_model = turn.before_next_model_callback
+                if callable(before_next_model):
+                    turn.context.copy().run(before_next_model)
+                raise RuntimeError(
+                    "Claude authoritative tool intent batch was not persisted; "
+                    f"refusing to execute side-effecting tool {name}"
+                )
+
+            if not batch.started:
+                batch.started = True
+                is_batch_leader = True
+            else:
+                is_batch_leader = False
+
+            if not is_batch_leader:
+                completion_deadline = time.monotonic() + self._tool_batch_timeout()
+                while not batch.completed and time.monotonic() < completion_deadline:
+                    self._projection_condition.wait(timeout=0.1)
+                if not batch.completed:
+                    raise RuntimeError(
+                        f"Hermes tool batch timed out while waiting for {name}"
+                    )
+                if batch.execution_error is not None:
+                    raise RuntimeError(batch.execution_error)
+                return projection.result_content
+
+        projection_callback = turn.projection_callback
+        call_context = turn.context.copy()
+        scratch_messages = list(turn.messages)
+        initial_message_count = len(scratch_messages)
+        all_tool_calls = [
+            SimpleNamespace(
+                id=item.local_id,
+                function=SimpleNamespace(
+                    name=item.name,
+                    arguments=json.dumps(
+                        item.arguments or {}, ensure_ascii=False
+                    ),
                 ),
             )
-            assistant = SimpleNamespace(tool_calls=[tool_call])
+            for item in batch.projections
+        ]
+        execution_calls = list(all_tool_calls)
+        skipped_results: dict[str, dict[str, Any]] = {}
 
-            def _execute() -> None:
-                from agent.tool_executor import execute_tool_calls_sequential
+        cap_delegate_calls = getattr(agent, "_cap_delegate_task_calls", None)
+        if callable(cap_delegate_calls):
+            capped_calls = list(cap_delegate_calls(execution_calls))
+            capped_identities = {id(call) for call in capped_calls}
+            for call in execution_calls:
+                if id(call) not in capped_identities:
+                    skipped_results[call.id] = {
+                        "role": "tool",
+                        "name": call.function.name,
+                        "tool_call_id": call.id,
+                        "content": (
+                            "[Tool execution skipped — the delegate_task batch "
+                            "exceeded Hermes' max_concurrent_children limit.]"
+                        ),
+                        "effect_disposition": "none",
+                    }
+            execution_calls = capped_calls
 
-                execute_tool_calls_sequential(
-                    agent,
+        deduplicate_calls = getattr(agent, "_deduplicate_tool_calls", None)
+        if callable(deduplicate_calls):
+            unique_calls = list(deduplicate_calls(execution_calls))
+            unique_identities = {id(call) for call in unique_calls}
+            for call in execution_calls:
+                if id(call) not in unique_identities:
+                    skipped_results[call.id] = {
+                        "role": "tool",
+                        "name": call.function.name,
+                        "tool_call_id": call.id,
+                        "content": (
+                            "[Tool execution skipped — duplicate call in the "
+                            "same assistant batch.]"
+                        ),
+                        "effect_disposition": "none",
+                    }
+            execution_calls = unique_calls
+
+        assistant = SimpleNamespace(tool_calls=execution_calls)
+
+        display_callback = getattr(agent, "stream_delta_callback", None)
+        if display_callback is not None:
+            try:
+                display_callback(None)
+            except Exception:
+                pass
+        thinking_callback = getattr(agent, "thinking_callback", None)
+        if callable(thinking_callback):
+            try:
+                thinking_callback("")
+            except Exception:
+                pass
+
+        started = time.monotonic()
+        try:
+            if execution_calls:
+                if turn.tool_executor is None:
+                    raise RuntimeError(
+                        "Claude turn has no captured Hermes tool executor"
+                    )
+                turn.tool_executor(
                     assistant,
                     scratch_messages,
                     turn.task_id,
+                    int(getattr(agent, "_api_call_count", 0) or 0),
                     persist_progress=False,
                 )
+            tool_names = {call.function.name for call in execution_calls}
+            if execution_calls and tool_names == {"execute_code"}:
+                budget = getattr(agent, "iteration_budget", None)
+                if budget is not None:
+                    budget.refund()
 
-            started = time.monotonic()
-            call_context.run(_execute)
+            executed_result_rows = [
+                dict(message)
+                for message in scratch_messages[initial_message_count:]
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ]
+            results_by_id = {
+                str(message.get("tool_call_id") or ""): message
+                for message in executed_result_rows
+            }
+            results_by_id.update(skipped_results)
+            missing = [
+                item.name
+                for item in batch.projections
+                if item.local_id not in results_by_id
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Hermes tool executor produced no result for: "
+                    + ", ".join(missing)
+                )
+
+            # Claude's native protocol requires one result per emitted call,
+            # in the original assistant order. Filtered duplicates/excess
+            # delegations therefore get explicit non-effect results rather
+            # than disappearing as they can on the host-owned HTTP wire.
+            result_rows = [
+                results_by_id[item.local_id]
+                for item in batch.projections
+            ]
+
+            if projection_callback is not None:
+                projection_callback(result_rows)
+            else:
+                turn.messages.extend(result_rows)
+            if getattr(agent, "_incremental_persistence_failed", False):
+                before_next_model = turn.before_next_model_callback
+                if callable(before_next_model):
+                    call_context.run(before_next_model)
+                raise RuntimeError(
+                    "Claude tool results could not be persisted after "
+                    "executing the authoritative batch"
+                )
+
+            # Claude will issue its next provider request only after every MCP
+            # result in this batch has returned.  This callback therefore sits
+            # on the last host-controlled boundary where Hermes can emit the
+            # documented per-provider ``pre_api_request`` observer event.
+            before_next_model = turn.before_next_model_callback
+            wire_result_overrides: dict[str, Any] = {}
+            if callable(before_next_model):
+                candidate = call_context.run(before_next_model)
+                if isinstance(candidate, dict):
+                    wire_result_overrides = candidate
+
+            agent._stream_needs_break = True
+            with self._projection_condition:
+                for item in batch.projections:
+                    item.result_projected = True
+                    item.result_content = wire_result_overrides.get(
+                        item.local_id,
+                        results_by_id[item.local_id].get("content"),
+                    )
+                batch.completed = True
+                self._projection_condition.notify_all()
             logger.debug(
-                "Claude MCP tool completed (name=%s duration_ms=%d)",
-                name,
+                "Claude MCP tool batch completed (tools=%s duration_ms=%d)",
+                ",".join(item.name for item in batch.projections),
                 int((time.monotonic() - started) * 1000),
             )
-
-        for message in reversed(scratch_messages):
-            if message.get("role") != "tool" or message.get("tool_call_id") != tool_call_id:
-                continue
-            content = message.get("content")
-            if isinstance(content, str):
-                return content
-            return json.dumps(content, ensure_ascii=False)
-        raise RuntimeError(f"Hermes tool executor produced no result for {name}")
-
+            return projection.result_content
+        except BaseException as exc:
+            with self._projection_condition:
+                batch.execution_error = (
+                    "Hermes authoritative tool batch failed: " + str(exc)
+                )
+                batch.completed = True
+                self._projection_condition.notify_all()
+            raise
 
 __all__ = ["ClaudeToolLoopback"]

@@ -1917,6 +1917,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         review_agent = AIAgent(
             model=_model_name,
             provider=_resolved_provider,
+            requested_provider=_resolved_provider,
             api_key=_api_key,
             base_url=_base_url,
             api_mode=_api_mode,
@@ -1935,6 +1936,9 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             skip_context_files=True,
             skip_memory=True,
         )
+        # Curator passes are one-shot and persist their useful output through
+        # skill files, not through a resumable Claude conversation binding.
+        review_agent._claude_cli_persistent_binding = False
         # Disable recursive nudges — the curator must never spawn its own review.
         review_agent._memory_nudge_interval = 0
         review_agent._skill_nudge_interval = 0

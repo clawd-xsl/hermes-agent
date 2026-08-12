@@ -2125,6 +2125,42 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+def claude_cli_owns_context_compaction(agent: Any) -> bool:
+    """Whether Claude's native history owns this agent's compaction policy.
+
+    The persistent Claude CLI transport owns the *physical* conversation, so
+    the built-in :class:`ContextCompressor` must not rewrite Hermes' mirror of
+    that live thread.  A configured context-engine plugin is different: its
+    ``should_compress*`` and ``compress`` methods are the user-selected context
+    policy, not a duplicate implementation of Claude's built-in compactor.
+    Those engines retain ownership and the persistent native binding is
+    rebuilt from their committed transcript at the resulting real boundary.
+
+    Non-``ContextEngine`` objects are treated as the built-in/native case.
+    Production plugins are required to inherit ``ContextEngine``; preserving
+    the native default here also keeps legacy/test compressor doubles safe.
+    """
+    if getattr(agent, "api_mode", None) != "claude_cli":
+        return False
+
+    engine = getattr(agent, "context_compressor", None)
+    selected_external = getattr(agent, "_context_engine_is_external", None)
+    if isinstance(selected_external, bool):
+        return not selected_external
+    try:
+        from agent.context_compressor import ContextCompressor
+        from agent.context_engine import ContextEngine
+
+        return not (
+            isinstance(engine, ContextEngine)
+            and not isinstance(engine, ContextCompressor)
+        )
+    except Exception:
+        # Failure to classify must never make the host rewrite a live native
+        # thread behind Claude's back.
+        return True
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -2133,7 +2169,9 @@ def compress_context(
     approx_tokens: Optional[int] = None,
     task_id: str = "default",
     focus_topic: Optional[str] = None,
+    native_keep_last_exchanges: Optional[int] = None,
     force: bool = False,
+    native_trigger_source: Optional[str] = None,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
 ) -> Tuple[list, str]:
@@ -2153,6 +2191,10 @@ def compress_context(
             by the manual ``/compress`` slash command so users can retry
             immediately after an auto-compress abort.  Auto-compress
             callers use the default ``False``.
+        native_trigger_source: Explicit automatic trigger that should cross a
+            native-history runtime boundary (currently ``"idle"``). Ordinary
+            token-threshold preflight leaves this unset because Claude owns
+            that pressure-driven compaction itself.
         defer_context_engine_notification: Delay the existing context-engine
             hook until a manual host commits its outer history transaction.
         commit_fence: Optional cooperative fence for executor callers that
@@ -2183,6 +2225,11 @@ def compress_context(
     # boundary, so the previous flush baseline remains authoritative.
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
+    agent._last_native_compaction = False
+    try:
+        agent.context_compressor._last_native_compaction = False
+    except Exception:
+        pass
     # Clear the lock-skip signal at the VERY TOP, before the codex route and
     # the breaker gates below can early-return (per-attempt state rule,
     # #58630/#69853). A stale ``True``/holder value from a prior lock-skip
@@ -2194,7 +2241,11 @@ def compress_context(
 
     _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
-    _trigger_source = "manual" if force else "auto"
+    _trigger_source = (
+        str(native_trigger_source).strip()
+        if isinstance(native_trigger_source, str) and native_trigger_source.strip()
+        else "manual" if force else "auto"
+    )
     try:
         agent._compression_attempt_id = _attempt_id
         setattr(agent.context_compressor, "_compression_telemetry_seed", {
@@ -2205,11 +2256,35 @@ def compress_context(
     except Exception:
         pass
 
-    # Claude CLI owns the native conversation and performs its own compaction.
-    # Rewriting Hermes' local mirror cannot shrink that live context and would
-    # make crash-recovery history diverge from what Claude actually saw.
-    if getattr(agent, "api_mode", None) == "claude_cli":
-        logger.info("Claude CLI owns native context compaction; Hermes compression skipped")
+    # With the built-in compressor, Claude CLI owns the native conversation
+    # and performs its own automatic compaction. Rewriting Hermes' local
+    # mirror cannot shrink that live context and would make crash-recovery
+    # history diverge from what Claude actually saw. Explicit /compress and
+    # opt-in idle compaction intentionally request a boundary, so bridge them
+    # to Claude's native /compact command. A user-selected ContextEngine keeps
+    # its own compaction policy and therefore falls through to the ordinary
+    # engine transaction below; the persistent binding is rebuilt from the
+    # committed compressed transcript at the next native turn.
+    if claude_cli_owns_context_compaction(agent):
+        if force or native_trigger_source:
+            return _compress_context_via_claude_cli(
+                agent,
+                messages,
+                system_message,
+                approx_tokens=approx_tokens,
+                task_id=task_id,
+                focus_topic=focus_topic,
+                keep_last_exchanges=native_keep_last_exchanges,
+                defer_context_engine_notification=(
+                    defer_context_engine_notification
+                ),
+                commit_fence=commit_fence,
+                attempt_started_at=_attempt_started_at,
+            )
+        logger.info(
+            "Claude CLI owns automatic native context compaction; Hermes "
+            "automatic compression skipped"
+        )
         return messages, getattr(agent, "_cached_system_prompt", None) or system_message
 
     # Codex app-server sessions: the codex agent owns the real thread context;
@@ -3541,6 +3616,291 @@ def compress_context(
         finally:
             if _commit_fence_entered:
                 commit_fence.finish_commit()
+
+
+def _compress_context_via_claude_cli(
+    agent: Any,
+    messages: list,
+    system_message: Optional[str],
+    *,
+    approx_tokens: Optional[int] = None,
+    task_id: str = "default",
+    focus_topic: Optional[str] = None,
+    keep_last_exchanges: Optional[int] = None,
+    defer_context_engine_notification: bool = False,
+    commit_fence: Optional[CompressionCommitFence] = None,
+    attempt_started_at: Optional[float] = None,
+) -> Tuple[list, str]:
+    """Run manual compaction against Claude's authoritative native thread."""
+    compressor = agent.context_compressor
+    agent._last_native_compaction = False
+    # Gateway hygiene uses this transport-reported value to re-baseline its
+    # pre-turn pressure check without rewriting Hermes' complete recovery
+    # transcript.  Clear it per attempt so a failed /compact can never reuse a
+    # stale successful boundary from an earlier turn.
+    agent._last_native_compaction_prompt_tokens = None
+    agent._last_compaction_in_place = False
+    try:
+        compressor._last_native_compaction = False
+    except Exception:
+        pass
+    agent._last_compression_attempt_in_place = None
+    # Manual feedback reads these compressor-owned fields. Clear stale state
+    # from a prior Hermes summarizer attempt before invoking the native path.
+    for name, value in (
+        ("_last_summary_dropped_count", 0),
+        ("_last_summary_fallback_used", False),
+        ("_last_summary_error", None),
+        ("_last_compress_aborted", False),
+        ("_last_compression_made_progress", False),
+    ):
+        try:
+            setattr(compressor, name, value)
+        except Exception:
+            pass
+
+    existing_prompt = getattr(agent, "_cached_system_prompt", None)
+    if not existing_prompt:
+        existing_prompt = agent._build_system_prompt(system_message)
+
+    logger.info(
+        "Claude native compaction started: session=%s messages=%d tokens=~%s focus=%r",
+        getattr(agent, "session_id", None) or "none",
+        len(messages),
+        f"{approx_tokens:,}" if approx_tokens else "unknown",
+        focus_topic,
+    )
+    try:
+        agent._emit_status(COMPACTION_STATUS)
+    except Exception:
+        pass
+
+    memory_context = ""
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if memory_manager is not None:
+        try:
+            maybe_context = memory_manager.on_pre_compress(messages)
+            if isinstance(maybe_context, str):
+                memory_context = sanitize_memory_context(maybe_context)
+        except Exception:
+            logger.debug(
+                "memory manager on_pre_compress (Claude native) failed",
+                exc_info=True,
+            )
+
+    native_focus_parts: list[str] = []
+    if isinstance(focus_topic, str) and focus_topic.strip():
+        native_focus_parts.append(focus_topic.strip())
+    if isinstance(keep_last_exchanges, int) and keep_last_exchanges > 0:
+        native_focus_parts.append(
+            "Keep the most recent "
+            f"{keep_last_exchanges} user exchange(s), including their tool "
+            "calls and results, in full detail; compact only older context."
+        )
+    if memory_context.strip():
+        native_focus_parts.append(
+            "Preserve these memory-provider insights in the compacted "
+            f"context:\n{memory_context.strip()}"
+        )
+    native_focus = "\n\n".join(native_focus_parts) or None
+
+    heartbeat = _CompressionActivityHeartbeat(
+        agent, commit_fence=commit_fence
+    ).start()
+    commit_entered = False
+    result = None
+    try:
+        if commit_fence is not None:
+            commit_entered = commit_fence.begin_commit(
+                getattr(agent, "_hard_interrupt_requested", None)
+            )
+            if not commit_entered:
+                heartbeat.stop("context compression cancelled")
+                _emit_compression_attempt_telemetry(
+                    agent,
+                    started_at=attempt_started_at or time.monotonic(),
+                    commit_status="aborted",
+                    split_status="aborted",
+                    failure_class="commit_fence_cancelled",
+                )
+                _emit_compaction_done(agent)
+                return messages, existing_prompt
+        from agent.claude_cli_runtime import compact_claude_cli_history
+
+        result = compact_claude_cli_history(agent, focus_topic=native_focus)
+    except BaseException as exc:
+        heartbeat.stop("context compression failed")
+        try:
+            compressor._last_compress_aborted = True
+            compressor._last_summary_error = str(exc)
+        except Exception:
+            pass
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=attempt_started_at or time.monotonic(),
+            commit_status="aborted",
+            split_status="not_applicable",
+            failure_class="claude_native_compaction_error",
+        )
+        _emit_compaction_done(agent)
+        raise
+    finally:
+        if commit_entered and commit_fence is not None:
+            commit_fence.finish_commit()
+
+    native_error = getattr(result, "error", None)
+    interrupted = bool(getattr(result, "interrupted", False))
+    compacted = bool(getattr(result, "compacted", False))
+    if native_error or interrupted or not compacted:
+        heartbeat.stop("context compression failed")
+        failure = str(
+            native_error
+            or ("Claude native compaction was interrupted" if interrupted else "Claude did not confirm a compaction boundary")
+        )
+        try:
+            compressor._last_compress_aborted = True
+            compressor._last_summary_error = failure
+        except Exception:
+            pass
+        try:
+            agent._emit_warning(f"⚠ Claude native compaction failed: {failure}")
+        except Exception:
+            pass
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=attempt_started_at or time.monotonic(),
+            commit_status="aborted",
+            split_status="not_applicable",
+            failure_class="claude_native_compaction_failed",
+        )
+        _emit_compaction_done(agent)
+        return messages, existing_prompt
+
+    # Claude's stream-json result reports the last model call separately on
+    # newer releases and aggregate turn usage on older ones.  Either is a
+    # better description of the *authoritative native context after the
+    # boundary* than estimating Hermes' deliberately unpruned local mirror.
+    # Keep it as side-channel bookkeeping only; _record_usage() already owns
+    # the normal session/accounting counters.
+    native_usage = getattr(result, "last_call_usage", None)
+    if not isinstance(native_usage, dict) or not native_usage:
+        native_usage = getattr(result, "token_usage", None)
+    if isinstance(native_usage, dict) and native_usage:
+        try:
+            native_prompt_tokens = sum(
+                int(native_usage.get(key) or 0)
+                for key in (
+                    "input_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                )
+            )
+        except (TypeError, ValueError):
+            native_prompt_tokens = 0
+        if native_prompt_tokens > 0:
+            agent._last_native_compaction_prompt_tokens = native_prompt_tokens
+
+    heartbeat.stop("context compression completed")
+    try:
+        compressor.compression_count = int(
+            getattr(compressor, "compression_count", 0) or 0
+        ) + 1
+        compressor._last_compression_made_progress = True
+        compressor.last_compression_rough_tokens = int(approx_tokens or 0)
+        compressor.last_prompt_tokens = -1
+        compressor.last_completion_tokens = 0
+        compressor.awaiting_real_usage_after_compression = True
+        record_boundary = getattr(
+            type(compressor), "record_completed_compaction", None
+        )
+        if callable(record_boundary):
+            record_boundary(compressor, used_fallback=False)
+        else:
+            compressor._verify_compaction_cleared_threshold = True
+    except Exception:
+        logger.debug("Claude native compaction bookkeeping failed", exc_info=True)
+
+    session_id = getattr(agent, "session_id", None) or ""
+    if defer_context_engine_notification:
+        _queue_context_engine_compression_notification(
+            agent,
+            new_session_id=session_id,
+            old_session_id=session_id,
+        )
+    else:
+        _notify_context_engine_compression_complete(
+            agent,
+            new_session_id=session_id,
+            old_session_id=session_id,
+        )
+    try:
+        if memory_manager is not None:
+            memory_manager.on_session_switch(
+                session_id,
+                parent_session_id=session_id,
+                reset=False,
+                reason="compression",
+            )
+    except Exception:
+        logger.debug(
+            "memory manager on_session_switch (Claude native) failed",
+            exc_info=True,
+        )
+
+    if getattr(agent, "event_callback", None):
+        try:
+            agent.event_callback(
+                "session:compress",
+                {
+                    "platform": getattr(agent, "platform", None) or "",
+                    "session_id": session_id,
+                    "old_session_id": "",
+                    "in_place": True,
+                    "native": True,
+                    "runtime": "claude_cli",
+                    "native_session_id": getattr(result, "native_session_id", None),
+                    "compression_count": getattr(compressor, "compression_count", 0),
+                },
+            )
+        except Exception:
+            logger.debug(
+                "event_callback error on Claude native session:compress",
+                exc_info=True,
+            )
+
+    for module_name, reset_name in (
+        ("tools.file_tools", "reset_file_dedup"),
+        ("tools.skills_tool", "reset_skill_view_dedup"),
+    ):
+        try:
+            module = __import__(module_name, fromlist=[reset_name])
+            getattr(module, reset_name)(task_id)
+        except Exception:
+            pass
+
+    agent._last_native_compaction = True
+    try:
+        compressor._last_native_compaction = True
+    except Exception:
+        pass
+    # Hermes retains its complete visible/recovery transcript; only Claude's
+    # native context changed, so do not claim a local in-place DB rewrite.
+    agent._last_compaction_in_place = False
+    agent._last_compression_attempt_in_place = None
+    _emit_compression_attempt_telemetry(
+        agent,
+        started_at=attempt_started_at or time.monotonic(),
+        commit_status="committed",
+        split_status="native_committed",
+    )
+    _emit_compaction_done(agent)
+    logger.info(
+        "Claude native compaction done: session=%s native_session=%s metadata=%s",
+        session_id or "none",
+        getattr(result, "native_session_id", None) or "",
+        getattr(result, "compaction_metadata", None) or {},
+    )
+    return messages, existing_prompt
 
 
 def _compress_context_via_codex_app_server(
