@@ -54,6 +54,25 @@ def _make_large_history_tokens(target_tokens: int) -> list:
     return _make_history(n_msgs, content_size=content_size)
 
 
+def _install_inline_asyncio_offload(monkeypatch) -> None:
+    """Keep bare-runner unit fixtures off the ambient ContextVar executor."""
+    loop = asyncio.get_running_loop()
+
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def _inline_run_in_executor(_executor, func, *args):
+        future = loop.create_future()
+        try:
+            future.set_result(func(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
+    monkeypatch.setattr(loop, "run_in_executor", _inline_run_in_executor)
+
+
 class HygieneCaptureAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
@@ -221,6 +240,22 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
     in place, the transcript MUST be preserved — an unconditional
     rewrite_transcript() would replace the original messages with only the
     summary (permanent data loss). Mirrors the /compress guard (#44794)."""
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
+    loop = asyncio.get_running_loop()
+
+    def _inline_run_in_executor(_executor, func, *args):
+        future = loop.create_future()
+        try:
+            future.set_result(func(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(loop, "run_in_executor", _inline_run_in_executor)
+
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -270,12 +305,31 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.append_to_transcript = MagicMock()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=runner.session_store.get_or_create_session.return_value
+        ),
+        load_transcript=AsyncMock(
+            return_value=runner.session_store.load_transcript.return_value
+        ),
+        has_any_sessions=AsyncMock(return_value=True),
+        rewrite_transcript=AsyncMock(return_value=True),
+        append_to_transcript=AsyncMock(return_value=True),
+        update_session=AsyncMock(return_value=None),
+    )
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    runner._cleanup_agent_resources_off_loop = AsyncMock(return_value=None)
+
+    async def _inline_executor(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _inline_executor
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -384,6 +438,22 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     stays False.  The guard must read the *result* flag, not the *config* flag,
     otherwise the transcript is unconditionally rewritten with only the summary
     (permanent data loss identical to #21301)."""
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
+    loop = asyncio.get_running_loop()
+
+    def _inline_run_in_executor(_executor, func, *args):
+        future = loop.create_future()
+        try:
+            future.set_result(func(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(loop, "run_in_executor", _inline_run_in_executor)
+
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -432,12 +502,31 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.append_to_transcript = MagicMock()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=runner.session_store.get_or_create_session.return_value
+        ),
+        load_transcript=AsyncMock(
+            return_value=runner.session_store.load_transcript.return_value
+        ),
+        has_any_sessions=AsyncMock(return_value=True),
+        rewrite_transcript=AsyncMock(return_value=True),
+        append_to_transcript=AsyncMock(return_value=True),
+        update_session=AsyncMock(return_value=None),
+    )
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    runner._cleanup_agent_resources_off_loop = AsyncMock(return_value=None)
+
+    async def _inline_executor(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _inline_executor
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -484,6 +573,31 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     timeout must fence its eventual commit, continue to the live agent, and
     clean up the temporary agent only after the worker actually returns.
     """
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    # The test exercises a real late worker and commit fence. Avoid inheriting
+    # the test runner's ambient ContextVars into that worker; ContextVar
+    # propagation is covered separately by the gateway executor tests.
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
+    loop = asyncio.get_running_loop()
+
+    def _threaded_run_in_executor(_executor, func, *args):
+        future = loop.create_future()
+
+        def _worker():
+            try:
+                result = func(*args)
+            except BaseException as exc:
+                loop.call_soon_threadsafe(future.set_exception, exc)
+            else:
+                loop.call_soon_threadsafe(future.set_result, result)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return future
+
+    monkeypatch.setattr(loop, "run_in_executor", _threaded_run_in_executor)
+
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -566,12 +680,37 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.append_to_transcript = MagicMock()
+    entry = runner.session_store.get_or_create_session.return_value
+    original_history = runner.session_store.load_transcript.return_value
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=entry),
+        load_transcript=AsyncMock(return_value=original_history),
+        has_any_sessions=AsyncMock(return_value=True),
+        rewrite_transcript=AsyncMock(return_value=True),
+        append_to_transcript=AsyncMock(return_value=True),
+        update_session=AsyncMock(return_value=None),
+        has_platform_message_id=AsyncMock(return_value=False),
+    )
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._is_telegram_topic_lane = lambda _source: False
+    runner._post_turn_goal_continuation = AsyncMock(return_value=None)
+
+    async def _inline_executor(func, *args):
+        return func(*args)
+
+    async def _cleanup_after_worker(agent, *, context):
+        agent.shutdown_memory_provider()
+        agent.close()
+
+    runner._run_in_executor_with_context = _inline_executor
+    runner._cleanup_agent_resources_off_loop = _cleanup_after_worker
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -624,7 +763,12 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     SlowCompressAgent.last_instance.close.assert_not_called()
 
     release_worker.set()
-    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+
+    async def _wait_for_cleanup():
+        while not cleanup_done.is_set():
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(_wait_for_cleanup(), timeout=2)
 
     # The late worker observed cancellation at the commit fence, so it never
     # mutated the live session after the new turn began. Cleanup still ran once
@@ -646,6 +790,8 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     summary without rotating/compacting, the guard preserves the original
     transcript, and the same oversized session is reloaded on every turn.
     """
+    _install_inline_asyncio_offload(monkeypatch)
+
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -803,6 +949,8 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     but WILL when the user lowers the hard-limit to 10.  Verifies the new
     config key is actually read and applied at the force-compress gate.
     """
+    _install_inline_asyncio_offload(monkeypatch)
+
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -908,6 +1056,164 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
         "Expected hygiene compression to fire when message count (12) "
         "exceeds configured hygiene_hard_message_limit (10)"
     )
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_uses_native_compaction_for_keychain_claude_cli(
+    monkeypatch, tmp_path
+):
+    """Keychain-only Claude sessions must not skip gateway hygiene.
+
+    The native thread is compacted while Hermes' full transcript is retained;
+    the provider-reported post-boundary prompt size becomes the temporary
+    pressure baseline until the immediately following real turn reports usage.
+    """
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    # This test targets the native compression branch, not Python's executor
+    # scheduling; keep the large GatewayRunner fixture deterministic.
+    monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
+    loop = asyncio.get_running_loop()
+
+    def _inline_run_in_executor(_executor, func, *args):
+        future = loop.create_future()
+        try:
+            future.set_result(func(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(loop, "run_in_executor", _inline_run_in_executor)
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    class FakeNativeCompressAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model")
+            self.api_mode = kwargs.get("api_mode")
+            self.session_id = kwargs.get("session_id", "sess-native")
+            self._last_compaction_in_place = False
+            self._last_native_compaction = False
+            self._last_native_compaction_prompt_tokens = None
+            self._claude_cli_session = object()
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+            type(self).last_instance = self
+
+        def _compress_context(self, messages, *_args, **kwargs):
+            assert self.api_mode == "claude_cli"
+            assert kwargs["native_trigger_source"] == "gateway_hygiene"
+            self._last_native_compaction = True
+            self._last_native_compaction_prompt_tokens = 23
+            return (messages, "stable prompt")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeNativeCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+    adapter = HygieneCaptureAdapter()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-native",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        last_prompt_tokens=99,
+    )
+    original_history = _make_history(8, content_size=400)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store.load_transcript.return_value = original_history
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    async_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=entry),
+        load_transcript=AsyncMock(return_value=original_history),
+        has_any_sessions=AsyncMock(return_value=True),
+        rewrite_transcript=AsyncMock(return_value=True),
+        append_to_transcript=AsyncMock(return_value=True),
+        update_session=AsyncMock(return_value=None),
+        has_platform_message_id=AsyncMock(return_value=False),
+    )
+    runner._async_session_store = async_store
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._is_telegram_topic_lane = lambda _source: False
+    runner._post_turn_goal_continuation = AsyncMock(return_value=None)
+    runner._cleanup_agent_resources_off_loop = AsyncMock(return_value=None)
+    runner._resolve_session_agent_runtime = lambda **_kwargs: (
+        "claude-sonnet-4-6",
+        {
+            "provider": "anthropic",
+            "api_mode": "claude_cli",
+            "api_key": None,
+            "base_url": None,
+        },
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="12345",
+        ),
+        message_id="1",
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    assert FakeNativeCompressAgent.last_instance is not None
+    assert FakeNativeCompressAgent.last_instance._claude_cli_session is None
+    # Native compaction never rewrites the complete Hermes recovery mirror.
+    runner.session_store.rewrite_transcript.assert_not_called()
+    async_store.update_session.assert_any_await(
+        entry.session_key, last_prompt_tokens=23
+    )
+    runner._run_agent.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1090,6 +1396,8 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
     assert the second runner still honors the cooldown — i.e. it does not
     re-instantiate a compression agent for the same failing session.
     """
+    _install_inline_asyncio_offload(monkeypatch)
+
     from hermes_state import SessionDB
 
     session_id = "sess-restart"

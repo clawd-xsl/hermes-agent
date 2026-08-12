@@ -118,6 +118,14 @@ class TestRunBackgroundTask:
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
+
+        async def run_inline(func, *args):
+            return func(*args)
+
+        # This unit exercises background-task routing/delivery, not the
+        # GatewayRunner executor lifecycle (the bare runner intentionally did
+        # not run __init__). Keep the blocking seam deterministic.
+        runner._run_in_executor_with_context = run_inline
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
@@ -165,6 +173,57 @@ class TestRunBackgroundTask:
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_claude_cli_subscription_needs_no_api_key(self):
+        """The persistent Claude runtime authenticates through `claude login`."""
+        runner = _make_runner()
+
+        async def run_inline(func, *args):
+            return func(*args)
+
+        runner._run_in_executor_with_context = run_inline
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "Native result"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "Native result"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        runtime = {
+            "provider": "anthropic",
+            "api_mode": "claude_cli",
+            "api_key": "",
+            "base_url": "",
+        }
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value=runtime,
+        ), patch(
+            "gateway.run._load_gateway_config", return_value={}
+        ), patch("run_agent.AIAgent") as MockAgent:
+            instance = MagicMock()
+            instance.run_conversation.return_value = {
+                "final_response": "Native result",
+                "messages": [],
+            }
+            MockAgent.return_value = instance
+
+            await runner._run_background_task(
+                "use subscription", source, "bg_claude"
+            )
+
+        assert "Background task complete" in (
+            mock_adapter.send.call_args.kwargs.get("content") or ""
+        )
+        assert MockAgent.call_args.kwargs["api_mode"] == "claude_cli"
+        assert MockAgent.call_args.kwargs["api_key"] == ""
+        assert instance._claude_cli_persistent_binding is False
 
 
 # ---------------------------------------------------------------------------

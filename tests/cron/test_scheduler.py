@@ -546,6 +546,45 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_run_job_preserves_keychain_claude_runtime_without_binding(self, tmp_path):
+        job = {"id": "native-job", "name": "native", "prompt": "hello"}
+        fake_db = MagicMock()
+        fake_db.get_compression_tip.side_effect = lambda session_id: session_id
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "",
+                     "base_url": "",
+                     "provider": "anthropic",
+                     "requested_provider": "anthropic",
+                     "api_mode": "claude_cli",
+                     "command": "/opt/claude",
+                     "args": ["--debug-to-stderr"],
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["api_key"] == ""
+        assert kwargs["api_mode"] == "claude_cli"
+        assert kwargs["acp_command"] == "/opt/claude"
+        assert kwargs["acp_args"] == ["--debug-to-stderr"]
+        assert mock_agent._claude_cli_persistent_binding is False
+
 
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):
