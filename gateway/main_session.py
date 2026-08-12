@@ -64,6 +64,7 @@ def _origin_source(origin: Any, *, profile: Optional[str] = None) -> Optional[Se
     chat_type = str(origin.get("chat_type") or "").strip().lower()
     if not chat_type:
         chat_type = "group" if chat_id.startswith("group:") else "dm"
+    origin_profile = str(origin.get("profile") or "").strip() or None
     return SessionSource(
         platform=platform,
         chat_id=chat_id,
@@ -72,7 +73,11 @@ def _origin_source(origin: Any, *, profile: Optional[str] = None) -> Optional[Se
         user_id=str(origin.get("user_id") or chat_id).strip() or None,
         user_name=str(origin.get("user_name") or "").strip() or None,
         thread_id=thread_id,
-        profile=profile,
+        scope_id=(
+            str(origin.get("scope_id") or origin.get("guild_id") or "").strip()
+            or None
+        ),
+        profile=profile or origin_profile,
     )
 
 
@@ -85,12 +90,25 @@ def _adapter_map_for_profile(runner: Any, profile: Optional[str]) -> Mapping[Any
     return getattr(runner, "adapters", {}) or {}
 
 
-def _source_matches_home(source: Any, platform: Platform, home: Any) -> bool:
+def _normalized_profile(value: Any) -> str:
+    raw = str(value or "").strip()
+    return "default" if raw in {"", "default", "main"} else raw
+
+
+def _source_matches_home(
+    source: Any,
+    platform: Platform,
+    home: Any,
+    *,
+    profile: Optional[str] = None,
+) -> bool:
     return bool(
         source
         and getattr(source, "platform", None) == platform
         and str(getattr(source, "chat_id", "")) == str(home.chat_id)
         and (str(getattr(source, "thread_id", "") or "") == str(home.thread_id or ""))
+        and _normalized_profile(getattr(source, "profile", None))
+        == _normalized_profile(profile)
     )
 
 
@@ -134,11 +152,22 @@ def resolve_main_session_source(
             candidates.append((platform, home, adapter))
 
     fallback = _origin_source(origin, profile=profile)
+    resolved_profile = profile or (fallback.profile if fallback is not None else None)
+    origin_session_key = (
+        str(origin.get("session_key") or "").strip()
+        if isinstance(origin, Mapping)
+        else ""
+    )
     if len(candidates) > 1 and fallback is not None:
         matching = [
             candidate
             for candidate in candidates
-            if _source_matches_home(fallback, candidate[0], candidate[1])
+            if _source_matches_home(
+                fallback,
+                candidate[0],
+                candidate[1],
+                profile=resolved_profile,
+            )
         ]
         if len(matching) == 1:
             candidates = matching
@@ -159,20 +188,47 @@ def resolve_main_session_source(
 
     platform, home, adapter = candidates[0]
 
-    # First prefer the exact source observed by this live runner.
-    for source in reversed(list((getattr(runner, "_session_sources", {}) or {}).values())):
-        if _source_matches_home(source, platform, home):
-            return dataclasses.replace(source, profile=profile or source.profile)
+    # First prefer the exact source captured when the job was created.  The
+    # durable session key disambiguates same-chat profile/scope variants that
+    # cannot safely be reconstructed from platform + chat_id alone.
+    live_sources = getattr(runner, "_session_sources", {}) or {}
+    if origin_session_key:
+        exact = live_sources.get(origin_session_key)
+        if _source_matches_home(exact, platform, home, profile=resolved_profile):
+            return dataclasses.replace(
+                exact,
+                profile=resolved_profile or exact.profile,
+            )
+
+    # Otherwise prefer the newest matching source observed by this live runner.
+    for source in reversed(list(live_sources.values())):
+        if _source_matches_home(source, platform, home, profile=resolved_profile):
+            return dataclasses.replace(source, profile=resolved_profile or source.profile)
 
     # Then use the durable gateway routing index. list_sessions() is public,
     # lock-held, and newest-first, so it is safe across cron worker threads.
     store = getattr(runner, "session_store", None)
     if store is not None:
         try:
-            for entry in store.list_sessions():
+            entries = store.list_sessions()
+            if origin_session_key:
+                entries = sorted(
+                    entries,
+                    key=lambda entry: getattr(entry, "session_key", "")
+                    != origin_session_key,
+                )
+            for entry in entries:
                 source = getattr(entry, "origin", None)
-                if _source_matches_home(source, platform, home):
-                    return dataclasses.replace(source, profile=profile or source.profile)
+                if _source_matches_home(
+                    source,
+                    platform,
+                    home,
+                    profile=resolved_profile,
+                ):
+                    return dataclasses.replace(
+                        source,
+                        profile=resolved_profile or source.profile,
+                    )
         except Exception:
             pass
 
@@ -188,13 +244,14 @@ def resolve_main_session_source(
             "session: main could not recover the exact group/thread home session; "
             "send one message in that home conversation first"
         )
-    return adapter.build_source(
+    source = adapter.build_source(
         chat_id=chat_id,
         chat_name=getattr(home, "name", None) or "Home",
         chat_type="dm",
         user_id=chat_id,
         user_name=getattr(home, "name", None) or None,
     )
+    return dataclasses.replace(source, profile=resolved_profile or source.profile)
 
 
 async def enqueue_main_session_turn(

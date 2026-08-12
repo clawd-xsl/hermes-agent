@@ -328,6 +328,7 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             "platform": origin_platform,
             "chat_id": origin_chat_id,
             "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
+            "chat_type": get_session_env("HERMES_SESSION_CHAT_TYPE") or None,
             "thread_id": thread_id,
             # Captured so an opt-in delivery mirror (cron.mirror_delivery /
             # attach_to_session) can resolve the exact participant's session in
@@ -335,6 +336,13 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             # send_message, which passes HERMES_SESSION_USER_ID to
             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+            "user_name": get_session_env("HERMES_SESSION_USER_NAME") or None,
+            # Preserve upstream's durable routing identity.  ``session: main``
+            # can then recover the exact live/persisted source instead of
+            # reconstructing a lookalike key after a gateway restart.
+            "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
+            "session_key": get_session_env("HERMES_SESSION_KEY") or None,
+            "profile": get_session_env("HERMES_SESSION_PROFILE") or None,
         }
     return None
 
