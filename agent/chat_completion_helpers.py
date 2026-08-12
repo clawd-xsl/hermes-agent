@@ -1891,11 +1891,12 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     agent._cached_system_prompt = sp
 
 
-def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
+def _fallback_entry_key(fb: dict) -> tuple[str, str, str, str]:
     return (
         str(fb.get("provider") or "").strip().lower(),
         str(fb.get("model") or "").strip(),
         str(fb.get("base_url") or "").strip().rstrip("/"),
+        str(fb.get("api_mode") or "").strip().lower(),
     )
 
 
@@ -1985,6 +1986,33 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
+    explicit_fb_api_mode = str(fb.get("api_mode") or "").strip().lower()
+    if explicit_fb_api_mode not in {
+        "",
+        "chat_completions",
+        "codex_responses",
+        "anthropic_messages",
+        "bedrock_converse",
+        "claude_cli",
+    }:
+        logger.warning(
+            "Fallback skip: %s/%s has unsupported api_mode=%r",
+            fb_provider,
+            fb_model,
+            explicit_fb_api_mode,
+        )
+        unavailable.add(fb_key)
+        return agent._try_activate_fallback(reason)
+    is_claude_cli_fallback = explicit_fb_api_mode == "claude_cli"
+    if is_claude_cli_fallback and fb_provider != "anthropic":
+        logger.warning(
+            "Fallback skip: claude_cli is only valid for provider=anthropic "
+            "(got %s/%s)",
+            fb_provider,
+            fb_model,
+        )
+        unavailable.add(fb_key)
+        return agent._try_activate_fallback(reason)
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2012,7 +2040,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     fb_ident = BackendIdentity.build(
         provider=fb_provider,
         model=fb_model,
-        base_url=(fb.get("base_url") or ""),
+        # The subscription runtime is a distinct deployment from Anthropic's
+        # HTTP API even when provider+model match. Give the identity layer an
+        # explicit local endpoint so HTTP -> Claude CLI remains a viable
+        # fallback while Claude CLI -> the same Claude CLI still deduplicates.
+        base_url=(
+            "claude-cli://local"
+            if is_claude_cli_fallback
+            else (fb.get("base_url") or "")
+        ),
     )
     if should_skip_candidate(fb_ident, current_ident):
         logger.warning(
@@ -2041,16 +2077,18 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             from agent.secret_scope import get_secret
 
             fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
-        fb_client, _resolved_fb_model = resolve_provider_client(
-            fb_provider, model=fb_model, raw_codex=True,
-            explicit_base_url=fb_base_url_hint,
-            explicit_api_key=fb_api_key_hint)
-        if fb_client is None:
-            logger.warning(
-                "Fallback to %s failed: provider not configured",
-                fb_provider)
-            unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+        fb_client = None
+        if not is_claude_cli_fallback:
+            fb_client, _resolved_fb_model = resolve_provider_client(
+                fb_provider, model=fb_model, raw_codex=True,
+                explicit_base_url=fb_base_url_hint,
+                explicit_api_key=fb_api_key_hint)
+            if fb_client is None:
+                logger.warning(
+                    "Fallback to %s failed: provider not configured",
+                    fb_provider)
+                unavailable.add(fb_key)
+                return agent._try_activate_fallback(reason)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2061,11 +2099,16 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
-        # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
-        fb_base_url = str(fb_client.base_url)
+        # Determine api_mode from provider / base URL / model. Explicit
+        # fallback transport is authoritative (the fallback picker persists
+        # it); in particular, claude_cli intentionally has no HTTP client,
+        # endpoint, or copied credential.
+        fb_api_mode = explicit_fb_api_mode or "chat_completions"
+        fb_base_url = "" if is_claude_cli_fallback else str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
+        if explicit_fb_api_mode:
+            pass
+        elif fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
         elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
             # Portal is dual-wire: anthropic/* must land on /v1/messages.
@@ -2166,7 +2209,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # SDK default.
         _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
 
-        if fb_api_mode == "anthropic_messages":
+        if fb_api_mode == "claude_cli":
+            # Claude Code owns authentication and inference. Clear every HTTP
+            # client/credential carrier so a stale primary key can neither be
+            # required nor accidentally forwarded to the subscription child.
+            agent.api_key = ""
+            agent.client = None
+            agent._client_kwargs = {}
+            agent._anthropic_client = None
+            agent._anthropic_api_key = ""
+            agent._anthropic_base_url = ""
+            agent._is_anthropic_oauth = False
+            agent._credential_pool = None
+            agent._credential_pool_entry_id = None
+        elif fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
             effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")

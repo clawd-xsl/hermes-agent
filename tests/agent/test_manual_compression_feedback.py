@@ -64,5 +64,27 @@ def test_fallback_compression_reports_dropped_message_count():
     assert "invalid response" in feedback["note"]
 
 
+def test_native_compaction_reports_real_boundary_without_claiming_local_rewrite():
+    messages = _messages(12)
+    state = SimpleNamespace(
+        _last_native_compaction=True,
+        _last_compress_aborted=False,
+        _last_summary_fallback_used=False,
+        _last_summary_error=None,
+    )
+
+    feedback = summarize_manual_compression(
+        messages,
+        list(messages),
+        120_000,
+        120_000,
+        compression_state=state,
+    )
+
+    assert feedback["native_compaction"] is True
+    assert feedback["noop"] is False
+    assert "Compacted Claude's native history" in feedback["headline"]
+    assert "full visible transcript" in feedback["note"]
+
 
 

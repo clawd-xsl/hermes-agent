@@ -245,6 +245,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    # A partial Claude-native assistant row plus its user continuation are
+    # request-only bridge context when a terminal subprocess failure falls
+    # through to Hermes' configured provider chain in the same logical turn.
+    "_provider_fallback_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
     # empty tool_calls array): the interim narration-only assistant turn
     # and the "issue the actual tool call now" user nudge exist only to
@@ -7474,7 +7478,9 @@ class AIAgent:
         approx_tokens: int = None,
         task_id: str = "default",
         focus_topic: str = None,
+        native_keep_last_exchanges: int = None,
         force: bool = False,
+        native_trigger_source: str = None,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
     ) -> tuple:
@@ -7539,7 +7545,9 @@ class AIAgent:
                     system_message,
                     approx_tokens=approx_tokens, task_id=task_id,
                     focus_topic=focus_topic,
+                    native_keep_last_exchanges=native_keep_last_exchanges,
                     force=force,
+                    native_trigger_source=native_trigger_source,
                     defer_context_engine_notification=(
                         defer_context_engine_notification
                     ),
@@ -7747,7 +7755,15 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
-    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+        *,
+        persist_progress: bool = True,
+    ) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
         The segment planner splits the batch into maximal contiguous runs of
@@ -7765,7 +7781,11 @@ class AIAgent:
         try:
             if len(tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
+                    persist_progress=persist_progress,
                 )
 
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
@@ -7777,16 +7797,25 @@ class AIAgent:
                 kind = segments[0][0]
                 if kind == "parallel":
                     return self._execute_tool_calls_concurrent(
-                        assistant_message, messages, effective_task_id, api_call_count
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                        persist_progress=persist_progress,
                     )
                 return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
+                    persist_progress=persist_progress,
                 )
 
             from agent.tool_executor import execute_tool_calls_segmented
             return execute_tool_calls_segmented(
                 self, assistant_message, messages, effective_task_id, api_call_count,
                 segments=segments,
+                persist_progress=persist_progress,
             )
         finally:
             self._executing_tools = False
@@ -7869,15 +7898,45 @@ class AIAgent:
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
 
-    def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls_concurrent(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+        *,
+        persist_progress: bool = True,
+    ) -> None:
         """Forwarder — see ``agent.tool_executor.execute_tool_calls_concurrent``."""
         from agent.tool_executor import execute_tool_calls_concurrent
-        return execute_tool_calls_concurrent(self, assistant_message, messages, effective_task_id, api_call_count)
+        return execute_tool_calls_concurrent(
+            self,
+            assistant_message,
+            messages,
+            effective_task_id,
+            api_call_count,
+            persist_progress=persist_progress,
+        )
 
-    def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls_sequential(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+        *,
+        persist_progress: bool = True,
+    ) -> None:
         """Forwarder — see ``agent.tool_executor.execute_tool_calls_sequential``."""
         from agent.tool_executor import execute_tool_calls_sequential
-        return execute_tool_calls_sequential(self, assistant_message, messages, effective_task_id, api_call_count)
+        return execute_tool_calls_sequential(
+            self,
+            assistant_message,
+            messages,
+            effective_task_id,
+            api_call_count,
+            persist_progress=persist_progress,
+        )
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Forwarder — see ``agent.chat_completion_helpers.handle_max_iterations``."""
@@ -8108,12 +8167,20 @@ class AIAgent:
     def _run_claude_cli_turn(
         self,
         *,
-        user_message: str,
+        user_message: Any,
         original_user_message: Any,
         messages: List[Dict[str, Any]],
+        conversation_history: List[Dict[str, Any]],
         effective_task_id: str,
+        turn_id: str,
+        current_turn_user_idx: int,
         active_system_prompt: str,
         should_review_memory: bool = False,
+        moa_config: Optional[dict[str, Any]] = None,
+        _moa_applied: bool = False,
+        _api_calls_before: int = 0,
+        _pending_verification_response: Optional[str] = None,
+        _pending_verification_response_previewed: bool = False,
     ) -> Dict[str, Any]:
         """Forward one turn to the persistent Claude Code runtime."""
         from agent.claude_cli_runtime import run_claude_cli_turn
@@ -8123,9 +8190,19 @@ class AIAgent:
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
+            conversation_history=conversation_history,
             effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            current_turn_user_idx=current_turn_user_idx,
             active_system_prompt=active_system_prompt,
             should_review_memory=should_review_memory,
+            moa_config=moa_config,
+            _moa_applied=_moa_applied,
+            _api_calls_before=_api_calls_before,
+            _pending_verification_response=_pending_verification_response,
+            _pending_verification_response_previewed=(
+                _pending_verification_response_previewed
+            ),
         )
 
 def main(
@@ -8133,6 +8210,10 @@ def main(
     model: str = "",
     api_key: str = None,
     base_url: str = "",
+    provider: str = None,
+    api_mode: str = None,
+    command: str = None,
+    args: str = None,
     max_turns: int = 10,
     enabled_toolsets: str = None,
     disabled_toolsets: str = None,
@@ -8150,6 +8231,10 @@ def main(
         model (str): Model name to use (OpenRouter format: provider/model). Defaults to anthropic/claude-sonnet-4.6.
         api_key (str): API key for authentication. Uses OPENROUTER_API_KEY env var if not provided.
         base_url (str): Base URL for the model API. Defaults to https://openrouter.ai/api/v1
+        provider (str): Runtime provider identity (for example ``anthropic``).
+        api_mode (str): Inference transport (for example ``claude_cli``).
+        command (str): Optional native runtime executable.
+        args (str): Shell-style arguments for the native runtime executable.
         max_turns (int): Maximum number of API call iterations. Defaults to 10.
         enabled_toolsets (str): Comma-separated list of toolsets to enable. Supports predefined
                               toolsets (e.g., "research", "development", "safe").
@@ -8267,12 +8352,59 @@ def main(
         print("   - Successful conversations → trajectory_samples.jsonl")
         print("   - Failed conversations → failed_trajectories.jsonl")
     
+    runtime_kwargs = {
+        "base_url": base_url,
+        "api_key": api_key,
+        "provider": provider,
+        "requested_provider": provider,
+        "api_mode": api_mode,
+        "acp_command": command,
+        "acp_args": None,
+    }
+    if args:
+        import shlex
+
+        runtime_kwargs["acp_args"] = shlex.split(args)
+
+    # Direct execution should honor the same configured runtime as every
+    # supported Hermes surface.  Without this resolution, a keychain-backed
+    # Claude selection has no api_key/base_url and falls through AIAgent's
+    # OpenAI-shaped auxiliary resolver instead of entering the persistent
+    # ``claude_cli`` transport.
+    if not any((api_key, base_url, provider, api_mode, command, args)):
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            resolved_runtime = resolve_runtime_provider(
+                target_model=model or None,
+            )
+            runtime_kwargs.update(
+                {
+                    "base_url": resolved_runtime.get("base_url"),
+                    "api_key": resolved_runtime.get("api_key"),
+                    "provider": resolved_runtime.get("provider"),
+                    "requested_provider": resolved_runtime.get(
+                        "requested_provider"
+                    ),
+                    "api_mode": resolved_runtime.get("api_mode"),
+                    "acp_command": resolved_runtime.get("command"),
+                    "acp_args": list(resolved_runtime.get("args") or []),
+                }
+            )
+            if not model and resolved_runtime.get("model"):
+                model = str(resolved_runtime["model"])
+        except Exception:
+            logger.debug(
+                "Direct runner could not resolve configured runtime; using "
+                "explicit/default AIAgent resolution",
+                exc_info=True,
+            )
+
     # Initialize agent with provided parameters
     try:
         agent = AIAgent(
-            base_url=base_url,
+            **runtime_kwargs,
             model=model,
-            api_key=api_key,
             max_iterations=max_turns,
             enabled_toolsets=enabled_toolsets_list,
             disabled_toolsets=disabled_toolsets_list,
@@ -8280,6 +8412,9 @@ def main(
             verbose_logging=verbose,
             log_prefix_chars=log_prefix_chars
         )
+        # ``main()`` executes one query and exits; there is no later Hermes
+        # turn that could resume this generated session id.
+        agent._claude_cli_persistent_binding = False
     except RuntimeError as e:
         print(f"❌ Failed to initialize agent: {e}")
         return

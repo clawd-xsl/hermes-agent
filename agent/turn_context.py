@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    claude_cli_owns_context_compaction,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
     recover_rotated_compression_session,
@@ -811,6 +812,11 @@ def build_turn_context(
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_idle_tokens,
                     task_id=effective_task_id,
+                    native_trigger_source=(
+                        "idle"
+                        if claude_cli_owns_context_compaction(agent)
+                        else None
+                    ),
                 )
                 # ``_compress_context`` returns the INPUT list object when it
                 # skips (per-session lock held by another path, failure
@@ -874,7 +880,7 @@ def build_turn_context(
         # Codex app-server threads are compacted by the codex agent itself;
         # Hermes only initiates compaction in "hermes" mode (#36801).
         _native_runtime_auto = (
-            getattr(agent, "api_mode", None) == "claude_cli"
+            claude_cli_owns_context_compaction(agent)
             or (
                 getattr(agent, "api_mode", None) == "codex_app_server"
                 and str(
@@ -1298,6 +1304,24 @@ def build_turn_context(
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
+
+        # Claude reports an automatic compaction boundary only after that
+        # request has completed. Memory-provider continuity therefore rides on
+        # the next user turn. Stamp it here, before the crash-resilience persist
+        # below, so a process loss can cold-bootstrap the exact bytes sent.
+        if getattr(agent, "api_mode", None) == "claude_cli":
+            _pending_native_context = str(
+                getattr(agent, "_claude_cli_pending_compaction_context", "") or ""
+            ).strip()
+            if _pending_native_context:
+                from agent.claude_cli_runtime import stamp_native_compaction_context
+
+                _api_content = stamp_native_compaction_context(
+                    _turn_user_msg,
+                    _pending_native_context,
+                )
+
+        if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             # In-place preflight compaction has ALREADY inserted this turn's
             # user row (archive_and_compact runs before prefetch/pre_llm_call
             # can compose the sidecar), and the crash persist below identity-
@@ -1310,7 +1334,7 @@ def build_turn_context(
                 getattr(agent, "_last_compaction_in_place", False)
             ):
                 _db = getattr(agent, "_session_db", None)
-                if _db is not None:
+                if _db is not None and isinstance(_api_content, str):
                     try:
                         _db.set_latest_user_api_content(
                             agent.session_id,

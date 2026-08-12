@@ -1786,6 +1786,39 @@ def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path)
     assert payload["request"]["url"] == "http://127.0.0.1:9208/v1/chat/completions"
 
 
+def test_dump_api_request_debug_uses_native_claude_transport(monkeypatch, tmp_path):
+    """Native dumps must describe the CLI transport without a fake bearer key."""
+    import json
+
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="claude-sonnet-4-5",
+        provider="anthropic",
+        api_mode="claude_cli",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+
+    dump_file = agent._dump_api_request_debug(
+        {
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [],
+            "transport": "claude_cli",
+        },
+        reason="preflight:claude_cli",
+    )
+
+    payload = json.loads(dump_file.read_text())
+    request = payload["request"]
+    assert request["url"] == "claude-cli://local/stream-json"
+    assert request["headers"] == {"Content-Type": "application/jsonl"}
+    assert request["body"]["transport"] == "claude_cli"
+
+
 
 
 # --- Reasoning-only response tests (fix for empty content retry loop) ---

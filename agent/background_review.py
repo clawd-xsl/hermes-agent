@@ -30,17 +30,18 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Background-review aux-model selector + routed digest.
+# Background-review aux-model selector + isolated/cold digest.
 #
 # The review fork runs on the MAIN model by default ("auto"), replaying the
 # full conversation — already warm in the prompt cache, so cheap cache reads.
 # Optimal and unchanged. A user can route the review to a different, cheaper
 # model via auxiliary.background_review.{provider,model}. A different model
 # cannot reuse the parent's cache (different key), so the fork is cold
-# regardless — replaying the full transcript would just cold-write it. So when
-# (and only when) routed to a different model, we replay a compact DIGEST to
-# minimise cold-written tokens. Same model -> full replay; different model ->
-# digest. That's the whole policy.
+# regardless — replaying the full transcript would just cold-write it. The
+# persistent Claude CLI runtime is the other cold case: its foreground cache
+# lives in a private native thread that the review fork must not share. In both
+# cases replay a compact, bounded DIGEST. Direct HTTP same-model forks retain
+# the full warm-prefix replay.
 # ---------------------------------------------------------------------------
 
 
@@ -59,6 +60,8 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         parent_api_mode = "codex_responses"
     parent = {
         "provider": agent.provider,
+        "requested_provider": getattr(agent, "requested_provider", None)
+        or agent.provider,
         "model": agent.model,
         "api_key": parent_runtime.get("api_key") or None,
         "base_url": parent_runtime.get("base_url") or None,
@@ -95,6 +98,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         )
         return {
             "provider": rp.get("provider") or task_provider,
+            "requested_provider": rp.get("requested_provider") or task_provider,
             "model": rp.get("model") or task_model,
             "api_key": rp.get("api_key"),
             "base_url": rp.get("base_url"),
@@ -112,32 +116,138 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
 
 
 def _msg_text(m: Dict) -> str:
-    c = m.get("content")
+    c = m.get("api_content", m.get("content"))
     if isinstance(c, str):
         return c.strip()
     if isinstance(c, list):
-        return " ".join(b.get("text", "") for b in c if isinstance(b, dict)).strip()
+        parts: List[str] = []
+        for block in c:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text") or block.get("content")
+            if text:
+                parts.append(str(text))
+            elif str(block.get("type") or "").lower() in {
+                "image",
+                "image_url",
+                "input_image",
+                "document",
+            }:
+                parts.append("[attachment omitted from bounded review replay]")
+        return " ".join(parts).strip()
     return ""
 
 
-def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]:
-    """Compact replay for the routed (different-model) path only.
+def _bounded_text(value: Any, limit: int) -> str:
+    """Keep both ends of a large historical field within a fixed budget."""
+    text = str(value or "")
+    limit = max(256, int(limit))
+    if len(text) <= limit:
+        return text
+    marker = "\n[... oversized historical content omitted ...]\n"
+    remaining = max(1, limit - len(marker))
+    head = max(1, (remaining * 2) // 3)
+    return text[:head] + marker + text[-(remaining - head):]
 
-    Keeps the recent ``tail`` messages verbatim, collapses older turns into one
-    synthetic user-role digest, preserving role alternation. Used ONLY when
-    routed to a different model (cache cold regardless, so fewer cold-written
-    tokens is a pure win). Never on the main-model path (full replay stays warm).
+
+def _bounded_review_message(
+    message: Dict,
+    *,
+    max_content_chars: int = 4_000,
+) -> Dict:
+    """Build a provider-valid, payload-bounded copy for a cold reviewer.
+
+    The review needs the semantic transcript, not historical binary payloads
+    or exact tool arguments. Keeping those verbatim is especially dangerous
+    for native Claude: the foreground thread may already have compacted them,
+    while its isolated reviewer cold-bootstraps from Hermes' lossless mirror.
     """
-    msgs = list(messages_snapshot or [])
+    row: Dict[str, Any] = {
+        "role": str(message.get("role") or ""),
+        "content": _bounded_text(_msg_text(message), max_content_chars),
+    }
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        bounded_calls: List[Dict[str, Any]] = []
+        for call in tool_calls[:8]:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            raw_arguments = function.get("arguments", "{}")
+            if not isinstance(raw_arguments, str):
+                try:
+                    raw_arguments = json.dumps(raw_arguments, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    raw_arguments = "{}"
+            if len(raw_arguments) > 512:
+                raw_arguments = json.dumps(
+                    {
+                        "_hermes_review_summary": _bounded_text(
+                            raw_arguments,
+                            384,
+                        )
+                    },
+                    ensure_ascii=False,
+                )
+            bounded_calls.append(
+                {
+                    "id": str(call.get("id") or ""),
+                    "type": "function",
+                    "function": {
+                        "name": _bounded_text(function.get("name") or "?", 128),
+                        "arguments": raw_arguments,
+                    },
+                }
+            )
+        if bounded_calls:
+            row["tool_calls"] = bounded_calls
+    if message.get("tool_call_id"):
+        row["tool_call_id"] = str(message["tool_call_id"])
+    if message.get("name"):
+        row["name"] = _bounded_text(message["name"], 128)
+    return row
+
+
+def _digest_history(
+    messages_snapshot: List[Dict],
+    tail: int = 24,
+    max_digest_chars: int = 24_000,
+    max_tail_message_chars: int = 4_000,
+) -> List[Dict]:
+    """Compact replay for a cold/isolated background-review fork.
+
+    Keeps a semantically equivalent, payload-bounded copy of the recent
+    ``tail`` messages and collapses older turns into one digest. A native Claude
+    foreground transcript remains lossless after physical compaction, so both
+    the older arc and recent large tool/image payloads must be bounded before
+    an isolated reviewer cold-boots from that mirror.
+    """
+    msgs = [m for m in (messages_snapshot or []) if isinstance(m, dict)]
+    def bounded(rows: List[Dict]) -> List[Dict]:
+        return [
+            _bounded_review_message(
+                row,
+                max_content_chars=max_tail_message_chars,
+            )
+            for row in rows
+        ]
     if len(msgs) <= tail:
-        return msgs
-    keep = msgs[-tail:]
-    while keep and isinstance(keep[0], dict) and keep[0].get("role") == "tool":
+        return bounded(msgs)
+    keep_source = msgs[-tail:]
+    # Never open the bounded recent suffix on a detached tool result; walk
+    # backward far enough to retain its parent assistant call.
+    while keep_source and keep_source[0].get("role") == "tool":
         tail += 1
         if len(msgs) <= tail:
-            return msgs
-        keep = msgs[-tail:]
-    old = msgs[:-len(keep)]
+            return bounded(msgs)
+        keep_source = msgs[-tail:]
+    keep = bounded(keep_source)
+    old = msgs[:-len(keep_source)]
     lines: List[str] = []
     for m in old:
         if not isinstance(m, dict):
@@ -153,15 +263,44 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
                 lines.append(f"ASSISTANT[tools: {', '.join(names)}]")
             if text:
                 lines.append(f"ASSISTANT: {text[:200]}")
-    digest = {
-        "role": "user",
-        "content": (
-            "[Earlier conversation digest — older turns summarised to bound the "
-            "review's cold-write cost on the routed aux model. Recent turns "
-            "follow verbatim below.]\n" + "\n".join(lines)
-        ),
-    }
-    return [digest] + keep
+    max_digest_chars = max(1_000, int(max_digest_chars or 24_000))
+    selected: List[str] = []
+    selected_chars = 0
+    # Current corrections/workflows matter most; earlier review passes have
+    # already considered the oldest arc.
+    for line in reversed(lines):
+        addition = len(line) + (1 if selected else 0)
+        if selected and selected_chars + addition > max_digest_chars:
+            break
+        if not selected and addition > max_digest_chars:
+            line = line[-max_digest_chars:]
+            addition = len(line)
+        selected.append(line)
+        selected_chars += addition
+    selected.reverse()
+    omitted = max(0, len(lines) - len(selected))
+    if omitted:
+        selected.insert(
+            0,
+            f"[... {omitted} older digest entries omitted by the review context bound ...]",
+        )
+
+    digest_content = (
+        "[Earlier conversation digest — older turns summarised to bound the "
+        "review's cold-write cost. A payload-bounded recent transcript follows.]\n"
+        + "\n".join(selected)
+    )
+    # A synthetic user digest immediately followed by a real user row violates
+    # strict role alternation. Merge it into that first retained user message;
+    # otherwise keep it as the user turn preceding an assistant/tool sequence.
+    if keep and keep[0].get("role") == "user":
+        keep[0]["content"] = (
+            digest_content
+            + "\n\n[First retained recent user message]\n"
+            + str(keep[0].get("content") or "")
+        )
+        return keep
+    return [{"role": "user", "content": digest_content}] + keep
 
 
 # Review-prompt strings — used by ``spawn_background_review_thread`` to build
@@ -815,6 +954,8 @@ def _run_review_in_thread(
                 quiet_mode=True,
                 platform=agent.platform,
                 provider=_rt.get("provider") or agent.provider,
+                requested_provider=_rt.get("requested_provider")
+                or getattr(agent, "requested_provider", None),
                 api_mode=_rt.get("api_mode"),
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
@@ -965,11 +1106,19 @@ def _run_review_in_thread(
                 pass
 
             try:
-                # Routed to a different model -> replay a digest (cache is cold
-                # on that model anyway, so minimise cold-written tokens). Same
-                # model -> replay the full snapshot (warm cache reads).
+                # Routed models are cold. Persistent Claude is also cold here:
+                # its useful cache/history is private to the foreground native
+                # thread, which this persistence-isolated review must never
+                # share. Replaying Claude's lossless Hermes mirror in full
+                # would eventually overflow after native compactions. Direct
+                # HTTP same-model forks retain the full warm-prefix replay.
+                _isolated_native_history = (
+                    str(_rt.get("api_mode") or "").strip().lower()
+                    == "claude_cli"
+                )
                 _review_history = (
-                    _digest_history(messages_snapshot) if _routed
+                    _digest_history(messages_snapshot)
+                    if (_routed or _isolated_native_history)
                     else messages_snapshot
                 )
                 review_agent.run_conversation(
