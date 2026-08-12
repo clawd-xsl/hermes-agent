@@ -56,6 +56,7 @@ from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    claude_cli_owns_context_compaction,
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
@@ -6869,7 +6870,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "max_tokens": override.get("max_tokens"),
                 "credential_pool": override.get("credential_pool"),
             }
-            if override_runtime.get("api_key"):
+            if (
+                override_runtime.get("api_key")
+                or override_runtime.get("api_mode") == "claude_cli"
+            ):
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(
                         override.get("provider")
@@ -16747,7 +16751,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key=session_key,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
-                        if _hyg_runtime.get("api_key"):
+                        _hyg_is_claude_cli = (
+                            str(_hyg_runtime.get("api_mode") or "").strip().lower()
+                            == "claude_cli"
+                        )
+                        if _hyg_runtime.get("api_key") or _hyg_is_claude_cli:
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
                             # compressor: tool results are usually the bulk of
@@ -16832,6 +16840,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
                                             commit_fence=_hyg_commit_fence,
+                                            # Claude owns the authoritative
+                                            # history.  A named native trigger
+                                            # bridges this pre-turn safety net
+                                            # to /compact; an ordinary auto
+                                            # call intentionally remains a
+                                            # no-op in the shared compressor.
+                                            native_trigger_source=(
+                                                "gateway_hygiene"
+                                                if claude_cli_owns_context_compaction(
+                                                    _hyg_agent
+                                                )
+                                                else None
+                                            ),
                                         ),
                                     )
                                     try:
@@ -17000,6 +17021,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_in_place = bool(
                                         getattr(_hyg_agent, "_last_compaction_in_place", False)
                                     )
+                                    _hyg_native = bool(
+                                        getattr(_hyg_agent, "_last_native_compaction", False)
+                                    )
                                     # Only rewrite the transcript when rotation produced
                                     # a NEW session id.  In-place compaction does NOT
                                     # need a rewrite: archive_and_compact() has already
@@ -17078,6 +17102,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _new_tokens = estimate_messages_tokens_rough(
                                             _compressed
                                         )
+                                    elif _hyg_native:
+                                        # Native Claude compaction shrinks the
+                                        # provider-owned thread but must not
+                                        # rewrite Hermes' complete searchable /
+                                        # crash-recovery transcript.  Rebase
+                                        # only the lightweight pressure meter
+                                        # on Claude's post-boundary usage when
+                                        # available.  The immediately following
+                                        # real turn will replace it with normal
+                                        # API-reported usage.
+                                        _native_prompt_tokens = int(
+                                            getattr(
+                                                _hyg_agent,
+                                                "_last_native_compaction_prompt_tokens",
+                                                0,
+                                            )
+                                            or 0
+                                        )
+                                        session_entry.last_prompt_tokens = (
+                                            _native_prompt_tokens
+                                        )
+                                        history = _hyg_msgs
+                                        _new_count = len(history)
+                                        _new_tokens = _native_prompt_tokens
+                                        if _new_tokens <= 0:
+                                            # Some Claude CLI releases omit
+                                            # usage on slash-command results.
+                                            # Zero means "await the next real
+                                            # turn's authoritative usage", not
+                                            # "the local mirror is empty".
+                                            _new_tokens = 0
+                                        try:
+                                            await self.async_session_store.update_session(
+                                                session_entry.session_key,
+                                                last_prompt_tokens=_native_prompt_tokens,
+                                            )
+                                        except Exception:
+                                            logger.debug(
+                                                "Session hygiene could not persist "
+                                                "Claude native token baseline for %s",
+                                                session_entry.session_id,
+                                                exc_info=True,
+                                            )
                                     else:
                                         # No rewrite happened — transcript preserved
                                         # unchanged, so the post-compression counts equal
@@ -17093,12 +17160,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             session_entry.session_id,
                                         )
 
-                                    logger.info(
-                                        "Session hygiene: compressed %s → %s msgs, "
-                                        "~%s → ~%s tokens",
-                                        _msg_count, _new_count,
-                                        f"{_approx_tokens:,}", f"{_new_tokens:,}",
-                                    )
+                                    if _hyg_native:
+                                        logger.info(
+                                            "Session hygiene: Claude native context "
+                                            "compacted at %s mirrored messages "
+                                            "(~%s → %s reported native tokens); "
+                                            "Hermes transcript retained in full",
+                                            _msg_count,
+                                            f"{_approx_tokens:,}",
+                                            (
+                                                f"~{_new_tokens:,}"
+                                                if _new_tokens > 0
+                                                else "pending next turn"
+                                            ),
+                                        )
+                                    else:
+                                        logger.info(
+                                            "Session hygiene: compressed %s → %s msgs, "
+                                            "~%s → ~%s tokens",
+                                            _msg_count, _new_count,
+                                            f"{_approx_tokens:,}", f"{_new_tokens:,}",
+                                        )
 
                                     if _new_tokens >= _warn_token_threshold:
                                         logger.warning(
@@ -17186,6 +17268,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # SOUL.md, memory, and skills.
                                     self._evict_cached_agent(session_key)
                                     if not _hyg_cleanup_deferred:
+                                        if _hyg_is_claude_cli:
+                                            # Keep the just-compacted native
+                                            # process warm; the real main agent
+                                            # constructed below will rebind it.
+                                            from agent.claude_cli_runtime import (
+                                                detach_claude_cli_session,
+                                            )
+
+                                            detach_claude_cli_session(_hyg_agent)
                                         await self._cleanup_agent_resources_off_loop(
                                             _hyg_agent, context="session hygiene"
                                         )
@@ -19265,7 +19356,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 user_config=user_config,
             )
-            if not runtime_kwargs.get("api_key"):
+            if (
+                not runtime_kwargs.get("api_key")
+                and runtime_kwargs.get("api_mode") != "claude_cli"
+            ):
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
@@ -19338,6 +19432,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                # Background task ids are one-shot. A resumable native binding
+                # would never be reused and could displace the foreground
+                # conversation from the bounded Claude process pool.
+                agent._claude_cli_persistent_binding = False
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
