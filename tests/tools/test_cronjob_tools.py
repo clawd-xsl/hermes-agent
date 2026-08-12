@@ -490,6 +490,39 @@ class TestLocalDeliveryNotice:
         assert created["deliver"] == "origin"
         assert "local-only cron job" not in created["message"]
 
+    def test_gateway_origin_preserves_durable_routing_identity(self):
+        from cron.jobs import get_job
+        from gateway.session_context import set_session_vars
+
+        set_session_vars(
+            platform="slack",
+            chat_id="D123",
+            chat_type="dm",
+            chat_name="Assistant DM",
+            user_id="U123",
+            user_name="Owner",
+            scope_id="T123",
+            session_key="agent:work:slack:dm:T123:D123",
+            profile="work",
+        )
+        created = json.loads(
+            cronjob(action="create", prompt="x", schedule="every 2m")
+        )
+
+        stored = get_job(created["job_id"])
+        assert stored["origin"] == {
+            "platform": "slack",
+            "chat_id": "D123",
+            "chat_name": "Assistant DM",
+            "chat_type": "dm",
+            "thread_id": None,
+            "user_id": "U123",
+            "user_name": "Owner",
+            "scope_id": "T123",
+            "session_key": "agent:work:slack:dm:T123:D123",
+            "profile": "work",
+        }
+
 
 class TestValidateCronBaseUrl:
     """The cron base_url guard must not let a NAMED custom provider's stored
