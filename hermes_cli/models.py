@@ -5476,6 +5476,43 @@ def validate_requested_model(
                 ),
             }
 
+    # Claude Code subscription runtime has neither an API key nor an HTTP
+    # endpoint by design. Validate against the bundled Anthropic catalog when
+    # possible and soft-accept newer/entitlement-gated IDs, matching the native
+    # Anthropic provider's hidden-model policy without probing a nonexistent
+    # wire endpoint.
+    if normalized == "anthropic" and api_mode == "claude_cli":
+        try:
+            catalog_models = provider_model_ids("anthropic")
+        except Exception:
+            catalog_models = []
+        if requested_for_lookup in set(catalog_models):
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
+        auto = get_close_matches(requested_for_lookup, catalog_models, n=1, cutoff=0.9)
+        if auto:
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "corrected_model": auto[0],
+                "message": f"Auto-corrected `{requested}` → `{auto[0]}`",
+            }
+        return {
+            "accepted": True,
+            "persist": True,
+            "recognized": False,
+            "message": (
+                f"Note: `{requested}` could not be verified through the Claude "
+                "Code subscription runtime. Claude Code will validate access "
+                "when the next turn starts."
+            ),
+        }
+
     # Native Anthropic provider: /v1/models requires x-api-key (or Bearer for
     # OAuth) plus anthropic-version headers.  The generic OpenAI-style probe
     # below uses plain Bearer auth and 401s against Anthropic, so dispatch to

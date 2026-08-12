@@ -71,7 +71,32 @@ def test_anthropic_claude_cli_runtime_needs_no_copied_credential(monkeypatch):
         "api_key": "",
         "source": "claude-code",
         "requested_provider": "anthropic",
+        "command": "",
+        "args": [],
     }
+
+
+def test_anthropic_claude_cli_runtime_includes_process_config(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "anthropic",
+            "default": "claude-opus-4-6",
+            "anthropic_runtime": "claude_cli",
+            "claude_cli": {
+                "command": "/opt/claude",
+                "args": ["--debug-to-stderr"],
+            },
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved["command"] == "/opt/claude"
+    assert resolved["args"] == ["--debug-to-stderr"]
 
 
 def test_anthropic_claude_cli_runtime_resolves_from_real_profile_config(tmp_path, monkeypatch):
@@ -120,6 +145,73 @@ def test_anthropic_claude_cli_runtime_drops_pool_bearer(monkeypatch):
     assert resolved["api_key"] == ""
     assert resolved["base_url"] == ""
     assert resolved["credential_pool"] is None
+
+
+def test_cli_runtime_setup_accepts_subscription_without_http_credentials(monkeypatch):
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    class _CLI(CLIAgentSetupMixin):
+        requested_provider = "anthropic"
+        _explicit_api_key = None
+        _explicit_base_url = None
+        _fallback_model = []
+        model = "claude-opus-4-6"
+        provider = "anthropic"
+        api_mode = "chat_completions"
+        api_key = None
+        base_url = None
+        acp_command = None
+        acp_args = []
+        _credential_pool = None
+        agent = None
+
+        def _normalize_model_for_provider(self, _provider):
+            return False
+
+    monkeypatch.setattr(
+        rp,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "anthropic",
+            "api_mode": "claude_cli",
+            "base_url": "",
+            "api_key": "",
+            "source": "claude-code",
+            "credential_pool": None,
+        },
+    )
+
+    cli = _CLI()
+    assert cli._ensure_runtime_credentials() is True
+    assert cli.api_mode == "claude_cli"
+    assert cli.api_key == ""
+    assert cli.base_url == ""
+
+
+def test_subscription_model_validation_never_probes_missing_http_credentials(
+    monkeypatch,
+):
+    from hermes_cli import models
+
+    monkeypatch.setattr(
+        models,
+        "_fetch_anthropic_models",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Claude subscription validation must not probe HTTP")
+        ),
+    )
+    result = models.validate_requested_model(
+        "claude-future-entitlement-model",
+        "anthropic",
+        api_key="",
+        base_url="",
+        api_mode="claude_cli",
+    )
+
+    assert result["accepted"] is True
+    assert result["persist"] is True
+    assert result["recognized"] is False
+    assert "Claude Code" in result["message"]
 
 
 def _fake_invoke_jwt(ttl_seconds=3600):

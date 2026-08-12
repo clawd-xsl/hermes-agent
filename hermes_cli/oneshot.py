@@ -436,6 +436,8 @@ def _run_agent(
             provider=runtime.get("provider"),
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
+            acp_command=runtime.get("command"),
+            acp_args=list(runtime.get("args") or []),
             model=effective_model,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
@@ -456,6 +458,8 @@ def _run_agent(
             #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
         )
+        # The hard-exit oneshot surface never resumes this generated session.
+        agent._claude_cli_persistent_binding = False
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.

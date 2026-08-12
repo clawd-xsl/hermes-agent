@@ -195,6 +195,7 @@ class TestCliApprovalUi:
 
         class FakeAgent:
             def __init__(self, **kwargs):
+                seen["agent_kwargs"] = kwargs
                 self._print_fn = None
                 self.thinking_callback = None
 
@@ -215,7 +216,13 @@ class TestCliApprovalUi:
 
         with patch.object(cli_module, "AIAgent", FakeAgent), \
              patch.object(cli_module, "_cprint"), \
-             patch.object(cli_module, "ChatConsole") as chat_console:
+             patch.object(cli_module, "ChatConsole") as chat_console, \
+             patch(
+                 "agent.claude_cli_runtime.release_claude_cli_session",
+                 side_effect=lambda agent: seen.update(
+                     released=agent._claude_cli_persistent_binding
+                 ),
+             ):
             chat_console.return_value.print = MagicMock()
             cli._handle_background_command("/btw check weather")
 
@@ -229,6 +236,7 @@ class TestCliApprovalUi:
         assert seen["approval"].__func__ is HermesCLI._approval_callback
         assert seen["sudo"].__self__ is cli
         assert seen["sudo"].__func__ is HermesCLI._sudo_password_callback
+        assert seen["released"] is False
         assert not cli._background_tasks
 
 
@@ -561,4 +569,3 @@ class TestClearOverlaysForInterrupt:
 
         assert not t.is_alive(), "worker thread never unblocked"
         assert result["value"] == "deny"
-

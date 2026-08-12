@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import contextvars
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -5697,7 +5698,15 @@ def fire_pre_command_hook(
         logger.debug("pre_command hook dispatch failed (non-fatal): %s", exc)
 
 
-_thread_tool_whitelist = threading.local()
+_tool_whitelist_context: contextvars.ContextVar[Optional[Set[str]]] = (
+    contextvars.ContextVar("hermes_tool_whitelist", default=None)
+)
+_tool_whitelist_format_context: contextvars.ContextVar[str] = (
+    contextvars.ContextVar(
+        "hermes_tool_whitelist_format",
+        default="Tool '{tool_name}' denied: not in this thread's tool whitelist",
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -5711,12 +5720,19 @@ def set_thread_tool_whitelist(
     allowed: Optional[Set[str]],
     deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
 ) -> None:
-    _thread_tool_whitelist.allowed = allowed
-    _thread_tool_whitelist.fmt = deny_msg_fmt
+    """Restrict tool dispatch in this logical execution context.
+
+    Context-local state preserves the historical thread isolation while also
+    allowing an explicitly copied turn context to cross a worker boundary.
+    The latter is required by persistent Claude's authenticated MCP loopback,
+    whose tool executor runs on a server thread on behalf of the review turn.
+    """
+    _tool_whitelist_context.set(set(allowed) if allowed is not None else None)
+    _tool_whitelist_format_context.set(deny_msg_fmt)
 
 
 def clear_thread_tool_whitelist() -> None:
-    _thread_tool_whitelist.allowed = None
+    _tool_whitelist_context.set(None)
 
 
 def _get_pre_tool_call_directive_details(
@@ -5755,9 +5771,9 @@ def _get_pre_tool_call_directive_details(
     The first valid directive wins. Invalid or irrelevant hook return values
     are silently ignored so existing observer-only hooks are unaffected.
     """
-    allowed = getattr(_thread_tool_whitelist, "allowed", None)
+    allowed = _tool_whitelist_context.get()
     if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
+        fmt = _tool_whitelist_format_context.get()
         return _PreToolCallDirective(
             action="block",
             message=fmt.format(tool_name=tool_name),

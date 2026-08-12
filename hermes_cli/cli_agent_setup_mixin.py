@@ -90,13 +90,18 @@ class CLIAgentSetupMixin:
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
+        _is_claude_cli_runtime = resolved_api_mode == "claude_cli"
         # A callable api_key is a bearer-token provider (Azure Foundry
         # Entra ID — ``azure_identity_adapter.build_token_provider``).
         # The OpenAI SDK accepts ``Callable[[], str]`` for ``api_key`` and
         # invokes it before every request. Skip the string-only validation
         # and placeholder substitution for callables.
         _is_callable_provider = callable(api_key) and not isinstance(api_key, str)
-        if not _is_callable_provider and (not isinstance(api_key, str) or not api_key):
+        if (
+            not _is_claude_cli_runtime
+            and not _is_callable_provider
+            and (not isinstance(api_key, str) or not api_key)
+        ):
             # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
             # don't require authentication.  When a base_url IS configured but
             # no API key was found, use a placeholder so the OpenAI SDK
@@ -119,7 +124,10 @@ class CLIAgentSetupMixin:
                 print("   Run 'hermes model' to choose a provider, or "
                       "'hermes setup' for first-time setup.")
                 return False
-        if not isinstance(base_url, str) or not base_url:
+        if (
+            not _is_claude_cli_runtime
+            and (not isinstance(base_url, str) or not base_url)
+        ):
             print("\n⚠️  Provider resolver returned an empty base URL. "
                   "Check your provider config or run: hermes setup")
             return False

@@ -5,26 +5,30 @@ Uses the same lazy-import + BaseRequest pattern as feishu_comment.py.
 The lark client is injected per-thread by the comment event handler.
 """
 
+import contextvars
 import json
 import logging
-import threading
 
 from tools.registry import registry, tool_error, tool_result
 
 logger = logging.getLogger(__name__)
 
-# Thread-local storage for the lark client injected by feishu_comment handler.
-_local = threading.local()
+# Context-local storage for the lark client injected by feishu_comment. This
+# keeps concurrent comment sessions isolated and survives intentional context
+# propagation into persistent-Claude's MCP/tool worker threads.
+_client_context: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "hermes_feishu_drive_client", default=None
+)
 
 
 def set_client(client):
-    """Store a lark client for the current thread (called by feishu_comment)."""
-    _local.client = client
+    """Store a lark client for the current logical comment execution."""
+    _client_context.set(client)
 
 
 def get_client():
-    """Return the lark client for the current thread, or None."""
-    return getattr(_local, "client", None)
+    """Return the lark client for the current logical execution, or None."""
+    return _client_context.get()
 
 
 def _check_feishu():
