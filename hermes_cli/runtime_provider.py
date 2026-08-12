@@ -453,6 +453,26 @@ def _maybe_apply_claude_cli_runtime(
     return "claude_cli" if runtime == "claude_cli" else api_mode
 
 
+def _claude_cli_process_config(
+    model_cfg: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return the configured Claude executable without leaking bad arg shapes.
+
+    Runtime resolution is the contract consumed by every AIAgent construction
+    site.  Keeping process settings only in ``claude_cli_runtime`` made those
+    entry points appear equivalent while silently falling back to ``claude``.
+    """
+    raw = (model_cfg or {}).get("claude_cli")
+    cfg = raw if isinstance(raw, dict) else {}
+    command = str(cfg.get("command") or "").strip()
+    raw_args = cfg.get("args")
+    if isinstance(raw_args, (list, tuple)):
+        args = [str(arg) for arg in raw_args]
+    else:
+        args = []
+    return {"command": command, "args": args}
+
+
 def _resolve_runtime_from_pool_entry(
     *,
     provider: str,
@@ -597,6 +617,7 @@ def _resolve_runtime_from_pool_entry(
             "source": "claude-code",
             "credential_pool": None,
             "requested_provider": requested_provider,
+            **_claude_cli_process_config(model_cfg),
         }
 
     if provider == "lmstudio":
@@ -2078,6 +2099,7 @@ def resolve_runtime_provider(
                 "api_key": "",
                 "source": "claude-code",
                 "requested_provider": requested_provider,
+                **_claude_cli_process_config(model_cfg),
             }
 
         # For Microsoft Foundry endpoints, use ANTHROPIC_API_KEY directly —

@@ -7592,7 +7592,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model_short = model_short[:27] + "..."
 
         # Get API status indicator
-        if self.api_key:
+        if self.api_key or self.api_mode == "claude_cli":
             api_indicator = "[green bold]●[/]"
         else:
             api_indicator = "[red bold]●[/]"
@@ -8212,7 +8212,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.requested_provider = _reset_result.target_provider
                     self._explicit_api_key = _reset_result.api_key
                     self._explicit_base_url = _reset_result.base_url
-                    if _reset_result.api_key:
+                    if _reset_result.api_mode == "claude_cli":
+                        self.api_key = ""
+                        self.base_url = ""
+                    elif _reset_result.api_key:
                         self.api_key = _reset_result.api_key
                     if _reset_result.base_url:
                         self.base_url = _reset_result.base_url
@@ -9141,7 +9144,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # the new provider's credential resolution on the next turn.
         self._explicit_api_key = result.api_key
         self._explicit_base_url = result.base_url
-        if result.api_key:
+        if result.api_mode == "claude_cli":
+            self.api_key = ""
+            self.base_url = ""
+        elif result.api_key:
             self.api_key = result.api_key
         if result.base_url:
             self.base_url = result.base_url
@@ -9210,7 +9216,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         cache_enabled = (
             (base_url_host_matches(result.base_url or "", "openrouter.ai") and "claude" in result.new_model.lower())
-            or result.api_mode == "anthropic_messages"
+            or result.api_mode in {"anthropic_messages", "claude_cli"}
         )
         if cache_enabled:
             _cprint("    Prompt caching: enabled")
@@ -9484,7 +9490,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # the new provider's credential resolution on the next turn.
         self._explicit_api_key = result.api_key
         self._explicit_base_url = result.base_url
-        if result.api_key:
+        if result.api_mode == "claude_cli":
+            self.api_key = ""
+            self.base_url = ""
+        elif result.api_key:
             self.api_key = result.api_key
         if result.base_url:
             self.base_url = result.base_url
@@ -9559,7 +9568,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Cache notice
         cache_enabled = (
             (base_url_host_matches(result.base_url or "", "openrouter.ai") and "claude" in result.new_model.lower())
-            or result.api_mode == "anthropic_messages"
+            or result.api_mode in {"anthropic_messages", "claude_cli"}
         )
         if cache_enabled:
             _cprint("    Prompt caching: enabled")
@@ -11004,6 +11013,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             summarize_compress_preview,
         )
         from agent.conversation_compression import (
+            claude_cli_owns_context_compaction,
             finalize_context_engine_compression_notification,
         )
 
@@ -11061,6 +11071,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # most recent `keep_last` exchanges ride along verbatim.
                 tail: list = []
                 head = original_history
+                native_keep_last_exchanges = None
                 if partial:
                     head, tail = split_history_for_partial_compress(
                         original_history, keep_last
@@ -11071,6 +11082,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # compression so the user still gets an action.
                         partial = False
                         head = original_history
+                    elif claude_cli_owns_context_compaction(self.agent):
+                        # Claude owns the authoritative context. Compacting a
+                        # Hermes-only prefix would not affect that native
+                        # thread, so send the whole native /compact operation
+                        # with an explicit recent-exchange preservation rule.
+                        native_keep_last_exchanges = keep_last
+                        head = original_history
+                        tail = []
 
                 # Include system prompt + tool schemas in the estimate —
                 # a transcript-only number understates real request pressure
@@ -11099,13 +11118,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # _build_system_prompt appends system_message to prompt_parts
                 # which already contain the agent identity — resulting in the
                 # identity block appearing twice (issue #15281).
+                _compress_kwargs = {
+                    "approx_tokens": approx_tokens,
+                    "focus_topic": focus_topic or None,
+                    "force": True,
+                    "defer_context_engine_notification": True,
+                }
+                if native_keep_last_exchanges is not None:
+                    _compress_kwargs["native_keep_last_exchanges"] = (
+                        native_keep_last_exchanges
+                    )
                 compressed, _ = self.agent._compress_context(
                     head,
                     None,
-                    approx_tokens=approx_tokens,
-                    focus_topic=focus_topic or None,
-                    force=True,
-                    defer_context_engine_notification=True,
+                    **_compress_kwargs,
                 )
 
                 # If _compress_context returned unchanged because a

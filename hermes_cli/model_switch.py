@@ -1996,6 +1996,17 @@ def list_authenticated_providers(
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
     _current_provider_norm = str(current_provider or "").strip().lower()
     _current_base_url_norm = str(current_base_url or "").strip().rstrip("/").lower()
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        _model_cfg = load_config_readonly().get("model", {}) or {}
+        _claude_cli_configured = bool(
+            isinstance(_model_cfg, dict)
+            and str(_model_cfg.get("anthropic_runtime") or "").strip().lower()
+            == "claude_cli"
+        )
+    except Exception:
+        _claude_cli_configured = False
 
     def _can_probe_custom_provider(*, row_is_current: bool) -> bool:
         return bool(probe_custom_providers or (probe_current_custom_provider and row_is_current))
@@ -2341,6 +2352,14 @@ def list_authenticated_providers(
         # providers the user can switch to, even if they aren't currently
         # configured.
         if not has_creds and hermes_slug == "anthropic":
+            # A configured Claude CLI runtime authenticates inside the child
+            # process and may keep its login in an OS keychain that Hermes
+            # cannot read as an HTTP credential. Explicit runtime selection is
+            # therefore sufficient for picker visibility; the child reports a
+            # clear auth error if its own login is unavailable at execution.
+            if _claude_cli_configured:
+                has_creds = True
+        if not has_creds and hermes_slug == "anthropic":
             try:
                 from agent.anthropic_adapter import (
                     read_claude_code_credentials,
@@ -2356,7 +2375,12 @@ def list_authenticated_providers(
         if not has_creds:
             continue
 
-        if hermes_slug in {"openai-codex", "copilot", "copilot-acp"}:
+        if hermes_slug == "anthropic" and _claude_cli_configured:
+            # Do not probe Anthropic's HTTP /models path for a runtime that has
+            # no HTTP bearer by design. The bundled curated catalog is enough
+            # for discovery, and typed hidden/new model IDs remain soft-valid.
+            model_ids = curated.get("anthropic", []) or curated.get(pid, [])
+        elif hermes_slug in {"openai-codex", "copilot", "copilot-acp"}:
             # Use live OAuth-backed discovery so the gateway /model picker
             # matches what the user's authenticated Codex/Copilot backend
             # actually serves — including ChatGPT-Pro-only Codex slugs
