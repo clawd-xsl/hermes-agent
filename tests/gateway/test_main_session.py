@@ -89,6 +89,53 @@ def test_resolver_reuses_durable_exact_home_source():
     assert build_session_key(resolved) == "agent:main:signal:dm:+15551234567"
 
 
+def test_resolver_uses_captured_session_key_with_profile_identity():
+    default_source = SessionSource(
+        platform=Platform.SIGNAL,
+        chat_id="+15551234567",
+        chat_type="dm",
+    )
+    work_source = SessionSource(
+        platform=Platform.SIGNAL,
+        chat_id="+15551234567",
+        chat_type="dm",
+        user_id="+15551234567",
+        scope_id="workspace-1",
+        profile="work",
+    )
+    runner, _ = _runner_with_home()
+    runner._profile_adapters = {"work": runner.adapters}
+    runner._session_sources = {
+        "agent:work:signal:dm:+15551234567": work_source,
+        "agent:main:signal:dm:+15551234567": default_source,
+    }
+
+    resolved = resolve_main_session_source(
+        runner,
+        origin={
+            "platform": "signal",
+            "chat_id": "+15551234567",
+            "session_key": "agent:work:signal:dm:+15551234567",
+            "profile": "work",
+        },
+        profile="work",
+    )
+
+    assert resolved == work_source
+    assert resolved.scope_id == "workspace-1"
+    assert resolved.profile == "work"
+
+
+def test_resolver_stamps_profile_on_new_dm_home():
+    runner, adapter = _runner_with_home()
+    runner._profile_adapters = {"work": runner.adapters}
+
+    resolved = resolve_main_session_source(runner, profile="work")
+
+    assert resolved.profile == "work"
+    adapter.build_source.assert_called_once()
+
+
 def test_resolver_rejects_without_live_home():
     runner, adapter = _runner_with_home()
     runner.config.platforms = {}
