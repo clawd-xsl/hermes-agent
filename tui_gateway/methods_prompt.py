@@ -792,12 +792,15 @@ def _(rid, params: dict) -> dict:
 
     def run():
         session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
+        background_agent = None
         try:
             from run_agent import AIAgent
 
-            result = AIAgent(
+            background_agent = AIAgent(
                 **_background_agent_kwargs(session["agent"], task_id)
-            ).run_conversation(
+            )
+            background_agent._claude_cli_persistent_binding = False
+            result = background_agent.run_conversation(
                 user_message=text,
                 task_id=task_id,
             )
@@ -820,6 +823,15 @@ def _(rid, params: dict) -> dict:
                 {"task_id": task_id, "text": f"error: {e}"},
             )
         finally:
+            if background_agent is not None:
+                try:
+                    from agent.claude_cli_runtime import (
+                        release_claude_cli_session,
+                    )
+
+                    release_claude_cli_session(background_agent)
+                except Exception:
+                    pass
             _clear_session_context(session_tokens)
 
     threading.Thread(target=run, daemon=True).start()
@@ -889,6 +901,7 @@ def _(rid, params: dict) -> dict:
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
         session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
+        preview_agent = None
         try:
             from run_agent import AIAgent
             from tools.terminal_tool import register_task_env_overrides
@@ -906,10 +919,12 @@ def _(rid, params: dict) -> dict:
                 parent,
                 {"task_id": task_id, "text": f"Starting hidden restart agent{history_note}"},
             )
-            result = AIAgent(
+            preview_agent = AIAgent(
                 **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
                 **_preview_restart_callbacks(parent, task_id),
-            ).run_conversation(
+            )
+            preview_agent._claude_cli_persistent_binding = False
+            result = preview_agent.run_conversation(
                 user_message=prompt,
                 task_id=task_id,
                 conversation_history=parent_history or None,
@@ -927,6 +942,15 @@ def _(rid, params: dict) -> dict:
                 {"task_id": task_id, "text": f"error: {e}"},
             )
         finally:
+            if preview_agent is not None:
+                try:
+                    from agent.claude_cli_runtime import (
+                        release_claude_cli_session,
+                    )
+
+                    release_claude_cli_session(preview_agent)
+                except Exception:
+                    pass
             try:
                 from tools.terminal_tool import clear_task_env_overrides
 

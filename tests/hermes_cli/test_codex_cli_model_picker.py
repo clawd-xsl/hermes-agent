@@ -132,6 +132,44 @@ def test_claude_code_file_detected_by_model_picker(claude_code_only_env):
     assert anthropic["total_models"] > 0
 
 
+def test_configured_claude_cli_runtime_is_visible_without_exportable_http_token(
+    tmp_path, monkeypatch
+):
+    """OS-keychain Claude logins need not be readable as Hermes OAuth data."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: anthropic\n"
+        "  default: claude-opus-4-6\n"
+        "  anthropic_runtime: claude_cli\n",
+        encoding="utf-8",
+    )
+    (hermes_home / "auth.json").write_text(
+        json.dumps({"version": 2, "providers": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        max_models=10,
+    )
+    anthropic = next(row for row in providers if row["slug"] == "anthropic")
+
+    assert anthropic["models"]
+    assert anthropic["total_models"] > 0
+
+
 def test_no_codex_when_no_credentials(tmp_path, monkeypatch):
     """openai-codex should NOT appear when no credentials exist anywhere."""
     hermes_home = tmp_path / ".hermes"

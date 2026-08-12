@@ -2014,6 +2014,7 @@ class CLICommandsMixin:
         turn_route = self._resolve_turn_agent_config(prompt)
 
         def run_background():
+            bg_agent = None
             set_sudo_password_callback(self._sudo_password_callback)
             set_approval_callback(self._approval_callback)
             try:
@@ -2026,9 +2027,13 @@ class CLICommandsMixin:
                     api_key=turn_route["runtime"].get("api_key"),
                     base_url=turn_route["runtime"].get("base_url"),
                     provider=turn_route["runtime"].get("provider"),
+                    requested_provider=turn_route["runtime"].get(
+                        "requested_provider"
+                    ),
                     api_mode=turn_route["runtime"].get("api_mode"),
                     acp_command=turn_route["runtime"].get("command"),
                     acp_args=turn_route["runtime"].get("args"),
+                    credential_pool=turn_route["runtime"].get("credential_pool"),
                     max_tokens=turn_route["runtime"].get("max_tokens"),
                     max_iterations=self.max_turns,
                     enabled_toolsets=self.enabled_toolsets,
@@ -2049,6 +2054,10 @@ class CLICommandsMixin:
                     openrouter_min_coding_score=self._openrouter_min_coding_score,
                     fallback_model=self._fallback_model,
                 )
+                # This task id is never resumed as an interactive session.
+                # Keep the native child for its inner tool loop, but do not
+                # create a cross-turn binding that could evict the main agent.
+                bg_agent._claude_cli_persistent_binding = False
                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
                 bg_agent._print_fn = lambda *_a, **_kw: None
 
@@ -2120,6 +2129,15 @@ class CLICommandsMixin:
                 print()
                 _cprint(f"  ❌ Background task #{task_num} failed: {e}")
             finally:
+                if bg_agent is not None:
+                    try:
+                        from agent.claude_cli_runtime import (
+                            release_claude_cli_session,
+                        )
+
+                        release_claude_cli_session(bg_agent)
+                    except Exception:
+                        pass
                 try:
                     set_sudo_password_callback(None)
                     set_approval_callback(None)

@@ -394,6 +394,9 @@ def _(rid, params: dict) -> dict:
             or api_key_text in {"aws-sdk", "no-key-required"}
             or has_usable_secret(api_key_text)
             or bool(runtime.get("command"))
+            # Claude Code owns authentication through its local keychain; an
+            # empty HTTP API key is the valid runtime shape, not a setup error.
+            or runtime.get("api_mode") == "claude_cli"
         )
 
         if not credential_ok:

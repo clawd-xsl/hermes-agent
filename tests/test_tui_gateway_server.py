@@ -680,6 +680,7 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
+        assert ready.wait(timeout=2)
     finally:
         server._sessions.pop(sid, None)
 
@@ -735,6 +736,7 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
+        assert ready.wait(timeout=2)
     finally:
         server._sessions.pop(sid, None)
 
@@ -6479,6 +6481,14 @@ def test_probe_credentials_allows_keyless_custom_runtime():
     assert server._probe_credentials(agent) == ""
 
 
+def test_probe_credentials_allows_claude_cli_keychain_runtime():
+    agent = types.SimpleNamespace(
+        api_key="", provider="anthropic", api_mode="claude_cli"
+    )
+
+    assert server._probe_credentials(agent) == ""
+
+
 def test_setup_runtime_check_rejects_empty_runtime_key(monkeypatch):
     monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
     monkeypatch.setattr(
@@ -6516,6 +6526,31 @@ def test_setup_runtime_check_allows_no_key_custom_runtime(monkeypatch):
 
     assert resp["result"]["ok"] is True
     assert resp["result"]["provider"] == "custom"
+
+
+def test_setup_runtime_check_allows_claude_cli_keychain_runtime(monkeypatch):
+    monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested=None: {
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+            "api_key": "",
+            "api_mode": "claude_cli",
+            "source": "claude-code",
+        },
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "setup.runtime_check", "params": {}}
+    )
+
+    assert resp["result"] == {
+        "ok": True,
+        "provider": "anthropic",
+        "model": "claude-opus-4-6",
+        "source": "claude-code",
+    }
 
 
 def test_setup_runtime_check_rejects_implicit_bedrock_when_unconfigured(monkeypatch):
@@ -10821,6 +10856,39 @@ def test_compress_session_history_here_triggers_partial_compress():
     assert removed == len(_PARTIAL_FAKE_HISTORY) - len(session["history"])
 
 
+def test_claude_cli_partial_compress_targets_native_history_with_recent_window():
+    calls = []
+    agent = _partial_compress_agent(calls)
+    agent.api_mode = "claude_cli"
+
+    def _native_compact(history, sys, **kwargs):
+        calls.append((list(history), kwargs))
+        return history, ""
+
+    agent._compress_context = _native_compact
+    session = _session(agent=agent)
+    session["history"] = list(_PARTIAL_FAKE_HISTORY)
+
+    removed, _usage = server._compress_session_history(
+        session, "here 1", approx_tokens=777
+    )
+
+    assert calls == [
+        (
+            _PARTIAL_FAKE_HISTORY,
+            {
+                "approx_tokens": 777,
+                "focus_topic": None,
+                "native_keep_last_exchanges": 1,
+                "force": True,
+                "defer_context_engine_notification": True,
+            },
+        )
+    ]
+    assert session["history"] == _PARTIAL_FAKE_HISTORY
+    assert removed == 0
+
+
 def test_compress_session_history_here_falls_back_on_degenerate_split():
     """/compress here with keep_last >= exchanges produces an empty tail —
     must fall back to full compression (whole history, no rejoined tail)."""
@@ -12678,7 +12746,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_args: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -12741,7 +12809,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_args: {"model": agent.model})
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -12774,7 +12842,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_args: {"model": agent.model})
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
@@ -12811,7 +12879,7 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
 
 
 def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_args: {"model": agent.model})
     server._sessions["sid-large"] = _session(
         agent=types.SimpleNamespace(model="model-large"),
         history=[
@@ -13925,6 +13993,39 @@ def test_make_agent_uses_session_runtime_overrides(monkeypatch):
     assert mock_agent.call_args.kwargs["service_tier"] == "priority"
 
 
+def test_make_agent_preserves_keychain_claude_runtime(monkeypatch):
+    _setup_make_agent_mocks(monkeypatch, {})
+    monkeypatch.setattr(
+        server,
+        "_resolve_startup_runtime",
+        lambda: ("claude-opus-4-6", "anthropic"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "anthropic",
+            "requested_provider": "anthropic",
+            "base_url": "",
+            "api_key": "",
+            "api_mode": "claude_cli",
+            "command": "/opt/claude",
+            "args": ["--debug-to-stderr"],
+            "credential_pool": None,
+        },
+    )
+
+    with patch("run_agent.AIAgent") as mock_agent:
+        server._make_agent("sid-native", "key-native")
+
+    kwargs = mock_agent.call_args.kwargs
+    assert kwargs["provider"] == "anthropic"
+    assert kwargs["requested_provider"] == "anthropic"
+    assert kwargs["api_mode"] == "claude_cli"
+    assert kwargs["api_key"] == ""
+    assert kwargs["acp_command"] == "/opt/claude"
+    assert kwargs["acp_args"] == ["--debug-to-stderr"]
+
+
 def test_make_agent_handles_null_agent_config(monkeypatch):
     _setup_make_agent_mocks(monkeypatch, {"agent": None, "max_turns": 80})
 
@@ -13938,6 +14039,7 @@ class _FakeAgentForBackground:
     base_url = None
     api_key = None
     provider = None
+    requested_provider = None
     api_mode = None
     acp_command = None
     acp_args = None
@@ -13953,6 +14055,7 @@ class _FakeAgentForBackground:
     reasoning_config = None
     service_tier = None
     request_overrides = {}
+    _credential_pool = None
     _fallback_model = None
 
 
@@ -13962,6 +14065,25 @@ def test_background_agent_kwargs_reads_nested_max_turns(monkeypatch):
     kwargs = server._background_agent_kwargs(_FakeAgentForBackground(), "task_1")
 
     assert kwargs["max_iterations"] == 300
+
+
+def test_background_agent_kwargs_preserves_persistent_claude_runtime(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    agent = _FakeAgentForBackground()
+    agent.provider = "anthropic"
+    agent.requested_provider = "anthropic"
+    agent.api_mode = "claude_cli"
+    agent.acp_command = "/opt/claude"
+    agent.acp_args = ["--debug-to-stderr"]
+
+    kwargs = server._background_agent_kwargs(agent, "task_native")
+
+    assert kwargs["provider"] == "anthropic"
+    assert kwargs["requested_provider"] == "anthropic"
+    assert kwargs["api_mode"] == "claude_cli"
+    assert kwargs["api_key"] is None
+    assert kwargs["acp_command"] == "/opt/claude"
+    assert kwargs["acp_args"] == ["--debug-to-stderr"]
 
 
 def test_background_agent_kwargs_falls_back_to_root_max_turns(monkeypatch):
