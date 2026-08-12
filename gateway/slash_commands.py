@@ -2382,7 +2382,7 @@ class GatewaySlashCommandsMixin:
             # Cache notice
             cache_enabled = (
                 (base_url_host_matches(result.base_url or "", "openrouter.ai") and "claude" in result.new_model.lower())
-                or result.api_mode == "anthropic_messages"
+                or result.api_mode in {"anthropic_messages", "claude_cli"}
             )
             if cache_enabled:
                 lines.append(t("gateway.model.prompt_caching_enabled"))
@@ -4039,6 +4039,9 @@ class GatewaySlashCommandsMixin:
 
         try:
             from run_agent import AIAgent
+            from agent.conversation_compression import (
+                claude_cli_owns_context_compaction,
+            )
             from agent.manual_compression_feedback import summarize_manual_compression
             from agent.model_metadata import estimate_request_tokens_rough
 
@@ -4062,7 +4065,10 @@ class GatewaySlashCommandsMixin:
                 source=source,
                 session_key=session_key,
             )
-            if not runtime_kwargs.get("api_key"):
+            if (
+                not runtime_kwargs.get("api_key")
+                and runtime_kwargs.get("api_mode") != "claude_cli"
+            ):
                 return t("gateway.compress.no_provider")
 
             # Pass the FULL transcript (tool results included) — same
@@ -4156,6 +4162,19 @@ class GatewaySlashCommandsMixin:
                 )
 
                 compressor = tmp_agent.context_compressor
+                native_keep_last_exchanges = None
+                if (
+                    partial
+                    and tail
+                    and claude_cli_owns_context_compaction(tmp_agent)
+                ):
+                    # The Claude thread is authoritative; a Hermes-only head
+                    # rewrite would leave its live context untouched. Preserve
+                    # the requested recent window through native /compact
+                    # instructions and keep the recovery transcript whole.
+                    native_keep_last_exchanges = keep_last
+                    head = msgs
+                    tail = []
                 if not compressor.has_content_to_compress(head):
                     return t("gateway.compress.nothing_to_do")
 
@@ -4171,6 +4190,9 @@ class GatewaySlashCommandsMixin:
                         "",
                         approx_tokens=approx_tokens,
                         focus_topic=focus_topic,
+                        native_keep_last_exchanges=(
+                            native_keep_last_exchanges
+                        ),
                         force=True,
                         defer_context_engine_notification=True,
                     )
@@ -4202,6 +4224,9 @@ class GatewaySlashCommandsMixin:
                 new_session_id = tmp_agent.session_id
                 rotated = new_session_id != session_entry.session_id
                 _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
+                _native_compacted = bool(
+                    getattr(compressor, "_last_native_compaction", False)
+                )
 
                 # Persist the compressed transcript BEFORE repointing the live
                 # session onto the new session_id. Order matters: if we
@@ -4248,6 +4273,11 @@ class GatewaySlashCommandsMixin:
                 elif _in_place:
                     # archive_and_compact() already persisted the compacted
                     # transcript inside _compress_context — nothing to do.
+                    pass
+                elif _native_compacted:
+                    # Claude compacted its authoritative thread. Hermes keeps
+                    # the unchanged full transcript as its recovery/search
+                    # mirror, so there is intentionally no DB rewrite here.
                     pass
                 else:
                     logger.warning(
@@ -4301,6 +4331,13 @@ class GatewaySlashCommandsMixin:
                 # Evict cached agent so next turn rebuilds system prompt
                 # from current files (SOUL.md, memory, etc.).
                 self._evict_cached_agent(session_key)
+                if claude_cli_owns_context_compaction(tmp_agent):
+                    # The helper operated on the authoritative main native
+                    # thread. Hand that warm process to the next rebuilt main
+                    # agent instead of closing it immediately after /compact.
+                    from agent.claude_cli_runtime import detach_claude_cli_session
+
+                    detach_claude_cli_session(tmp_agent)
                 # Off-loop + bounded: temporary-agent teardown can block on
                 # subprocess/network/SQLite work. Running it inline freezes the
                 # gateway loop and stalls platform polling / heartbeat, the same
