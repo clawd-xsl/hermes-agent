@@ -709,6 +709,23 @@ def init_agent(
     else:
         agent.api_mode = "chat_completions"
 
+    # ``acp_command`` is shared by several subprocess transports. Keep a
+    # Claude-specific copy only when it was supplied for an actual native
+    # Claude runtime, so a later HTTP/ACP -> Claude fallback cannot mistake a
+    # stale Copilot command for the Claude executable.
+    agent._claude_cli_command = (
+        agent.acp_command if agent.api_mode == "claude_cli" else None
+    )
+    agent._claude_cli_args = (
+        list(agent.acp_args) if agent.api_mode == "claude_cli" else []
+    )
+    # Long-lived chat sessions keep a resumable Claude binding by default.
+    # One-shot surfaces (cron, background jobs, batch samples, curator passes,
+    # and delegated children) opt this internal flag out before their first
+    # turn: their generated session ids are never reused, so persisting those
+    # bindings only fills the native-session pool and runtime directory.
+    agent._claude_cli_persistent_binding = True
+
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent
     # was constructed with provider=None and an anthropic.com URL.
@@ -2563,6 +2580,12 @@ def init_agent(
             )
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
+    # Keep selection provenance explicit. A plugin may legitimately subclass
+    # ContextCompressor to reuse its helpers; runtime ownership decisions must
+    # still treat that configured instance as external rather than guessing
+    # solely from its Python type.
+    agent._context_engine_is_external = _selected_engine is not None
+
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy: the host compression
@@ -2908,6 +2931,8 @@ def init_agent(
         "requested_provider": agent.requested_provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "claude_cli_command": getattr(agent, "_claude_cli_command", None),
+        "claude_cli_args": list(getattr(agent, "_claude_cli_args", []) or []),
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,

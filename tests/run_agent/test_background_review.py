@@ -203,6 +203,92 @@ def test_new_live_turn_cancels_still_running_background_review(monkeypatch):
     assert calls == ["superseded by a new live turn"]
 
 
+def test_background_review_inherits_keychain_claude_runtime_and_isolates_history(
+    monkeypatch,
+):
+    """A native review fork inherits runtime config but not live history."""
+    captured = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = dict(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            captured["run"] = dict(kwargs)
+            captured["state"] = {
+                "persist_disabled": self._persist_disabled,
+                "session_db": self._session_db,
+                "session_json_enabled": self._session_json_enabled,
+                "session_id": self.session_id,
+                "compression_enabled": self.compression_enabled,
+                "end_session_on_close": self._end_session_on_close,
+            }
+            return {"final_response": "", "messages": []}
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    agent = _bare_agent()
+    agent.model = "claude-sonnet-4-6"
+    agent.provider = "anthropic"
+    agent.api_mode = "claude_cli"
+    agent.api_key = ""
+    agent.base_url = ""
+    agent.acp_command = "/opt/claude"
+    agent.acp_args = ["--setting-sources", ""]
+    agent.reasoning_config = {"enabled": True, "effort": "high"}
+    agent.ephemeral_system_prompt = "stable gateway context"
+    agent.prefill_messages = []
+    agent.enabled_toolsets = ["memory", "skills", "terminal"]
+    agent.disabled_toolsets = []
+    agent.request_overrides = {}
+    agent.max_tokens = None
+    agent._credential_pool = None
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+
+    snapshot = [
+        {
+            "role": "user" if i % 2 == 0 else "assistant",
+            "content": f"historical row {i}",
+        }
+        for i in range(40)
+    ]
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=snapshot,
+        review_memory=True,
+        review_skills=True,
+    )
+
+    kwargs = captured["kwargs"]
+    assert kwargs["provider"] == "anthropic"
+    assert kwargs["model"] == "claude-sonnet-4-6"
+    assert kwargs["api_mode"] == "claude_cli"
+    assert kwargs["api_key"] is None
+    assert kwargs["acp_command"] == "/opt/claude"
+    assert kwargs["acp_args"] == ["--setting-sources", ""]
+    assert kwargs["reasoning_config"] == agent.reasoning_config
+    assert kwargs["ephemeral_system_prompt"] == agent.ephemeral_system_prompt
+    review_history = captured["run"]["conversation_history"]
+    assert review_history[0]["content"].startswith("[Earlier conversation digest")
+    assert review_history[-1] == snapshot[-1]
+    assert len(review_history) < len(snapshot)
+    assert captured["state"] == {
+        "persist_disabled": True,
+        "session_db": None,
+        "session_json_enabled": False,
+        "session_id": agent.session_id,
+        "compression_enabled": False,
+        "end_session_on_close": False,
+    }
+
 
 
 

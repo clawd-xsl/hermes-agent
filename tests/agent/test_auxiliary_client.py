@@ -11,6 +11,8 @@ import pytest
 
 from agent.auxiliary_client import (
     _NOUS_MODEL,
+    AsyncClaudeCliAuxiliaryClient,
+    ClaudeCliAuxiliaryClient,
     CodexAuxiliaryClient,
     get_text_auxiliary_client,
     get_available_vision_backends,
@@ -37,7 +39,366 @@ from agent.auxiliary_client import (
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
     _pool_runtime_base_url,
+    _read_main_api_mode,
 )
+
+
+class TestClaudeCliAuxiliaryClient:
+    def test_reads_claude_runtime_from_config_without_live_turn(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._runtime_main_value", lambda _field: ""
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {
+                "model": {
+                    "provider": "anthropic",
+                    "anthropic_runtime": "claude_cli",
+                }
+            },
+        )
+
+        assert _read_main_api_mode() == "claude_cli"
+
+    def test_resolves_without_anthropic_http_credentials(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._try_anthropic",
+            lambda *args, **kwargs: pytest.fail(
+                "claude_cli must not consult Anthropic HTTP credentials"
+            ),
+        )
+
+        client, model = resolve_provider_client(
+            "anthropic",
+            model="anthropic/claude-opus-4-6",
+            api_mode="claude_cli",
+        )
+
+        assert isinstance(client, ClaudeCliAuxiliaryClient)
+        assert model == "claude-opus-4-6"
+        assert client.base_url == "claude-cli://local"
+
+    def test_turn_external_auto_resolution_reads_configured_runtime(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "anthropic"
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model",
+            lambda: "claude-opus-4-6",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_api_mode", lambda: "claude_cli"
+        )
+
+        client, model = resolve_provider_client(
+            "auto",
+            main_runtime={},
+            task="goal_judge",
+        )
+
+        assert isinstance(client, ClaudeCliAuxiliaryClient)
+        assert model == "claude-opus-4-6"
+
+    def test_explicit_anthropic_task_slot_inherits_main_claude_runtime(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda _task: {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+            },
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "anthropic"
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_api_mode", lambda: "claude_cli"
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._try_anthropic",
+            lambda *args, **kwargs: pytest.fail(
+                "matching keychain runtime must not probe Anthropic HTTP auth"
+            ),
+        )
+
+        client, model = get_text_auxiliary_client("goal_judge")
+
+        assert isinstance(client, ClaudeCliAuxiliaryClient)
+        assert model == "claude-sonnet-4-6"
+
+    def test_explicit_http_mode_wins_over_main_claude_runtime(self, monkeypatch):
+        sentinel = object()
+        seen = []
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "anthropic"
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_api_mode", lambda: "claude_cli"
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._try_anthropic",
+            lambda **kwargs: (seen.append(kwargs) or (sentinel, "http-default")),
+        )
+
+        client, model = resolve_provider_client(
+            "anthropic",
+            model="claude-sonnet-4-6",
+            api_mode="anthropic_messages",
+        )
+
+        assert client is sentinel
+        assert model == "claude-sonnet-4-6"
+        assert seen == [{"explicit_api_key": None}]
+
+    def test_chat_facade_maps_native_result_and_usage(self, monkeypatch):
+        calls = []
+
+        def _complete(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                final_text="native answer",
+                projected_messages=[
+                    {
+                        "role": "assistant",
+                        "content": "native answer",
+                        "reasoning": "private reasoning",
+                    }
+                ],
+                token_usage={
+                    "input_tokens": 5,
+                    "cache_read_input_tokens": 7,
+                    "cache_creation_input_tokens": 3,
+                    "output_tokens": 11,
+                },
+            )
+
+        monkeypatch.setattr(
+            "agent.claude_cli_runtime.run_claude_cli_auxiliary_completion",
+            _complete,
+        )
+        client = ClaudeCliAuxiliaryClient("claude-opus-4-6")
+
+        response = client.chat.completions.create(
+            model="claude-sonnet-4-6",
+            messages=[
+                {"role": "system", "content": "Return one word"},
+                {"role": "user", "content": "answer"},
+            ],
+            timeout=17,
+            _reasoning_config={"enabled": True, "effort": "low"},
+        )
+
+        assert response.choices[0].message.content == "native answer"
+        assert response.choices[0].message.reasoning == "private reasoning"
+        assert response.usage.prompt_tokens == 15
+        assert response.usage.completion_tokens == 11
+        assert response.usage.total_tokens == 26
+        assert calls == [{
+            "messages": [
+                {"role": "system", "content": "Return one word"},
+                {"role": "user", "content": "answer"},
+            ],
+            "model": "claude-sonnet-4-6",
+            "timeout": 17,
+            "reasoning_config": {"enabled": True, "effort": "low"},
+        }]
+
+    def test_tool_calls_are_returned_to_the_outer_host_without_execution(
+        self, monkeypatch
+    ):
+        calls = []
+
+        def _complete(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                final_text="",
+                projected_messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "act",
+                                    "arguments": '{"value": 7}',
+                                },
+                            }
+                        ],
+                    }
+                ],
+                token_usage={"input_tokens": 4, "output_tokens": 2},
+            )
+
+        monkeypatch.setattr(
+            "agent.claude_cli_runtime.run_claude_cli_auxiliary_completion",
+            _complete,
+        )
+        client = ClaudeCliAuxiliaryClient("claude-opus-4-6")
+        tools = [{"type": "function", "function": {"name": "act"}}]
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": "act"}],
+            tools=tools,
+            tool_choice="required",
+        )
+
+        choice = response.choices[0]
+        assert choice.finish_reason == "tool_calls"
+        assert choice.message.content == ""
+        assert choice.message.tool_calls[0].id == "call_1"
+        assert choice.message.tool_calls[0].function.name == "act"
+        assert choice.message.tool_calls[0].function.arguments == '{"value": 7}'
+        assert calls[0]["tools"] == tools
+        assert calls[0]["tool_choice"] == "required"
+
+    def test_structured_response_format_reaches_claude_json_schema(
+        self, monkeypatch
+    ):
+        calls = []
+
+        def _complete(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                final_text='{"answer":"yes"}',
+                projected_messages=[],
+                token_usage={},
+                last_stop_reason="end_turn",
+            )
+
+        monkeypatch.setattr(
+            "agent.claude_cli_runtime.run_claude_cli_auxiliary_completion",
+            _complete,
+        )
+        client = ClaudeCliAuxiliaryClient("claude-opus-4-6")
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": "answer as JSON"}],
+            extra_body={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": schema,
+                        "strict": False,
+                    },
+                }
+            },
+        )
+
+        assert calls[0]["json_schema"] == schema
+        assert response.choices[0].message.content == '{"answer":"yes"}'
+        assert response.choices[0].finish_reason == "stop"
+
+    def test_json_object_response_format_uses_object_schema(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "agent.claude_cli_runtime.run_claude_cli_auxiliary_completion",
+            lambda **kwargs: calls.append(kwargs)
+            or SimpleNamespace(
+                final_text="{}",
+                projected_messages=[],
+                token_usage={},
+            ),
+        )
+        client = ClaudeCliAuxiliaryClient("claude-opus-4-6")
+
+        client.chat.completions.create(
+            messages=[{"role": "user", "content": "return JSON"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert calls[0]["json_schema"] == {"type": "object"}
+
+    def test_explicit_auxiliary_output_cap_reaches_native_child(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "agent.claude_cli_runtime.run_claude_cli_auxiliary_completion",
+            lambda **kwargs: calls.append(kwargs)
+            or SimpleNamespace(
+                final_text="bounded",
+                projected_messages=[],
+                token_usage={},
+            ),
+        )
+        client = ClaudeCliAuxiliaryClient("claude-opus-4-6")
+
+        client.chat.completions.create(
+            messages=[{"role": "user", "content": "answer"}],
+            max_completion_tokens=321,
+        )
+
+        assert calls[0]["max_tokens"] == 321
+
+    @pytest.mark.asyncio
+    async def test_async_facade_uses_native_adapter(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.claude_cli_runtime.run_claude_cli_auxiliary_completion",
+            lambda **kwargs: SimpleNamespace(
+                final_text="async native",
+                projected_messages=[],
+                token_usage={},
+            ),
+        )
+        client, model = resolve_provider_client(
+            "anthropic",
+            model="claude-opus-4-6",
+            api_mode="claude_cli",
+            async_mode=True,
+        )
+
+        assert isinstance(client, AsyncClaudeCliAuxiliaryClient)
+        response = await client.chat.completions.create(
+            messages=[{"role": "user", "content": "answer"}],
+        )
+        assert model == "claude-opus-4-6"
+        assert response.choices[0].message.content == "async native"
+
+    def test_vision_auto_inherits_main_claude_cli_transport(self, monkeypatch):
+        sentinel = object()
+        calls = []
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            lambda *args, **kwargs: ("auto", None, None, None, None),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_provider_vision_default",
+            lambda provider: None,
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._main_model_supports_vision",
+            lambda provider, model: True,
+        )
+
+        def _resolve(provider, model=None, **kwargs):
+            calls.append((provider, model, kwargs))
+            return sentinel, model
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client.resolve_provider_client", _resolve
+        )
+
+        provider, client, model = resolve_vision_provider_client(
+            provider="auto",
+            main_runtime={
+                "provider": "anthropic",
+                "model": "claude-opus-4-6",
+                "api_mode": "claude_cli",
+            },
+        )
+
+        assert (provider, client, model) == (
+            "anthropic", sentinel, "claude-opus-4-6"
+        )
+        assert calls[0][2]["api_mode"] == "claude_cli"
 
 
 def _jwt_with_claims(claims: dict) -> str:
@@ -1148,6 +1509,32 @@ class TestVisionClientFallback:
             backends = get_available_vision_backends()
 
         assert "anthropic" in backends
+
+    def test_vision_capability_probe_inherits_main_claude_runtime(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "anthropic"
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model",
+            lambda: "claude-sonnet-4-6",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_api_mode", lambda: "claude_cli"
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._strict_vision_backend_available",
+            lambda _provider: False,
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._try_anthropic",
+            lambda *args, **kwargs: pytest.fail(
+                "vision capability probe must not require Anthropic HTTP auth"
+            ),
+        )
+
+        assert get_available_vision_backends() == ["anthropic"]
 
 
     def test_anthropic_auxiliary_client_aggregates_stream_response(self):
