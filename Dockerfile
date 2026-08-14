@@ -264,7 +264,7 @@ RUN cd plugins/platforms/photon/sidecar && \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
+RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra claude-agent-sdk --extra bedrock --extra azure-identity --extra hindsight --extra matrix
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
@@ -419,7 +419,8 @@ COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-di
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
+# Railway rejects Dockerfile VOLUME declarations. The production service
+# mounts its managed persistent volume at /opt/data via service configuration.
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
 # When the image really owns PID 1 (normal Docker / Podman), the dispatcher
@@ -453,5 +454,16 @@ VOLUME [ "/opt/data" ]
 # supervised PID-1 path and the non-PID-1 fallback path. Without the
 # wrapper-as-ENTRYPOINT, leading-dash args like `--version` would be
 # intercepted by /init's POSIX shell.
+# This deployment context is prepared on Windows. Normalize the executable
+# control files after all COPY steps so s6 does not parse values such as
+# `longrun\r` and shell shebangs remain valid inside Linux containers.
+RUN find /opt/hermes/docker /etc/s6-overlay/s6-rc.d /etc/cont-init.d -type f \
+        \( -name '*.sh' -o -name run -o -name finish -o -name type \
+           -o -path '*/cont-init.d/*' \) \
+        -exec sed -i 's/\r$//' {} + && \
+    find /opt/hermes/docker /etc/s6-overlay/s6-rc.d /etc/cont-init.d -type f \
+        \( -name '*.sh' -o -name run -o -name finish \
+           -o -path '*/cont-init.d/*' \) \
+        -exec chmod 0755 {} +
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]
