@@ -309,13 +309,21 @@ auxiliary:
 When you point it at a model **different** from your main one, the review runs
 there for substantially lower cost (~3–5× in benchmarks). Because a different
 model can't reuse your main model's prompt cache anyway, the fork automatically
-replays a compact **digest** of the conversation (recent turns verbatim + a
-summary of older ones) rather than the full transcript — minimizing what it
-writes to the new cache. Capture holds: in testing, memory capture was
-identical and skill capture near-identical to the main-model review.
+replays a compact **digest** of the conversation (a payload-bounded semantic
+copy of recent turns + a bounded summary of older ones) rather than the full
+transcript — minimizing what it writes to the new cache. Historical binary
+attachments, oversized tool arguments, and large tool results are represented
+without replaying their raw payloads. The persistent Claude Agent SDK runtime uses
+the same digest even on the main model: its foreground history/cache is private
+to the native child and cannot safely be shared with the isolated review fork,
+while Hermes intentionally retains a lossless visible transcript after native
+compaction. The bound keeps long-lived personal-assistant sessions reviewable
+without contaminating the foreground thread. Capture holds: in testing, memory
+capture was identical and skill capture near-identical to the full replay.
 
-Leave it at `auto` (or set it to your main model) and nothing changes — the
-review keeps running on the main model with the full warm-cache replay.
+Leave it at `auto` (or set it to your main model) to keep using the main model.
+Direct HTTP runtimes retain the full warm-cache replay; persistent Claude uses
+the isolated bounded replay described above.
 
 ## Controlling skill writes (`skills.write_approval`)
 

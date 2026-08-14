@@ -169,6 +169,24 @@ model:
   default: "claude-sonnet-4-6"
 ```
 
+If Hermes is your always-on personal assistant and first-token latency matters,
+you can let a persistent Claude Agent SDK client own the model session while
+Hermes continues to own channels, memory, skills, approvals, and tools:
+
+```yaml
+model:
+  provider: "anthropic"
+  default: "claude-sonnet-4-6"
+  anthropic_runtime: "claude_agent_sdk"
+```
+
+This path uses the SDK's version-matched Claude Code runtime, Claude Code's own
+login, and an in-process Hermes MCP server. Agent SDK traffic uses Anthropic's
+separate monthly Agent SDK credit and then usage credits (if enabled), not the
+interactive Claude subscription quota. Hermes does not copy its API bearer or
+run a second HTTP model client. See
+[Persistent Claude Agent SDK Runtime](/user-guide/features/claude-agent-sdk-runtime).
+
 :::tip Aliases
 `--provider claude` and `--provider claude-code` also work as shorthand for `--provider anthropic`.
 :::

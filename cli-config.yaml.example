@@ -137,11 +137,14 @@ model:
 # Use this for per-provider request timeouts, non-stream stale timeouts,
 # and per-model exceptions.
 # Applies to the primary turn client on every api_mode (OpenAI-wire, native
-# Anthropic, and Anthropic-compatible providers), the fallback chain, and
+# Anthropic, Anthropic-compatible providers, and persistent Claude Agent SDK), the fallback chain, and
 # client rebuilds during credential rotation.  For OpenAI-wire chat
 # completions (streaming and non-streaming) the configured value is also
 # used as the per-request ``timeout=`` kwarg so it wins over the legacy
-# HERMES_API_TIMEOUT env var (which still applies when no config is set).
+# HERMES_API_TIMEOUT env var (which still applies when no config is set). On
+# persistent Claude Agent SDK this is the inner provider-request timeout; the
+# complete private tool loop has its own model.claude_agent_sdk.turn_timeout_seconds
+# cap.
 # ``stale_timeout_seconds`` controls the non-streaming stale-call detector and
 # wins over the legacy HERMES_API_CALL_STALE_TIMEOUT env var. Leaving these
 # unset keeps the legacy defaults (HERMES_API_TIMEOUT=1800s,
