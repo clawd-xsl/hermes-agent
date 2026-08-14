@@ -7,6 +7,7 @@ import time
 import types
 from types import SimpleNamespace
 
+from agent.claude_cli_journal import ClaudeCliToolJournal
 from agent.claude_cli_loopback import ClaudeToolLoopback
 
 
@@ -829,8 +830,8 @@ def test_authoritative_batch_does_not_execute_duplicate_calls_twice():
         loopback.close()
 
 
-def test_mcp_first_race_waits_for_full_authoritative_intent_before_execution(
-    monkeypatch,
+def test_mcp_first_race_uses_wal_then_reconciles_delayed_authoritative_record(
+    monkeypatch, tmp_path,
 ):
     executed = threading.Event()
 
@@ -848,7 +849,12 @@ def test_mcp_first_race_waits_for_full_authoritative_intent_before_execution(
     fake_module.execute_tool_calls_sequential = fake_execute
     monkeypatch.setitem(sys.modules, "agent.tool_executor", fake_module)
     agent = _Agent()
-    loopback = ClaudeToolLoopback(agent, serve=False)
+    loopback = ClaudeToolLoopback(
+        agent,
+        serve=False,
+        owner_key="mcp-first",
+        journal=ClaudeCliToolJournal("mcp-first", root=tmp_path),
+    )
     history = [{"role": "user", "content": "run it"}]
     response_holder = []
 
@@ -884,15 +890,14 @@ def test_mcp_first_race_waits_for_full_authoritative_intent_before_execution(
             )
         )
         request_thread.start()
-        deadline = time.monotonic() + 2.0
-        with loopback._projection_condition:
-            while (
-                not any(entry.claimed for entry in loopback._tool_projections)
-                and time.monotonic() < deadline
-            ):
-                loopback._projection_condition.wait(timeout=0.05)
-        assert any(entry.claimed for entry in loopback._tool_projections)
-        assert executed.is_set() is False
+        request_thread.join(timeout=2.0)
+
+        assert request_thread.is_alive() is False
+        assert response_holder[0]["result"] == "done"
+        assert executed.is_set() is True
+        # Execution is crash-durable in the separate effect WAL, but no tool
+        # row can enter the transcript before its assistant tool-call row.
+        assert history == [{"role": "user", "content": "run it"}]
 
         reconciled = loopback.reconcile_authoritative_projection(
             [
@@ -918,11 +923,7 @@ def test_mcp_first_race_waits_for_full_authoritative_intent_before_execution(
         loopback.mark_authoritative_projection_persisted(
             reconciled, succeeded=True
         )
-        request_thread.join(timeout=2.0)
 
-        assert request_thread.is_alive() is False
-        assert response_holder[0]["result"] == "done"
-        assert executed.is_set() is True
         assert history[1]["content"] == "I will inspect this now."
         assert history[1]["reasoning"] == (
             "The echo tool is the correct next step."
@@ -931,6 +932,170 @@ def test_mcp_first_race_waits_for_full_authoritative_intent_before_execution(
         assert history[1]["tool_calls"][0]["id"] == "native-control-id"
         assert history[2]["tool_call_id"] == "native-control-id"
         assert len(history) == 3
+    finally:
+        loopback.end_turn()
+        loopback.close()
+
+
+def test_mcp_call_without_observed_native_tool_id_fails_closed():
+    agent = _Agent()
+    loopback = ClaudeToolLoopback(agent, serve=False)
+    try:
+        loopback.begin_turn(
+            task_id="missing-id",
+            user_task="run it",
+            messages=[{"role": "user", "content": "run it"}],
+        )
+
+        response = _request(
+            loopback,
+            {
+                "id": "call",
+                "token": loopback.token,
+                "method": "call_tool",
+                "params": {"name": "echo", "arguments": {"value": "hi"}},
+            },
+        )
+
+        assert response["error"]["type"] == "RuntimeError"
+        assert "durable native tool_use_id" in response["error"]["message"]
+    finally:
+        loopback.end_turn()
+        loopback.close()
+
+
+def test_partial_stream_batch_is_wal_durable_and_keeps_batch_planner(tmp_path):
+    class BatchAgent(_Agent):
+        def __init__(self):
+            self.batch_sizes = []
+
+        def _execute_tool_calls(
+            self,
+            assistant,
+            messages,
+            _task_id,
+            _api_call_count=0,
+            *,
+            persist_progress=True,
+        ):
+            assert persist_progress is False
+            self.batch_sizes.append(len(assistant.tool_calls))
+            for call in assistant.tool_calls:
+                value = json.loads(call.function.arguments)["value"]
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": call.function.name,
+                        "tool_call_id": call.id,
+                        "content": f"done:{value}",
+                        "effect_disposition": "performed",
+                    }
+                )
+
+    agent = BatchAgent()
+    journal = ClaudeCliToolJournal("batch-owner", root=tmp_path)
+    loopback = ClaudeToolLoopback(agent, serve=False, journal=journal)
+    history = [{"role": "user", "content": "run both"}]
+    try:
+        loopback.begin_turn(
+            task_id="task-1",
+            user_task="run both",
+            messages=history,
+            projection_callback=history.extend,
+        )
+        loopback.observe_stream_event(
+            {"type": "message_start", "message": {"id": "assistant-1"}}
+        )
+        for index, tool_id, value in ((0, "tool-a", "a"), (1, "tool-b", "b")):
+            loopback.observe_stream_event(
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": "mcp__hermes__echo",
+                        "input": {},
+                    },
+                }
+            )
+            loopback.observe_stream_event(
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps({"value": value}),
+                    },
+                }
+            )
+            loopback.observe_stream_event(
+                {"type": "content_block_stop", "index": index}
+            )
+        loopback.observe_stream_event({"type": "message_stop"})
+        loopback.register_tool_request(
+            name="echo", arguments={"value": "a"}, claude_id="tool-a"
+        )
+        loopback.register_tool_request(
+            name="echo", arguments={"value": "b"}, claude_id="tool-b"
+        )
+
+        assert loopback._call_tool(
+            {"name": "echo", "arguments": {"value": "a"}}
+        ) == "done:a"
+        assert loopback._call_tool(
+            {"name": "echo", "arguments": {"value": "b"}}
+        ) == "done:b"
+        assert agent.batch_sizes == [2]
+        assert history == [{"role": "user", "content": "run both"}]
+        assert {row["state"] for row in journal.snapshot().values()} == {
+            "completed"
+        }
+
+        authoritative = loopback.reconcile_authoritative_projection(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Running both.",
+                    "tool_calls": [
+                        {
+                            "id": "tool-a",
+                            "type": "function",
+                            "function": {
+                                "name": "echo",
+                                "arguments": '{"value":"a"}',
+                            },
+                        },
+                        {
+                            "id": "tool-b",
+                            "type": "function",
+                            "function": {
+                                "name": "echo",
+                                "arguments": '{"value":"b"}',
+                            },
+                        },
+                    ],
+                }
+            ]
+        )
+        history.extend(authoritative)
+        loopback.mark_authoritative_projection_persisted(
+            authoritative, succeeded=True
+        )
+
+        assert [row["role"] for row in history] == [
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+        ]
+        assert [row["tool_call_id"] for row in history[2:]] == [
+            "tool-a",
+            "tool-b",
+        ]
+        assert {row["state"] for row in journal.snapshot().values()} == {
+            "reconciled"
+        }
     finally:
         loopback.end_turn()
         loopback.close()

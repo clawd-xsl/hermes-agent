@@ -4,6 +4,7 @@ import io
 import json
 import os
 import queue
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,9 +26,10 @@ class _Agent:
 
 
 class _Loopback:
-    def __init__(self, agent):
+    def __init__(self, agent, **_kwargs):
         self.agent = agent
         self._agent = agent
+        self.observed_events = []
 
     def fingerprint(self):
         return "tools"
@@ -60,6 +62,9 @@ class _Loopback:
 
     def register_tool_request(self, **_kwargs):
         return None
+
+    def observe_stream_event(self, event):
+        self.observed_events.append(event)
 
     def close(self):
         return None
@@ -662,7 +667,7 @@ def test_resume_discards_native_binding_when_hermes_history_was_rewritten(
     session._history_signature = _hermes_history_signature(old_prefix)
     forgot = []
     seen_resume = []
-    monkeypatch.setattr(session, "_stop_process", lambda: None)
+    monkeypatch.setattr(session, "_stop_process", lambda **_kwargs: None)
     monkeypatch.setattr(
         "agent.transports.claude_cli_session._forget_binding",
         forgot.append,
@@ -756,6 +761,79 @@ def test_native_stdin_sanitizes_lone_surrogates(tmp_path, monkeypatch):
     finally:
         session._process = None
         session.close()
+
+
+def test_retired_reader_cannot_publish_into_replacement_process_queue(
+    tmp_path, monkeypatch
+):
+    session = _session(tmp_path, monkeypatch)
+    retired_events = queue.Queue()
+    replacement_events = queue.Queue()
+    session._events = replacement_events
+    process = SimpleNamespace(
+        stdout=io.StringIO('{"type":"result","result":"old"}\n'),
+        poll=lambda: 0,
+    )
+
+    session._read_stdout(process, retired_events, generation=7)
+
+    assert retired_events.get_nowait()["result"] == "old"
+    exit_event = retired_events.get_nowait()
+    assert exit_event == {
+        "type": "_process_exit",
+        "exit_code": 0,
+        "generation": 7,
+    }
+    assert replacement_events.empty()
+
+
+def test_retired_stderr_reader_cannot_contaminate_replacement_tail(
+    tmp_path, monkeypatch
+):
+    session = _session(tmp_path, monkeypatch)
+    retired_stderr = deque(maxlen=80)
+    with session._stderr_lock:
+        session._stderr = deque(["new process"], maxlen=80)
+    process = SimpleNamespace(stderr=io.StringIO("old process\n"))
+
+    session._read_stderr(process, retired_stderr)
+
+    assert list(retired_stderr) == ["old process"]
+    assert session.stderr_tail() == "new process"
+
+
+def test_graceful_stop_closes_stdin_before_signalling_child(tmp_path, monkeypatch):
+    session = _session(tmp_path, monkeypatch)
+
+    class Process:
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.returncode = None
+            self.pid = 123
+            self.signalled = False
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            assert timeout > 0
+            assert self.stdin.closed is True
+            self.returncode = 0
+            return 0
+
+    process = Process()
+    session._process = process
+    monkeypatch.setattr(
+        session,
+        "_signal_process",
+        lambda *_args, **_kwargs: setattr(process, "signalled", True),
+    )
+
+    session._stop_process(graceful=True)
+
+    assert process.stdin.closed is True
+    assert process.signalled is False
+    assert session._process is None
 
 
 def test_stream_protocol_projects_tools_and_keeps_only_final_assistant_text(
@@ -925,6 +1003,14 @@ def test_stream_protocol_projects_tools_and_keeps_only_final_assistant_text(
         assert writes[0]["type"] == "user"
         assert reasoning_deltas == ["private thought"]
         assert tool_gen == ["echo"]
+        assert [event["type"] for event in session.loopback.observed_events] == [
+            "message_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_start",
+            "message_start",
+            "content_block_delta",
+        ]
         assert steps == [
             (1, []),
             (
@@ -1345,7 +1431,9 @@ def test_manual_compact_temporarily_lifts_disabled_automatic_policy(
     stopped = []
     observed_envs = []
 
-    monkeypatch.setattr(session, "_stop_process", lambda: stopped.append(True))
+    monkeypatch.setattr(
+        session, "_stop_process", lambda **_kwargs: stopped.append(True)
+    )
 
     def run_once(**_kwargs):
         observed_envs.append(session._build_env())

@@ -5,11 +5,13 @@ sidebar_label: Persistent Claude CLI Runtime
 
 # Persistent Claude CLI Runtime
 
-Hermes can hand Anthropic turns to one long-lived Claude Code process instead
-of creating an HTTP request loop itself. Claude owns the native conversation,
-prompt cache, and compaction. Hermes still owns the visible session, messaging
-channels, memory, skills, approvals, scheduled delivery, and every configured
-tool.
+Hermes can hand Anthropic turns to one long-lived Claude Code process through
+Claude Code's bidirectional stream-JSON CLI protocol instead of creating an
+HTTP request loop itself. This runtime is a direct process wrapper; it does not
+install or import a separate Claude client library. Claude owns the native
+conversation, prompt cache, and compaction. Hermes still owns the visible
+session, messaging channels, memory, skills, approvals, scheduled delivery,
+and every configured tool.
 
 The process stays alive across turns. This avoids repeated Node startup,
 credential loading, MCP discovery, and system-prompt ingestion, which is most
@@ -155,12 +157,17 @@ standard sequential tool executor, preserving:
 - live agent tools such as memory, skills, session search, todo, and delegation.
 
 Tool intent is persisted before execution and its result immediately after.
-Claude's stdout event and its parallel MCP request may arrive in either order;
-the bridge reconciles them by native tool id and call signature so the
-transcript contains one durable tool pair without allowing a side effect to
-overtake persistence. If Claude reuses an id inside one batch, Hermes applies
-the same deterministic `_d2`, `_d3`, ... repair as the standard agent loop so
-later results cannot overwrite earlier calls.
+This uses a private effect write-ahead log, separate from conversation history,
+because Claude's stdout record and parallel MCP request may arrive in either
+order. Requiring the complete assistant record first would deadlock when Claude
+waits for MCP before emitting that record. The bridge instead advances each
+effect through `prepared → running → completed → reconciled`, then merges the
+complete assistant row and cached results into the transcript in strict role
+order. A `running` effect left by a process crash has an unknown outcome and is
+never executed again automatically; a `completed` result can be replayed
+without repeating the side effect. If Claude reuses an id inside one batch,
+Hermes applies the same deterministic `_d2`, `_d3`, ... repair as the standard
+agent loop so later results cannot overwrite earlier calls.
 
 The Claude subprocess is not given Hermes' Anthropic HTTP API credentials. An
 explicit `CLAUDE_CODE_OAUTH_TOKEN` is passed through only as Claude Code's own
@@ -180,6 +187,14 @@ Each result includes `claude_session_reuse` (`cold_miss`, `native_resume`,
 process startup, first parsed record, first text, total turn time, and process
 age. These are available to gateway/session diagnostics without being inserted
 into model context.
+
+Each child generation owns its own stdout queue and stderr tail, so a late
+reader from a retired process cannot inject an exit or error into its
+replacement. On POSIX, Claude and the private MCP proxy run in one dedicated
+process group so interrupts and timeout escalation reap the whole runtime.
+Normal shutdown closes stdin first and gives Claude time to flush its native
+session before escalating to termination; failed or wedged children remain
+bounded by TERM/KILL deadlines.
 
 Hermes maps `model.max_tokens` to Claude Code's native output cap, translates
 Hermes' total API-attempt ceiling to Claude's retry count, and applies

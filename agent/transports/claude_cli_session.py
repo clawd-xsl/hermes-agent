@@ -17,6 +17,7 @@ import logging
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 _MAX_JSONL_LINE_CHARS = 8 * 1024 * 1024
 _STDERR_TAIL_LINES = 80
+_GRACEFUL_CLOSE_SECONDS = 5.0
+_TERMINATE_SECONDS = 3.0
 _BINDING_LOCK = threading.RLock()
 _PROCESS_ENV_CLEAR = {
     "API_TIMEOUT_MS",
@@ -504,9 +507,13 @@ class ClaudeCliSession:
         self.auto_compaction_enabled = bool(auto_compaction_enabled)
         self.json_schema = dict(json_schema) if isinstance(json_schema, dict) else None
         self.loopback = (
-            ClaudeToolLoopback(agent)
+            ClaudeToolLoopback(agent, owner_key=owner_key)
             if tool_definitions is None
-            else ClaudeToolLoopback(agent, tool_definitions=tool_definitions)
+            else ClaudeToolLoopback(
+                agent,
+                tool_definitions=tool_definitions,
+                owner_key=owner_key,
+            )
         )
         self.tool_fingerprint = self.loopback.fingerprint()
         self.native_session_id = _load_binding(owner_key) if persistent_binding else None
@@ -521,6 +528,8 @@ class ClaudeCliSession:
         self._stderr: collections.deque[str] = collections.deque(maxlen=_STDERR_TAIL_LINES)
         self._reader_threads: list[threading.Thread] = []
         self._write_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._stderr_lock = threading.Lock()
         self._turn_lock = threading.Lock()
         self._interrupt_requested = threading.Event()
         self._runtime_dir: Optional[Path] = None
@@ -528,6 +537,8 @@ class ClaudeCliSession:
         self._created_at = time.monotonic()
         self._last_used_at = self._created_at
         self._process_started_at: Optional[float] = None
+        self._process_group_id: Optional[int] = None
+        self._process_generation = 0
         self._turns_completed = 0
 
     @property
@@ -765,61 +776,102 @@ class ClaudeCliSession:
         return args
 
     def ensure_started(self) -> None:
-        if self._closed:
-            raise RuntimeError("Claude CLI session is closed")
-        if self.is_alive:
-            return
-        if shutil.which(self.command) is None:
-            raise RuntimeError(
-                f"Claude Code executable not found: {self.command}. Install @anthropic-ai/claude-code and run `claude login`."
-            )
-        if importlib.util.find_spec("mcp") is None:
-            raise RuntimeError(
-                "Claude CLI runtime requires the Hermes MCP extra. Install with `pip install 'hermes-agent[mcp]'`."
-            )
-        self._events = queue.Queue()
-        self._stderr.clear()
-        self._process = subprocess.Popen(
-            self._build_args(),
-            cwd=self.cwd,
-            env=self._build_env(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        # We choose the UUID before launch, so persist the binding as soon as
-        # the child exists rather than waiting for a successful terminal
-        # result. If Hermes crashes mid-first-turn, Claude's on-disk native
-        # transcript can then be resumed instead of silently cold-bootstrapped.
-        # A launch that never materializes a Claude session is harmless: the
-        # existing resume-missing recovery forgets the stale binding.
-        if self.persistent_binding and self.native_session_id:
-            _save_binding(self.owner_key, self.native_session_id)
-        self._process_started_at = time.monotonic()
-        assert self._process.stdout is not None and self._process.stderr is not None
-        stdout_thread = threading.Thread(target=self._read_stdout, daemon=True, name="claude-cli-stdout")
-        stderr_thread = threading.Thread(target=self._read_stderr, daemon=True, name="claude-cli-stderr")
-        self._reader_threads = [stdout_thread, stderr_thread]
-        stdout_thread.start()
-        stderr_thread.start()
-        logger.info(
-            "Claude CLI live session started (owner=%s resume=%s pid=%s)",
-            self.owner_key,
-            self._resume,
-            self._process.pid,
-        )
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Claude CLI session is closed")
+            if self.is_alive:
+                return
+            if shutil.which(self.command) is None:
+                raise RuntimeError(
+                    f"Claude Code executable not found: {self.command}. Install @anthropic-ai/claude-code and run `claude login`."
+                )
+            if importlib.util.find_spec("mcp") is None:
+                raise RuntimeError(
+                    "Claude CLI runtime requires the Hermes MCP extra. Install with `pip install 'hermes-agent[mcp]'`."
+                )
 
-    def _read_stdout(self) -> None:
-        process = self._process
-        if process is None or process.stdout is None:
+            events: "queue.Queue[dict[str, Any]]" = queue.Queue()
+            stderr: collections.deque[str] = collections.deque(
+                maxlen=_STDERR_TAIL_LINES
+            )
+            spawn_kwargs: dict[str, Any] = {}
+            if os.name != "nt":
+                # Claude launches the stdio MCP proxy as a descendant. A
+                # dedicated process group lets timeout/interrupt cleanup reap
+                # the complete private runtime instead of orphaning the proxy.
+                spawn_kwargs["start_new_session"] = True
+            process = subprocess.Popen(
+                self._build_args(),
+                cwd=self.cwd,
+                env=self._build_env(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                **spawn_kwargs,
+            )
+            self._process_generation += 1
+            generation = self._process_generation
+            self._events = events
+            with self._stderr_lock:
+                self._stderr = stderr
+            self._process = process
+            self._process_group_id = process.pid if os.name != "nt" else None
+
+            # We choose the UUID before launch, so persist the binding as soon
+            # as the child exists. A crash during the first turn can resume
+            # Claude's native transcript; a launch that never materializes is
+            # handled by the existing missing-resume recovery.
+            if self.persistent_binding and self.native_session_id:
+                _save_binding(self.owner_key, self.native_session_id)
+            self._process_started_at = time.monotonic()
+            assert process.stdout is not None and process.stderr is not None
+            stdout_thread = threading.Thread(
+                target=self._read_stdout,
+                args=(process, events, generation),
+                daemon=True,
+                name=f"claude-cli-stdout-{generation}",
+            )
+            stderr_thread = threading.Thread(
+                target=self._read_stderr,
+                args=(process, stderr),
+                daemon=True,
+                name=f"claude-cli-stderr-{generation}",
+            )
+            self._reader_threads = [stdout_thread, stderr_thread]
+            stdout_thread.start()
+            stderr_thread.start()
+            logger.info(
+                "Claude CLI live session started (owner=%s resume=%s pid=%s generation=%d)",
+                self.owner_key,
+                self._resume,
+                process.pid,
+                generation,
+            )
+
+    def _read_stdout(
+        self,
+        process: subprocess.Popen[str],
+        events: "queue.Queue[dict[str, Any]]",
+        generation: int,
+    ) -> None:
+        if process.stdout is None:
             return
-        for line in process.stdout:
-            if len(line) > _MAX_JSONL_LINE_CHARS:
-                self._events.put({"type": "_transport_error", "error": "Claude JSONL line exceeded 8 MiB"})
+        while True:
+            line = process.stdout.readline(_MAX_JSONL_LINE_CHARS + 1)
+            if not line:
+                break
+            if len(line) > _MAX_JSONL_LINE_CHARS or not line.endswith("\n"):
+                events.put(
+                    {
+                        "type": "_transport_error",
+                        "error": "Claude JSONL record exceeded 8 MiB or was unterminated",
+                        "generation": generation,
+                    }
+                )
                 return
             try:
                 parsed = json.loads(line)
@@ -827,21 +879,36 @@ class ClaudeCliSession:
                 logger.debug("Ignoring non-JSON Claude stdout: %s", line[:300])
                 continue
             if isinstance(parsed, dict):
-                self._events.put(parsed)
+                events.put(parsed)
         exit_code = process.poll()
         if exit_code is None:
             try:
                 exit_code = process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 exit_code = None
-        self._events.put({"type": "_process_exit", "exit_code": exit_code})
+        # This reader owns its queue. A late exit from an older generation can
+        # never inject a false process-exit event into a replacement child.
+        events.put(
+            {
+                "type": "_process_exit",
+                "exit_code": exit_code,
+                "generation": generation,
+            }
+        )
 
-    def _read_stderr(self) -> None:
-        process = self._process
-        if process is None or process.stderr is None:
+    def _read_stderr(
+        self,
+        process: subprocess.Popen[str],
+        stderr: collections.deque[str],
+    ) -> None:
+        if process.stderr is None:
             return
-        for line in process.stderr:
-            self._stderr.append(line.rstrip())
+        while True:
+            line = process.stderr.readline(_MAX_JSONL_LINE_CHARS + 1)
+            if not line:
+                return
+            with self._stderr_lock:
+                stderr.append(line[:_MAX_JSONL_LINE_CHARS].rstrip())
 
     def _write_json(self, payload: dict[str, Any]) -> None:
         process = self._process
@@ -1117,20 +1184,72 @@ class ClaudeCliSession:
             and any(marker in text for marker in ("not found", "does not exist", "no conversation found"))
         )
 
-    def _stop_process(self) -> None:
-        process = self._process
-        if process is not None and process.poll() is None:
-            process.terminate()
+    def _signal_process(self, process: subprocess.Popen[str], sig: int) -> None:
+        """Signal the Claude child and its MCP descendants when possible."""
+        if os.name != "nt" and self._process_group_id is not None:
             try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+                os.killpg(self._process_group_id, sig)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                logger.debug(
+                    "Claude CLI process-group signal failed; falling back to child",
+                    exc_info=True,
+                )
+        try:
+            if sig == signal.SIGKILL:
                 process.kill()
-                process.wait(timeout=3)
-        for reader in self._reader_threads:
-            reader.join(timeout=0.5)
-        self._reader_threads = []
-        self._process = None
-        self._process_started_at = None
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+
+    def _stop_process(self, *, graceful: bool = False) -> None:
+        with self._lifecycle_lock:
+            process = self._process
+            readers = list(self._reader_threads)
+            if process is not None and graceful and process.poll() is None:
+                # EOF lets Claude flush its native session file. Bound the
+                # write lock so a wedged stdin writer cannot pin shutdown.
+                acquired = self._write_lock.acquire(
+                    timeout=_GRACEFUL_CLOSE_SECONDS
+                )
+                if acquired:
+                    try:
+                        if process.stdin is not None and not process.stdin.closed:
+                            try:
+                                process.stdin.close()
+                            except OSError:
+                                pass
+                    finally:
+                        self._write_lock.release()
+                try:
+                    process.wait(timeout=_GRACEFUL_CLOSE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            if process is not None and process.poll() is None:
+                self._signal_process(process, signal.SIGTERM)
+                try:
+                    process.wait(timeout=_TERMINATE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    self._signal_process(process, signal.SIGKILL)
+                    try:
+                        process.wait(timeout=_TERMINATE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        logger.error(
+                            "Claude CLI child did not exit after SIGKILL (pid=%s)",
+                            process.pid,
+                        )
+
+            for reader in readers:
+                reader.join(timeout=0.5)
+            self._reader_threads = []
+            if self._process is process:
+                self._process = None
+            self._process_started_at = None
+            self._process_group_id = None
 
     def _reset_fresh_binding(self) -> None:
         self._stop_process()
@@ -1141,7 +1260,8 @@ class ClaudeCliSession:
         self._history_signature = None
         self._turns_completed = 0
         self._events = queue.Queue()
-        self._stderr.clear()
+        with self._stderr_lock:
+            self._stderr.clear()
 
     def run_turn(
         self,
@@ -1243,7 +1363,7 @@ class ClaudeCliSession:
     ) -> ClaudeCliTurnResult:
         """Compact the existing Claude-owned history in the live session.
 
-        Claude Code exposes native compaction to SDK/stream-json clients by
+        Claude Code exposes native compaction to stream-json clients by
         accepting ``/compact`` as a user input and emitting a
         ``system/compact_boundary`` record.  This operation deliberately does
         not project command chatter into Hermes' visible transcript and does
@@ -1605,11 +1725,23 @@ class ClaudeCliSession:
                     result.native_session_id = self.native_session_id
                     if self.persistent_binding:
                         _save_binding(self.owner_key, self.native_session_id)
+                inner = event.get("event")
+                if (
+                    event.get("type") == "stream_event"
+                    and isinstance(inner, dict)
+                    and not is_compaction
+                ):
+                    # Partial provider events establish the complete tool
+                    # batch before Claude may block waiting for MCP results.
+                    # The loopback writes that intent to its independent WAL;
+                    # the later complete assistant row still owns transcript
+                    # projection and narration.
+                    self.loopback.observe_stream_event(inner)
+
                 if event.get("type") == "control_request":
                     self._handle_control_request(event)
                     continue
 
-                inner = event.get("event")
                 if (
                     event.get("type") == "stream_event"
                     and isinstance(inner, dict)
@@ -2057,19 +2189,20 @@ class ClaudeCliSession:
         self._interrupt_requested.set()
         process = self._process
         if process is not None and process.poll() is None:
-            process.terminate()
+            self._signal_process(process, signal.SIGTERM)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._stop_process()
+        self._stop_process(graceful=True)
         self.loopback.close()
         if self._runtime_dir is not None:
             shutil.rmtree(self._runtime_dir, ignore_errors=True)
 
     def stderr_tail(self) -> str:
-        return "\n".join(self._stderr)
+        with self._stderr_lock:
+            return "\n".join(list(self._stderr))
 
 
 __all__ = [
