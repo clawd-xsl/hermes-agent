@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
 
 
@@ -262,6 +262,7 @@ async def enqueue_main_session_turn(
     event_id: str,
     raw_message: Any = None,
     metadata: Optional[dict[str, Any]] = None,
+    processing_complete: Optional[Callable[[ProcessingOutcome], Any]] = None,
 ) -> MainSessionEnqueueResult:
     """Accept one internal turn into the exact main-session FIFO."""
     prompt = str(text or "").strip()
@@ -293,6 +294,11 @@ async def enqueue_main_session_turn(
         internal=True,
         metadata={"main_session": True, **(metadata or {})},
     )
+    if processing_complete is not None:
+        # Private process-local acknowledgement. It deliberately stays out of
+        # MessageEvent.metadata so it cannot enter transcripts, plugin payloads,
+        # or serialization paths.
+        setattr(event, "_gateway_processing_complete_callback", processing_complete)
     session_key = runner._session_key_for_source(source)
     runner._cache_session_source(session_key, source)
 

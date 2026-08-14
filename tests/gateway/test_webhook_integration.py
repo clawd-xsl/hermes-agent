@@ -226,14 +226,16 @@ class TestMainSessionWebhook:
             chat_type="dm",
             user_id="+15551234567",
         )
-        enqueue = AsyncMock(
-            return_value=MainSessionEnqueueResult(
+        async def _enqueue_and_complete(*args, **kwargs):
+            await kwargs["processing_complete"](ProcessingOutcome.SUCCESS)
+            return MainSessionEnqueueResult(
                 session_key="agent:main:signal:dm:+15551234567",
                 platform="signal",
                 chat_id="+15551234567",
                 queued=True,
             )
-        )
+
+        enqueue = AsyncMock(side_effect=_enqueue_and_complete)
 
         with patch(
             "gateway.main_session.resolve_main_session_source",
@@ -254,6 +256,7 @@ class TestMainSessionWebhook:
             assert resp.status == 202
             assert data["session"] == "main"
             assert data["reviewing"] is True
+            assert data["durable"] is True
             assert enqueue.await_count == 0
             assert len(captured_events) == 1
 
@@ -286,12 +289,21 @@ class TestMainSessionWebhook:
                 review_event, ProcessingOutcome.SUCCESS
             )
 
+            # The completion hook durably writes pending_main; the outbox owns
+            # the enqueue so HTTP/reviewer lifecycles never carry an in-memory
+            # only handoff. Give that independently scheduled stage a turn.
+            for _ in range(50):
+                if enqueue.await_count:
+                    break
+                await asyncio.sleep(0.01)
+
         enqueue.assert_awaited_once()
         queued = enqueue.await_args.kwargs
         assert queued["source"] == home_source
         assert handoff in queued["text"]
         assert "Build notification:" not in queued["text"]
         assert queued["metadata"]["filtered"] is True
+        assert queued["raw_message"] is None
         adapter._end_webhook_session.assert_awaited_once_with(
             review_event, review_event.source.chat_id
         )
@@ -343,6 +355,53 @@ class TestMainSessionWebhook:
             )
 
         enqueue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_main_review_returns_503_when_durable_accept_fails(self):
+        adapter = _make_adapter({
+            "personal-alert": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message}",
+                "session": "main",
+            }
+        })
+        adapter.gateway_runner = MagicMock()
+        adapter.handle_message = AsyncMock()
+        home_source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="+15551234567",
+            chat_type="dm",
+            user_id="+15551234567",
+        )
+
+        with patch(
+            "gateway.main_session.resolve_main_session_source",
+            return_value=home_source,
+        ), patch.object(
+            adapter._review_store,
+            "get",
+            return_value=None,
+        ), patch.object(
+            adapter._review_store,
+            "accept",
+            side_effect=OSError("state.db unavailable"),
+        ) as accept:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                first = await cli.post(
+                    "/webhooks/personal-alert",
+                    json={"message": "do not lose me"},
+                    headers={"X-GitHub-Delivery": "durable-fail-001"},
+                )
+                second = await cli.post(
+                    "/webhooks/personal-alert",
+                    json={"message": "do not lose me"},
+                    headers={"X-GitHub-Delivery": "durable-fail-001"},
+                )
+
+        assert first.status == 503
+        assert second.status == 503
+        assert accept.call_count == 2
+        adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_main_route_failure_is_retryable(self):

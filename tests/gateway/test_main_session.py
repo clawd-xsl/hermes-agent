@@ -10,6 +10,7 @@ from gateway.main_session import (
     normalize_session_mode,
     resolve_main_session_source,
 )
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 
@@ -168,6 +169,39 @@ async def test_idle_main_turn_enters_normal_adapter_pipeline():
     assert event.internal is True
     assert event.text == "scheduled prompt"
     assert event.metadata == {"main_session": True, "trigger": "cron"}
+
+
+@pytest.mark.asyncio
+async def test_main_turn_completion_callback_stays_private_and_runs_once():
+    source = SessionSource(
+        platform=Platform.SIGNAL,
+        chat_id="+15551234567",
+        chat_type="dm",
+        user_id="+15551234567",
+    )
+    runner, adapter = _runner_with_home(source)
+    completed = AsyncMock()
+
+    await enqueue_main_session_turn(
+        runner,
+        source=source,
+        text="durable handoff",
+        event_id="webhook:alerts:1",
+        processing_complete=completed,
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert "processing_complete" not in event.metadata
+    assert callable(getattr(event, "_gateway_processing_complete_callback"))
+
+    await BasePlatformAdapter._run_event_completion_callback(
+        adapter, event, ProcessingOutcome.SUCCESS
+    )
+    await BasePlatformAdapter._run_event_completion_callback(
+        adapter, event, ProcessingOutcome.FAILURE
+    )
+
+    completed.assert_awaited_once_with(ProcessingOutcome.SUCCESS)
 
 
 @pytest.mark.asyncio

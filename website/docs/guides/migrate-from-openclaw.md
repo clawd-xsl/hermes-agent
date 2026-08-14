@@ -211,7 +211,10 @@ sets both `cron.session: main` and
 Signal main-session FIFO directly. Authenticated webhooks first run through a
 zero-tool isolated reviewer; `NO_REPLY` is dropped, and only a concise handoff
 enters main with its full conversation, memory, skills, model choice, and
-persistent provider backend. Per-job or per-route `session: isolated` remains
+persistent provider backend. Hermes commits the reviewer receipt before
+returning HTTP `202` and durably retries an admitted handoff with bounded
+backoff, including across gateway restarts. Per-job or per-route
+`session: isolated` remains
 available when isolation is intentional, while a trusted webhook can explicitly
 set `filter_before_main: false` for direct raw-prompt injection.
 OpenClaw hook definitions are archived rather than mechanically translated;
