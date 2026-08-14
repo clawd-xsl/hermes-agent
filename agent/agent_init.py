@@ -555,6 +555,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    skip_memory_sync: bool = False,
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -654,6 +655,10 @@ def init_agent(
     # skip_memory=True already disables the memory-review trigger; this
     # flag is the explicit single-switch off for both review paths.
     agent.skip_background_review = bool(skip_background_review)
+    # Read-only memory mode: keep normal memory/context recall in the prompt,
+    # but do not feed this turn back into external memory/context providers.
+    # Used by one-shot classifier runs over untrusted external events.
+    agent.skip_memory_sync = bool(skip_memory_sync)
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""

@@ -742,6 +742,9 @@ def test_main_session_defaults_preserve_other_config(tmp_path: Path):
     assert config["timezone"] == "America/Los_Angeles"
     assert config["cron"]["session"] == "main"
     assert config["platforms"]["webhook"]["extra"]["session"] == "main"
+    assert (
+        config["platforms"]["webhook"]["extra"]["filter_before_main"] is True
+    )
 
 
 def test_claude_runtime_preserves_existing_scalar_claude_model(tmp_path: Path):
@@ -1116,5 +1119,4 @@ def test_messaging_settings_handles_invalid_utf8_in_telegram_allowlist(tmp_path:
     assert items and items[0]["status"] == "migrated"
     env_text = (target / ".env").read_text(encoding="utf-8")
     assert "123456789" in env_text
-
 

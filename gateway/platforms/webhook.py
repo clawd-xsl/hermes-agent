@@ -12,6 +12,8 @@ Each route defines:
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
   - session: isolated (default) or main (the real gateway home conversation)
+  - filter_before_main: for main routes, run a one-shot isolated reviewer first
+    (default true); only a concise non-NO_REPLY handoff enters the main session
   - deliver: where to send the response (github_comment, telegram, etc.)
   - deliver_extra: additional delivery config (repo, pr_number, chat_id)
   - deliver_only: if true, skip the agent — the rendered prompt IS the
@@ -58,13 +60,17 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
 )
 from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
     WebhookRouteProcessor,
 )
-from gateway.response_filters import is_autonomous_silence_response
+from gateway.response_filters import (
+    is_autonomous_silence_response,
+    is_intentional_silence_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +138,8 @@ DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
+_MAIN_REVIEW_CHAT_PREFIX = "webhook-review:"
+_MAX_MAIN_HANDOFF_CHARS = 2_000
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
 _LOOPBACK_HOSTS = frozenset({
@@ -194,6 +202,9 @@ class WebhookAdapter(BasePlatformAdapter):
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
         self._global_secret: str = config.extra.get("secret", "")
         self._default_session: Any = config.extra.get("session", "isolated")
+        self._default_filter_before_main: Any = config.extra.get(
+            "filter_before_main", True
+        )
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
@@ -215,6 +226,13 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info: Dict[str, dict] = {}
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
+
+        # One-shot isolated reviewers for main-session routes.  The entry owns
+        # the exact resolved home source plus the final reviewer handoff.  It is
+        # never exposed as a delivery destination: send() captures only the
+        # final notify-marked response and on_processing_complete() conditionally
+        # enqueues it into the real home FIFO.
+        self._main_reviews: Dict[str, dict] = {}
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -365,13 +383,25 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Deliver the agent's response to the configured destination.
 
-        chat_id is ``webhook:{route}:{delivery_id}``.  The delivery info
+        Ordinary chat_id is ``webhook:{route}:{delivery_id}``; reviewed main
+        routes use ``webhook-review:{route}:{delivery_id}`` and are captured
+        locally instead of delivered.  The ordinary delivery info
         stored during webhook receipt is read with ``.get()`` (not popped)
         so that interim status messages emitted before the final response
         — fallback-model notifications, context-pressure warnings, etc. —
         do not consume the entry and silently downgrade the final response
         to the ``log`` deliver type.  TTL cleanup happens on POST.
         """
+        review = self._main_reviews.get(chat_id)
+        if review is not None:
+            # Status/progress callbacks use the same adapter but are explicitly
+            # non-final.  BasePlatformAdapter marks only the final user-visible
+            # response with notify=True, which gives us an authoritative capture
+            # point without duplicating the agent loop or parsing stream chunks.
+            if bool((metadata or {}).get("notify")):
+                review["response"] = str(content or "")
+            return SendResult(success=True)
+
         if _is_webhook_silence_response(content):
             logger.info(
                 "[webhook] Response for %s is a silence marker — not delivering", chat_id
@@ -407,6 +437,14 @@ class WebhookAdapter(BasePlatformAdapter):
             success=False, error=f"Unknown deliver type: {deliver_type}"
         )
 
+    def _final_delivery_adapter(self, source):
+        """Keep in-flight reviewer capture on the adapter that owns its state."""
+        if str(getattr(source, "chat_id", "") or "").startswith(
+            _MAIN_REVIEW_CHAT_PREFIX
+        ):
+            return self
+        return super()._final_delivery_adapter(source)
+
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL.
 
@@ -428,6 +466,17 @@ class WebhookAdapter(BasePlatformAdapter):
                 continue
             self._delivery_info.pop(key, None)
             self._delivery_info_created.pop(key, None)
+
+    def _prune_main_reviews(self, now: float) -> None:
+        """Bound abandoned reviewer state using the delivery idempotency TTL."""
+        cutoff = now - self._idempotency_ttl
+        stale = [
+            chat_id
+            for chat_id, review in self._main_reviews.items()
+            if float(review.get("created_at") or 0) < cutoff
+        ]
+        for chat_id in stale:
+            self._main_reviews.pop(chat_id, None)
 
     def _prune_seen_deliveries(self, now: float) -> None:
         """Occasionally prune expired delivery IDs without scanning every POST."""
@@ -487,12 +536,20 @@ class WebhookAdapter(BasePlatformAdapter):
         subscription cannot self-grant elevated tools).
         """
         chat_id = str(getattr(source, "chat_id", "") or "")
+        is_review = chat_id.startswith(_MAIN_REVIEW_CHAT_PREFIX)
         parts = chat_id.split(":", 2)
-        if len(parts) < 2 or parts[0] != "webhook":
+        if len(parts) < 2 or parts[0] not in {"webhook", "webhook-review"}:
             return None
         route_config = self._routes.get(parts[1])
         if not isinstance(route_config, dict):
             return None
+
+        if is_review:
+            # Reviewers are classifiers, not actors.  An explicit empty list is
+            # meaningful and resolves to zero tools.  This is deliberately not
+            # configurable: the reviewer is a filter, never an actor.
+            return []
+
         toolsets = route_config.get("toolsets")
         if not isinstance(toolsets, list) or not toolsets:
             return None
@@ -581,6 +638,76 @@ class WebhookAdapter(BasePlatformAdapter):
         if configured is None or str(configured).strip() == "":
             configured = self._default_session
         return normalize_session_mode(configured)
+
+    @staticmethod
+    def _coerce_bool(value: Any, *, default: bool) -> bool:
+        """Parse YAML/native booleans without treating the string false as true."""
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "yes", "on", "1"}:
+                return True
+            if normalized in {"false", "no", "off", "0"}:
+                return False
+            return default
+        return bool(value)
+
+    def _route_filters_before_main(self, route: Dict[str, Any]) -> bool:
+        configured = route.get("filter_before_main")
+        if configured is None:
+            configured = self._default_filter_before_main
+        return self._coerce_bool(configured, default=True)
+
+    @staticmethod
+    def _build_main_review_prompt(
+        *, route_name: str, event_type: str, rendered_event: str
+    ) -> str:
+        """Build the isolated classifier turn without changing the system prompt."""
+        return (
+            "Review this authenticated external webhook event and decide whether "
+            "the main personal-assistant conversation should be interrupted.\n\n"
+            "If the event is routine, duplicate, irrelevant, or needs no user "
+            "attention, reply with exactly NO_REPLY and nothing else.\n\n"
+            "If it matters, reply only with a concise, self-contained handoff for "
+            "the main assistant: identify the source, what changed, why it matters, "
+            "and any likely next action. Do not address the user, send messages, "
+            "or mutate external state in this review turn.\n\n"
+            f"Route: {route_name}\n"
+            f"Event type: {event_type}\n\n"
+            "<external_event>\n"
+            f"{rendered_event}\n"
+            "</external_event>"
+        )
+
+    @staticmethod
+    def _inject_route_skill(prompt: str, route_config: Dict[str, Any]) -> str:
+        """Expand the first configured skill for ordinary (non-review) runs."""
+        skills = route_config.get("skills", [])
+        if not skills:
+            return prompt
+        try:
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                get_skill_commands,
+            )
+
+            skill_cmds = get_skill_commands()
+            for skill_name in skills:
+                cmd_key = f"/{skill_name}"
+                if cmd_key in skill_cmds:
+                    skill_content = build_skill_invocation_message(
+                        cmd_key, user_instruction=prompt
+                    )
+                    if skill_content:
+                        return skill_content
+                else:
+                    logger.warning("[webhook] Skill '%s' not found", skill_name)
+        except Exception as exc:
+            logger.warning("[webhook] Skill loading failed: %s", exc)
+        return prompt
 
     def _resolve_request_profile(self, request: "web.Request"):
         """Resolve + validate the /p/<profile>/ URL prefix on a webhook request.
@@ -821,35 +948,6 @@ class WebhookAdapter(BasePlatformAdapter):
             prompt_template, payload, event_type, route_name
         )
 
-        # Inject skill content if configured.
-        # We call build_skill_invocation_message() directly rather than
-        # using /skill-name slash commands — the gateway's command parser
-        # would intercept those and break the flow.
-        skills = route_config.get("skills", [])
-        if skills:
-            try:
-                from agent.skill_commands import (
-                    build_skill_invocation_message,
-                    get_skill_commands,
-                )
-
-                skill_cmds = get_skill_commands()
-                for skill_name in skills:
-                    cmd_key = f"/{skill_name}"
-                    if cmd_key in skill_cmds:
-                        skill_content = build_skill_invocation_message(
-                            cmd_key, user_instruction=prompt
-                        )
-                        if skill_content:
-                            prompt = skill_content
-                            break  # Load the first matching skill
-                    else:
-                        logger.warning(
-                            "[webhook] Skill '%s' not found", skill_name
-                        )
-            except Exception as e:
-                logger.warning("[webhook] Skill loading failed: %s", e)
-
         # Build a unique delivery ID
         delivery_id = request.headers.get(
             "X-GitHub-Delivery",
@@ -862,6 +960,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
+        self._prune_main_reviews(now)
         if not self._record_delivery_id(delivery_id, now):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
@@ -929,9 +1028,9 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=502,
             )
 
-        # Main mode is not an isolated webhook agent with copied context. It
-        # enters the exact home conversation's existing FIFO, so the normal
-        # agent cache/provider session/transcript and response delivery apply.
+        # Main mode targets the exact home conversation.  By default a one-shot
+        # isolated reviewer first turns the raw event into either NO_REPLY or a
+        # concise handoff; filter_before_main=false retains direct FIFO injection.
         try:
             session_mode = self._route_session_mode(route_config)
         except ValueError as exc:
@@ -954,6 +1053,72 @@ class WebhookAdapter(BasePlatformAdapter):
                     self.gateway_runner,
                     profile=profile if isinstance(profile, str) else None,
                 )
+
+                if self._route_filters_before_main(route_config):
+                    review_chat_id = (
+                        f"{_MAIN_REVIEW_CHAT_PREFIX}{route_name}:{delivery_id}"
+                    )
+                    review_source = self.build_source(
+                        chat_id=review_chat_id,
+                        chat_name=f"webhook-review/{route_name}",
+                        chat_type="webhook_review",
+                        user_id=f"webhook:{route_name}",
+                        user_name=route_name,
+                    )
+                    if profile and isinstance(profile, str):
+                        review_source.profile = profile
+
+                    self._main_reviews[review_chat_id] = {
+                        "created_at": now,
+                        "delivery_id": delivery_id,
+                        "event_id": f"webhook:{route_name}:{delivery_id}",
+                        "route": route_name,
+                        "event_type": event_type,
+                        "payload": payload,
+                        "skills": list(route_config.get("skills") or []),
+                        "main_source": source,
+                        "response": "",
+                    }
+                    review_event = MessageEvent(
+                        text=self._build_main_review_prompt(
+                            route_name=route_name,
+                            event_type=event_type,
+                            rendered_event=prompt,
+                        ),
+                        message_type=MessageType.TEXT,
+                        source=review_source,
+                        raw_message=payload,
+                        message_id=delivery_id,
+                        # The host synthesized this turn after HMAC validation.
+                        # It must not resolve slash commands or user auth flows.
+                        internal=True,
+                        allow_gateway_control=False,
+                        metadata={
+                            "trigger": "webhook_review",
+                            "route": route_name,
+                            "event_type": event_type,
+                            "delivery_id": delivery_id,
+                            # This response is captured for classification; it
+                            # is not a platform delivery obligation.
+                            "skip_delivery_ledger": True,
+                        },
+                    )
+                    task = asyncio.create_task(self.handle_message(review_event))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                    return web.json_response(
+                        {
+                            "status": "accepted",
+                            "route": route_name,
+                            "event": event_type,
+                            "delivery_id": delivery_id,
+                            "session": "main",
+                            "reviewing": True,
+                        },
+                        status=202,
+                    )
+
+                prompt = self._inject_route_skill(prompt, route_config)
                 accepted = await enqueue_main_session_turn(
                     self.gateway_runner,
                     source=source,
@@ -992,6 +1157,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 },
                 status=202,
             )
+
+        prompt = self._inject_route_skill(prompt, route_config)
 
         # Use delivery_id in session key so concurrent webhooks on the
         # same route get independent agent runs (not queued/interrupted).
@@ -1079,7 +1246,79 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        chat_id = event.source.chat_id
+        review = self._main_reviews.pop(chat_id, None)
+        if review is not None:
+            response = str(review.get("response") or "").strip()
+            if len(response) > _MAX_MAIN_HANDOFF_CHARS:
+                logger.warning(
+                    "[webhook] Truncating oversized reviewer handoff "
+                    "route=%s delivery=%s chars=%d",
+                    review.get("route"),
+                    review.get("delivery_id"),
+                    len(response),
+                )
+                response = response[: _MAX_MAIN_HANDOFF_CHARS - 1].rstrip() + "…"
+            if outcome != ProcessingOutcome.SUCCESS:
+                # Let an upstream retry with the same delivery id re-run a
+                # reviewer that failed before producing an authoritative result.
+                self._seen_deliveries.pop(str(review.get("delivery_id") or ""), None)
+                logger.warning(
+                    "[webhook] Main-session review failed route=%s delivery=%s",
+                    review.get("route"),
+                    review.get("delivery_id"),
+                )
+            elif not response or is_intentional_silence_response(response):
+                logger.info(
+                    "[webhook] Main-session review filtered route=%s delivery=%s",
+                    review.get("route"),
+                    review.get("delivery_id"),
+                )
+            else:
+                try:
+                    from gateway.main_session import enqueue_main_session_turn
+
+                    main_text = (
+                        f"[External event: {review['route']} / "
+                        f"{review['event_type']}]\n\n{response}"
+                    )
+                    main_text = self._inject_route_skill(
+                        main_text, {"skills": review.get("skills") or []}
+                    )
+                    accepted = await enqueue_main_session_turn(
+                        self.gateway_runner,
+                        source=review["main_source"],
+                        text=main_text,
+                        event_id=review["event_id"],
+                        raw_message=review["payload"],
+                        metadata={
+                            "trigger": "webhook",
+                            "route": review["route"],
+                            "event_type": review["event_type"],
+                            "delivery_id": review["delivery_id"],
+                            "filtered": True,
+                        },
+                    )
+                    logger.info(
+                        "[webhook] Main-session review admitted route=%s "
+                        "delivery=%s session=%s queued=%s",
+                        review.get("route"),
+                        review.get("delivery_id"),
+                        accepted.session_key,
+                        accepted.queued,
+                    )
+                except Exception:
+                    self._seen_deliveries.pop(
+                        str(review.get("delivery_id") or ""), None
+                    )
+                    logger.exception(
+                        "[webhook] Reviewed main-session enqueue failed "
+                        "route=%s delivery=%s",
+                        review.get("route"),
+                        review.get("delivery_id"),
+                    )
+
+        await self._end_webhook_session(event, chat_id)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str

@@ -105,7 +105,7 @@ MIGRATION_OPTION_METADATA: Dict[str, Dict[str, str]] = {
     },
     "main-session-defaults": {
         "label": "Main-session automation defaults",
-        "description": "Route cron jobs and authenticated webhook turns through the real main conversation by default.",
+        "description": "Route cron jobs through main and filter authenticated webhooks before waking the real main conversation.",
     },
     "claude-runtime": {
         "label": "Persistent Claude runtime",
@@ -2277,7 +2277,14 @@ class Migrator:
         destination = self.target_root / "config.yaml"
         desired: Dict[str, Any] = {
             "cron": {"session": "main"},
-            "platforms": {"webhook": {"extra": {"session": "main"}}},
+            "platforms": {
+                "webhook": {
+                    "extra": {
+                        "session": "main",
+                        "filter_before_main": True,
+                    }
+                }
+            },
         }
         openclaw_config = self.load_openclaw_config()
         source_timezone = (
@@ -2312,6 +2319,7 @@ class Migrator:
                 backup=str(backup) if backup else "",
                 cron_session="main",
                 webhook_session="main",
+                webhook_filter_before_main=True,
             )
         else:
             self.record(
@@ -2319,6 +2327,7 @@ class Migrator:
                 "Would make cron and authenticated webhook turns enter the real main-session FIFO by default",
                 cron_session="main",
                 webhook_session="main",
+                webhook_filter_before_main=True,
             )
 
     @staticmethod

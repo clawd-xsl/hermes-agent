@@ -50,6 +50,10 @@ class TestWebhookAdapterToolsetsForSource:
         wa = _make_adapter({"mon": {"secret": "x", "toolsets": ["terminal"]}})
         assert wa.toolsets_for_source(_Src("telegram:123")) is None
 
+    def test_main_reviewer_defaults_to_zero_tools(self):
+        wa = _make_adapter({"mon": {"secret": "x", "toolsets": ["terminal"]}})
+        assert wa.toolsets_for_source(_Src("webhook-review:mon:d1")) == []
+
     def test_empty_or_non_list_toolsets_returns_none(self):
         wa = _make_adapter(
             {
@@ -108,6 +112,14 @@ class TestGatewayResolveEnabledToolsetsForSource:
         )
         assert res == sorted(_get_platform_tools(BASE_CONFIG, "webhook"))
         assert "terminal" not in res
+
+    def test_explicit_empty_override_disables_all_tools(self):
+        wa = _make_adapter({"mon": {"secret": "x"}})
+        gr = _make_runner(wa)
+        res = GatewayRunner._resolve_enabled_toolsets_for_source(
+            gr, BASE_CONFIG, _Src("webhook-review:mon:d"), "webhook"
+        )
+        assert res == []
 
     def test_adapter_exception_falls_back_to_platform_resolution(self):
         wa = _make_adapter({})

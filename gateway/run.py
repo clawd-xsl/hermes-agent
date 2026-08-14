@@ -5290,6 +5290,10 @@ class TurnRunner:
 
         if agent is None:
             # Config changed or first message — create fresh agent
+            _is_webhook_review = (
+                str(getattr(ctx.source, "chat_type", "") or "")
+                == "webhook_review"
+            )
             agent = ctx.AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
@@ -5327,6 +5331,10 @@ class TurnRunner:
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
+                # The classifier may read the normal identity/memory context,
+                # but must never fork another memory/skill reviewer afterward.
+                skip_memory_sync=_is_webhook_review,
+                skip_background_review=_is_webhook_review,
             )
             if _cache_lock and _cache is not None:
                 with _cache_lock:
@@ -5343,6 +5351,11 @@ class TurnRunner:
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
+        if str(getattr(ctx.source, "chat_type", "") or "") == "webhook_review":
+            # Defensive for the (normally impossible) cached-reviewer reuse case.
+            agent.skip_memory_sync = True
+            agent.skip_background_review = True
+
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
         # rather than tool_progress alone: the progress_callback also relays
         # _thinking assistant scratch text, which is gated on
@@ -21129,7 +21142,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             override = None
 
-        if override and isinstance(override, list):
+        # None means "no per-source override"; an explicit empty list means
+        # "this source gets zero tools" (used by isolated webhook reviewers).
+        if isinstance(override, list):
             cfg = dict(user_config)
             pts = dict(cfg.get("platform_toolsets") or {})
             pts[platform_key] = [str(t) for t in override]

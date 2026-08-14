@@ -206,10 +206,14 @@ failure alerts, and other OpenClaw-specific fields are not one-to-one.
 
 Under `personal-assistant`, imported jobs use `session: main`, and the migration
 sets both `cron.session: main` and
-`platforms.webhook.extra.session: main`. A fire or authenticated webhook request
-therefore enters the exact Signal main-session FIFO with its full conversation,
-memory, skills, model choice, and persistent provider backend. Per-job or
-per-route `session: isolated` remains available when isolation is intentional.
+`platforms.webhook.extra.session: main`, with
+`platforms.webhook.extra.filter_before_main: true`. Cron fires enter the exact
+Signal main-session FIFO directly. Authenticated webhooks first run through a
+zero-tool isolated reviewer; `NO_REPLY` is dropped, and only a concise handoff
+enters main with its full conversation, memory, skills, model choice, and
+persistent provider backend. Per-job or per-route `session: isolated` remains
+available when isolation is intentional, while a trusted webhook can explicitly
+set `filter_before_main: false` for direct raw-prompt injection.
 OpenClaw hook definitions are archived rather than mechanically translated;
 recreate only the external routes you still need with `hermes webhook`.
 

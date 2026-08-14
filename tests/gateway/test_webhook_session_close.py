@@ -23,10 +23,12 @@ masks exactly that bug (the first version of this fix shipped that way).
 """
 
 import asyncio
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.main_session import MainSessionEnqueueResult
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.session import SessionSource, SessionStore
@@ -151,3 +153,94 @@ async def test_completed_webhook_delivery_closes_its_session(tmp_path):
     store._db.close()
 
 
+@pytest.mark.asyncio
+async def test_review_completion_captures_final_and_wakes_main_fifo(tmp_path):
+    """Exercise the real Base adapter final-delivery + lifecycle-hook seam."""
+    store = _make_store(tmp_path)
+    runner = _FakeRunner(store)
+    adapter = _make_adapter({
+        "alerts": {
+            "secret": _INSECURE_NO_AUTH,
+            "prompt": "Alert: {message}",
+            "session": "main",
+        }
+    })
+    adapter.gateway_runner = runner
+    adapter.config.typing_indicator = False
+
+    delivery_id = "review-close-001"
+    chat_id = f"webhook-review:alerts:{delivery_id}"
+    source = adapter.build_source(
+        chat_id=chat_id,
+        chat_name="webhook-review/alerts",
+        chat_type="webhook_review",
+        user_id="webhook:alerts",
+        user_name="alerts",
+    )
+    event = MessageEvent(
+        text="internal reviewer turn",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"message": "deployment failed"},
+        message_id=delivery_id,
+        internal=True,
+        allow_gateway_control=False,
+        metadata={"skip_delivery_ledger": True},
+    )
+    home_source = SessionSource(
+        platform=Platform.SIGNAL,
+        chat_id="+15551234567",
+        chat_type="dm",
+        user_id="+15551234567",
+    )
+    adapter._main_reviews[chat_id] = {
+        "created_at": 1,
+        "delivery_id": delivery_id,
+        "event_id": f"webhook:alerts:{delivery_id}",
+        "route": "alerts",
+        "event_type": "deploy.failed",
+        "payload": event.raw_message,
+        "skills": [],
+        "main_source": home_source,
+        "response": "",
+    }
+
+    created = {}
+
+    async def _message_handler(inbound: MessageEvent):
+        entry = store.get_or_create_session(inbound.source)
+        created["session_id"] = entry.session_id
+        return "Deployment failed; the release is blocked. Inspect CI logs."
+
+    adapter._message_handler = _message_handler
+
+    async def _send_once(*, chat_id, content, reply_to=None, metadata=None):
+        return await adapter.send(
+            chat_id, content, reply_to=reply_to, metadata=metadata
+        )
+
+    # Keep this test on the delivery/capture contract without starting the
+    # adapter's long-lived retry executor, which is unrelated to the invariant.
+    adapter._send_with_retry = _send_once
+    enqueue = AsyncMock(
+        return_value=MainSessionEnqueueResult(
+            session_key="agent:main:signal:dm:+15551234567",
+            platform="signal",
+            chat_id="+15551234567",
+            queued=False,
+        )
+    )
+    with patch("gateway.main_session.enqueue_main_session_turn", new=enqueue):
+        await adapter.handle_message(event)
+        await _drain_background_tasks(adapter)
+
+    enqueue.assert_awaited_once()
+    queued = enqueue.await_args.kwargs
+    assert queued["source"] == home_source
+    assert "Deployment failed" in queued["text"]
+    assert queued["metadata"]["filtered"] is True
+    assert chat_id not in adapter._main_reviews
+
+    row = store._db.get_session(created["session_id"])
+    assert row is not None and row["ended_at"] is not None
+    store._db.close()

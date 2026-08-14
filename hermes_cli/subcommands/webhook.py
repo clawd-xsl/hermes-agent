@@ -67,10 +67,24 @@ def build_webhook_parser(subparsers, *, cmd_webhook: Callable) -> None:
         choices=("isolated", "main"),
         default=None,
         help=(
-            "Agent conversation: isolated webhook run, or the live main "
-            "gateway conversation with full context"
+            "Agent conversation: isolated webhook run, or an isolated review "
+            "that conditionally wakes the live main gateway conversation"
         ),
     )
+    wh_filter = wh_sub.add_mutually_exclusive_group()
+    wh_filter.add_argument(
+        "--filter-before-main",
+        dest="filter_before_main",
+        action="store_true",
+        help="Review a main-session event in isolation before waking main (default)",
+    )
+    wh_filter.add_argument(
+        "--no-filter-before-main",
+        dest="filter_before_main",
+        action="store_false",
+        help="Trusted routes only: inject the rendered event directly into main",
+    )
+    wh_sub.set_defaults(filter_before_main=None)
 
     webhook_subparsers.add_parser(
         "list", aliases=["ls"], help="List all dynamic subscriptions"

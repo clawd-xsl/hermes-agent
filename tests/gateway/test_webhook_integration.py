@@ -22,7 +22,7 @@ from gateway.config import (
     Platform,
     PlatformConfig,
 )
-from gateway.platforms.base import MessageEvent, SendResult
+from gateway.platforms.base import MessageEvent, ProcessingOutcome, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.main_session import MainSessionEnqueueResult
 from gateway.session import SessionSource
@@ -154,6 +154,7 @@ class TestMainSessionWebhook:
                 "secret": _INSECURE_NO_AUTH,
                 "prompt": "Please handle: {message}",
                 "session": "main",
+                "filter_before_main": False,
             }
         }
         adapter = _make_adapter(routes)
@@ -199,6 +200,149 @@ class TestMainSessionWebhook:
         assert queued["metadata"]["trigger"] == "webhook"
         adapter.handle_message.assert_not_awaited()
         assert adapter._delivery_info == {}
+
+    @pytest.mark.asyncio
+    async def test_main_route_reviews_then_enqueues_only_the_handoff(self):
+        routes = {
+            "personal-alert": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Build notification: {message}",
+                "session": "main",
+            }
+        }
+        adapter = _make_adapter(routes)
+        runner = MagicMock()
+        adapter.gateway_runner = runner
+        adapter._end_webhook_session = AsyncMock()
+        captured_events: list[MessageEvent] = []
+
+        async def _capture(event: MessageEvent):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        home_source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="+15551234567",
+            chat_type="dm",
+            user_id="+15551234567",
+        )
+        enqueue = AsyncMock(
+            return_value=MainSessionEnqueueResult(
+                session_key="agent:main:signal:dm:+15551234567",
+                platform="signal",
+                chat_id="+15551234567",
+                queued=True,
+            )
+        )
+
+        with patch(
+            "gateway.main_session.resolve_main_session_source",
+            return_value=home_source,
+        ), patch(
+            "gateway.main_session.enqueue_main_session_turn",
+            new=enqueue,
+        ):
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/personal-alert",
+                    json={"message": "Build finished successfully"},
+                    headers={"X-GitHub-Delivery": "review-main-001"},
+                )
+                data = await resp.json()
+
+            await asyncio.sleep(0.05)
+            assert resp.status == 202
+            assert data["session"] == "main"
+            assert data["reviewing"] is True
+            assert enqueue.await_count == 0
+            assert len(captured_events) == 1
+
+            review_event = captured_events[0]
+            assert review_event.source.chat_type == "webhook_review"
+            assert review_event.source.chat_id.startswith("webhook-review:")
+            assert review_event.internal is True
+            assert review_event.allow_gateway_control is False
+            assert "reply with exactly NO_REPLY" in review_event.text
+            assert "Build finished successfully" in review_event.text
+
+            # Non-final status output is swallowed and cannot wake main.
+            await adapter.send(
+                review_event.source.chat_id,
+                "provider switched",
+                metadata={"non_conversational": True},
+            )
+            assert enqueue.await_count == 0
+
+            handoff = (
+                "CI build finished successfully; this unblocks deployment. "
+                "Check the release queue next."
+            )
+            await adapter.send(
+                review_event.source.chat_id,
+                handoff,
+                metadata={"notify": True},
+            )
+            await adapter.on_processing_complete(
+                review_event, ProcessingOutcome.SUCCESS
+            )
+
+        enqueue.assert_awaited_once()
+        queued = enqueue.await_args.kwargs
+        assert queued["source"] == home_source
+        assert handoff in queued["text"]
+        assert "Build notification:" not in queued["text"]
+        assert queued["metadata"]["filtered"] is True
+        adapter._end_webhook_session.assert_awaited_once_with(
+            review_event, review_event.source.chat_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_main_route_no_reply_never_enters_main(self):
+        adapter = _make_adapter({
+            "personal-alert": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message}",
+                "session": "main",
+            }
+        })
+        adapter.gateway_runner = MagicMock()
+        adapter._end_webhook_session = AsyncMock()
+        home_source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="+15551234567",
+            chat_type="dm",
+            user_id="+15551234567",
+        )
+        captured_events: list[MessageEvent] = []
+
+        async def _capture(event: MessageEvent):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        enqueue = AsyncMock()
+        with patch(
+            "gateway.main_session.resolve_main_session_source",
+            return_value=home_source,
+        ), patch(
+            "gateway.main_session.enqueue_main_session_turn",
+            new=enqueue,
+        ):
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/personal-alert",
+                    json={"message": "routine heartbeat"},
+                    headers={"X-GitHub-Delivery": "review-main-silent-001"},
+                )
+            await asyncio.sleep(0.05)
+            assert resp.status == 202
+            review_event = captured_events[0]
+            # The normal gateway silence filter suppresses NO_REPLY before send,
+            # so an empty authoritative capture is the expected completion state.
+            await adapter.on_processing_complete(
+                review_event, ProcessingOutcome.SUCCESS
+            )
+
+        enqueue.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_main_route_failure_is_retryable(self):

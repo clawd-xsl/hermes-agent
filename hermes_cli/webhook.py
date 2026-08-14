@@ -182,6 +182,8 @@ def _cmd_subscribe(args):
     }
     if getattr(args, "session", None):
         route["session"] = args.session
+    if getattr(args, "filter_before_main", None) is not None:
+        route["filter_before_main"] = bool(args.filter_before_main)
 
     if getattr(args, "deliver_only", False):
         if route["deliver"] == "log":
@@ -214,6 +216,9 @@ def _cmd_subscribe(args):
         print("  Events: (all)")
     print(f"  Deliver: {route['deliver']}")
     print(f"  Session: {route.get('session', 'default')}")
+    if route.get("session") == "main":
+        reviewed = route.get("filter_before_main", True) is not False
+        print(f"  Main wake: {'reviewed' if reviewed else 'direct'}")
     if route.get("deliver_only"):
         print("  Mode: direct delivery (no agent, zero LLM cost)")
     if route.get("prompt"):
@@ -249,6 +254,9 @@ def _cmd_list(args):
         print(f"    Events:  {events}")
         print(f"    Deliver: {deliver}")
         print(f"    Session: {route.get('session', 'default')}")
+        if route.get("session") == "main":
+            reviewed = route.get("filter_before_main", True) is not False
+            print(f"    Main wake: {'reviewed' if reviewed else 'direct'}")
         if route.get("script"):
             print(f"    Script:  {route['script']}")
         print()

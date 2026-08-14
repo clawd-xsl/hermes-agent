@@ -84,9 +84,10 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. Payload fields are untrusted — see [Authenticated does not mean trusted](#authenticated-does-not-mean-trusted). |
 | `filters` | No | Declarative payload filters evaluated after auth/body/event filtering and before agent or direct delivery work. Non-matches return `{"status":"ignored","reason":"filter"}` with HTTP 200. |
 | `script` | No | Filter/transform script under `~/.hermes/scripts/`. The webhook payload is passed as JSON on stdin. JSON object stdout replaces the payload before templating; text stdout is exposed as `script_output`; empty stdout, `[SILENT]`, or a nonzero exit code ignores the webhook. |
-| `skills` | No | List of skill names to load for the agent run. |
+| `skills` | No | List of skill names to load for the agent run. On reviewed `session: main` routes, the reviewer stays minimal; the configured skill is applied only to the admitted handoff entering main. |
 | `toolsets` | No | List of toolset keys (e.g. `["terminal", "file", "web"]`) that **replaces** the platform-level webhook toolset for runs triggered by this route only. Manual config edit only — not settable via `hermes webhook subscribe`, so agent-created subscriptions cannot self-grant elevated tools. Names are validated the same way as `platform_toolsets` entries (unknown or platform-restricted names are dropped). See [Per-route toolsets](#per-route-toolsets). |
-| `session` | No | `isolated` (default) starts a one-shot webhook session. `main` queues a real FIFO turn in the configured gateway home conversation with its complete context and persistent provider session. |
+| `session` | No | `isolated` (default) starts a one-shot webhook session. `main` targets the configured gateway home conversation; by default an isolated reviewer filters and summarizes the event before its handoff enters the real FIFO. |
+| `filter_before_main` | No | Applies to `session: main`. Defaults to `true`: run a zero-tool, read-only-memory isolated reviewer first; exact `NO_REPLY` drops the event, while a concise handoff enters main. Set `false` only when the raw rendered prompt should enter main directly. May also be set once under `platforms.webhook.extra`. |
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
@@ -101,6 +102,7 @@ platforms:
       port: 8644
       secret: "global-fallback-secret"
       session: "isolated"       # platform-wide default; may be "main"
+      filter_before_main: true   # default for main routes
       routes:
         github-pr:
           events: ["pull_request"]
@@ -140,23 +142,35 @@ platforms:
     enabled: true
     extra:
       session: main
+      filter_before_main: true
       routes:
         personal-events:
           secret: "route-secret"
           prompt: "Handle this event using our current plans: {__raw__}"
 ```
 
-Hermes resolves the configured `home_channel` and submits the event through
-that exact conversation's normal FIFO. An in-flight user turn is not
-interrupted, simultaneous events remain separate turns, and the normal IM
-streaming/delivery path sends the response. No webhook shadow session or
-copied history is created. The POST returns `202 Accepted` after the turn is
-accepted by the FIFO.
+Hermes first runs each authenticated event in a unique isolated reviewer using
+the normal system prompt and memory recall. The reviewer has no tools by
+default, does not sync the event back into memory/context providers, and does
+not deliver a response. Exact `NO_REPLY` ends there. Otherwise, only its concise,
+self-contained handoff is submitted through the exact home conversation's FIFO.
+The raw payload and reviewer transcript never enter main.
 
-Main mode requires the gateway and home-channel adapter to be live. On a
-temporary resolution/enqueue failure Hermes returns `503` and releases the
-delivery ID so the sender can retry. The route's standalone `deliver` target
-does not apply in main mode—the main conversation delivers its own response.
+Once admitted, an in-flight user turn is not interrupted, simultaneous events
+remain separate turns, and the normal IM streaming/delivery path sends the main
+assistant's response with its complete conversation, memory, skills, model, and
+persistent provider session. The POST returns `202 Accepted` when review is
+scheduled; the JSON response includes `"reviewing": true`.
+
+For a trusted route that intentionally needs the old direct behavior, set
+`filter_before_main: false`. That skips the reviewer and submits the rendered
+prompt directly to the home FIFO.
+
+Main mode requires the gateway and home-channel adapter to be live. If Hermes
+cannot resolve that home before review, it returns `503` and releases the
+delivery ID so the sender can retry. A post-review enqueue failure is logged and
+also releases the delivery ID. The route's standalone `deliver` target does not
+apply in main mode—the main conversation delivers its own response.
 
 Dynamic subscriptions expose the same choice:
 
@@ -165,6 +179,9 @@ hermes webhook subscribe personal-events \
   --session main \
   --prompt "Handle this event using our current plans: {__raw__}"
 ```
+
+Reviewed main wake is the default. Add `--no-filter-before-main` only for a
+trusted route that should inject its rendered prompt directly.
 
 ### Payload Filters
 
@@ -524,6 +541,7 @@ Behavior and safety properties:
 
 - The route list **replaces** the platform-level webhook toolset resolution for that route's runs (it is not merged).
 - Names are validated through the same path as `platform_toolsets` config — unknown names and platform-restricted toolsets are dropped.
+- Pre-main reviewers always have no tools, even when the route's ordinary `toolsets` grants elevated capabilities.
 - `hermes webhook subscribe` deliberately does **not** accept a toolsets flag. Granting elevated tools is a manual config-file edit, so an agent creating its own subscription at runtime cannot self-grant `terminal`.
 - Only grant elevated toolsets to routes whose senders you fully control, with a real HMAC secret. Anyone who can POST a validly-signed payload to that route is effectively running an agent with those tools.
 

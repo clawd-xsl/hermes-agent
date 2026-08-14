@@ -6487,9 +6487,17 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                    if (
+                        not is_ephemeral_response
+                        and not bool(
+                            (getattr(event, "metadata", None) or {}).get(
+                                "skip_delivery_ledger"
+                            )
+                        )
+                        and not str(event.text or "").lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,

@@ -122,6 +122,17 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "failed"
 
+    @pytest.mark.asyncio
+    async def test_internal_capture_can_skip_delivery_ledger(self):
+        adapter = _Adapter()
+        event = _event()
+        event.metadata["skip_delivery_ledger"] = True
+
+        await _run(adapter, event)
+
+        assert adapter.sent == ["final answer"]
+        assert _rows() == []
+
 
     @pytest.mark.asyncio
     async def test_slow_ledger_record_does_not_block_event_loop(self):

@@ -502,6 +502,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        skip_memory_sync: bool = False,
         skip_background_review: bool = False,
         session_db=None,
         parent_session_id: str = None,
@@ -590,6 +591,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            skip_memory_sync=skip_memory_sync,
             skip_background_review=skip_background_review,
             session_db=session_db,
             parent_session_id=parent_session_id,
@@ -4221,6 +4223,8 @@ class AIAgent:
         backend must not block the user from seeing their response.
         """
         if interrupted:
+            return
+        if getattr(self, "skip_memory_sync", False):
             return
         if not (self._memory_manager and final_response and original_user_message):
             return

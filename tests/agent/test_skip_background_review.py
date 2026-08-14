@@ -13,7 +13,10 @@ from run_agent import AIAgent
 from agent.turn_finalizer import finalize_turn
 
 
-def _make_agent(skip_background_review: bool = False) -> AIAgent:
+def _make_agent(
+    skip_background_review: bool = False,
+    skip_memory_sync: bool = False,
+) -> AIAgent:
     """Construct a minimally-configured AIAgent for unit testing."""
     return AIAgent(
         model="openai/gpt-4o-mini",
@@ -23,6 +26,7 @@ def _make_agent(skip_background_review: bool = False) -> AIAgent:
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
+        skip_memory_sync=skip_memory_sync,
         skip_background_review=skip_background_review,
         platform="cli",
     )
@@ -89,6 +93,34 @@ def test_skip_background_review_flag_persists() -> None:
     """Passing skip_background_review=True records the flag on the instance."""
     agent = _make_agent(skip_background_review=True)
     assert agent.skip_background_review is True
+
+
+def test_skip_memory_sync_keeps_turn_out_of_external_memory() -> None:
+    """Read-only classifier turns must not sync their exchange to providers."""
+    agent = _make_agent(skip_memory_sync=True)
+    manager = MagicMock()
+    agent._memory_manager = manager
+
+    agent._sync_external_memory_for_turn(
+        original_user_message="external webhook payload",
+        final_response="concise handoff",
+        interrupted=False,
+        messages=[],
+    )
+
+    manager.sync_all.assert_not_called()
+    manager.queue_prefetch_all.assert_not_called()
+
+
+def test_skip_memory_sync_skips_context_engine_observation() -> None:
+    agent = _make_agent(skip_memory_sync=True)
+    _stub_agent_for_finalize(agent)
+    engine = MagicMock()
+    agent.context_compressor = engine
+
+    _run_finalize(agent)
+
+    engine.on_turn_complete.assert_not_called()
 
 
 def test_finalize_turn_skips_review_when_flag_set() -> None:
