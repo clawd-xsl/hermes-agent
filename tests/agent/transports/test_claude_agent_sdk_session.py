@@ -568,6 +568,7 @@ def test_sdk_options_keep_hermes_as_only_agent_and_preserve_raw_cli_args(
         assert options.skills == []
         assert options.strict_mcp_config is True
         assert options.mcp_servers["hermes"]["type"] == "sdk"
+        assert options.mcp_servers["hermes"]["alwaysLoad"] is True
         assert list(options.hooks) == ["PreToolUse"]
         command = client._custom_transport._build_command()
         assert command[0] == sys.executable
@@ -725,6 +726,41 @@ def test_sdk_connect_fails_closed_when_hermes_mcp_is_not_connected(
     assert disconnected == [True]
     assert session.is_alive is False
     session.close()
+
+
+def test_sdk_connect_accepts_hermes_mcp_deferred_until_first_prompt(
+    tmp_path, monkeypatch
+):
+    agent = _ToolAgent()
+    monkeypatch.setattr(
+        "agent.claude_agent_sdk_journal._journal_root",
+        lambda: tmp_path / "effect-journal",
+    )
+    session = ClaudeAgentSdkSession(
+        owner_key="mcp-deferred",
+        agent=agent,
+        cwd=str(tmp_path),
+        model="anthropic/claude-sonnet-4-6",
+        system_prompt="stable system prompt",
+        command=sys.executable,
+        persistent_binding=False,
+    )
+
+    async def fake_connect(_client):
+        return None
+
+    async def fake_status(_client):
+        return {"mcpServers": []}
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient.connect", fake_connect)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient.get_mcp_status", fake_status)
+
+    asyncio.run(session._sdk_connect())
+    try:
+        assert session.is_alive is True
+    finally:
+        asyncio.run(session._sdk_disconnect())
+        session.close()
 
 
 def test_sdk_partial_batch_executes_before_delayed_authoritative_message(

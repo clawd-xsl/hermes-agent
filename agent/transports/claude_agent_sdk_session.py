@@ -654,7 +654,15 @@ class ClaudeAgentSdkSession:
 
         has_tools = bool(sdk_tools)
         mcp_servers = (
-            {"hermes": create_sdk_mcp_server("hermes", tools=sdk_tools)}
+            {
+                "hermes": {
+                    **create_sdk_mcp_server("hermes", tools=sdk_tools),
+                    # Current Claude Code initializes SDK MCP servers lazily.
+                    # Require the Hermes bridge on the first model turn so its
+                    # tools cannot be omitted from the initial tool surface.
+                    "alwaysLoad": True,
+                }
+            }
             if has_tools
             else {}
         )
@@ -747,10 +755,15 @@ class ClaudeAgentSdkSession:
                     None,
                 )
                 if hermes is None:
-                    raise RuntimeError(
-                        "Hermes SDK MCP server is absent after Claude initialization"
+                    # Claude Code may not materialize a lazily registered SDK
+                    # MCP server until the first prompt.  The bridge is still
+                    # fail-safe here: only mcp__hermes__* is allowed, and an
+                    # absent server exposes no effecting tools.  alwaysLoad
+                    # above makes the server mandatory for that first turn.
+                    logger.debug(
+                        "Hermes SDK MCP status deferred until the first prompt"
                     )
-                if str(hermes.get("status") or "").lower() not in {
+                elif str(hermes.get("status") or "").lower() not in {
                     "connected",
                     "pending",
                 }:
