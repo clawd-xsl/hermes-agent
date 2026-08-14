@@ -33,11 +33,10 @@ _SHA_BRACKET = re.compile(r"\[(?P<sha>[^\]]+)\]\s*$")
 def _run_dump(image: str) -> str:
     """Return the stdout of ``docker run <image> dump``.
 
-    Relies on Docker's anonymous VOLUME for ``/opt/data`` (declared by the
-    Dockerfile) so the container's hermes user (UID 10000) can bootstrap
-    its config.  Anonymous volumes are auto-cleaned by ``--rm``, so unlike
-    a host bind-mount we don't have to chown anything to UID 10000 (which
-    would break cleanup on non-root hosts).
+    The image pre-creates ``/opt/data`` as the hermes user's home, so the
+    container can bootstrap its config without a mount. Production services
+    attach persistent storage there through deployment configuration; this
+    disposable ``--rm`` smoke test intentionally uses the image-local path.
     """
     r = subprocess.run(
         ["docker", "run", "--rm", image, "dump"],

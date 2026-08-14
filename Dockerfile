@@ -166,6 +166,16 @@ COPY --from=node_source /usr/local/lib/node_modules/npm /usr/local/lib/node_modu
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
+# The persistent Anthropic runtime talks directly to Claude Code's stream-JSON
+# CLI. Pin the executable in the production image so Railway and other
+# immutable deployments do not depend on a first-boot npm install or whatever
+# happens to be present on the host PATH.
+ARG CLAUDE_CODE_VERSION=2.1.229
+RUN npm install --global --omit=dev --no-audit --no-fund \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && \
+    claude --version && \
+    npm cache clean --force
+
 WORKDIR /opt/hermes
 
 # ---------- Layer-cached dependency install ----------
@@ -419,7 +429,9 @@ COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-di
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
+# Railway rejects Dockerfile VOLUME declarations. Production services mount
+# their managed persistent volume at /opt/data through service configuration;
+# Docker/Podman users can continue mounting the same path explicitly.
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
 # When the image really owns PID 1 (normal Docker / Podman), the dispatcher
@@ -453,5 +465,16 @@ VOLUME [ "/opt/data" ]
 # supervised PID-1 path and the non-PID-1 fallback path. Without the
 # wrapper-as-ENTRYPOINT, leading-dash args like `--version` would be
 # intercepted by /init's POSIX shell.
+# This deployment context may be prepared on Windows. Normalize executable
+# control files after every COPY step so s6 does not parse values such as
+# `longrun\r` and shell shebangs remain valid inside Linux containers.
+RUN find /opt/hermes/docker /etc/s6-overlay/s6-rc.d /etc/cont-init.d -type f \
+        \( -name '*.sh' -o -name run -o -name finish -o -name type \
+           -o -path '*/cont-init.d/*' \) \
+        -exec sed -i 's/\r$//' {} + && \
+    find /opt/hermes/docker /etc/s6-overlay/s6-rc.d /etc/cont-init.d -type f \
+        \( -name '*.sh' -o -name run -o -name finish \
+           -o -path '*/cont-init.d/*' \) \
+        -exec chmod 0755 {} +
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]

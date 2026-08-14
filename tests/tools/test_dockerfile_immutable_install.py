@@ -115,3 +115,13 @@ def test_dockerfile_bakes_photon_sidecar_deps() -> None:
     assert not re.search(
         r"chown\s+-R\s+hermes:hermes\s+/opt/hermes/plugins", text
     )
+
+
+def test_dockerfile_bakes_pinned_claude_cli_for_immutable_deployments() -> None:
+    """The persistent CLI backend must not install its runtime on first use."""
+    text = _dockerfile_text()
+
+    assert re.search(r"ARG CLAUDE_CODE_VERSION=\d+\.\d+\.\d+", text)
+    assert '"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"' in text
+    assert "npm install --global --omit=dev" in text
+    assert "claude --version" in text
