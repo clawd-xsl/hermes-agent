@@ -1680,7 +1680,108 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    # Claude Code stream-json runtime. Like codex_app_server, Claude owns the
+    # model/tool loop; Hermes tools are called through an authenticated MCP
+    # SDK bridge bound to this live AIAgent. The child and its native history are
+    # retained across turns for low first-token latency.
+    if agent.api_mode == "claude_agent_sdk":
+        effective_system_prompt = active_system_prompt or ""
+        if agent.ephemeral_system_prompt:
+            effective_system_prompt = (
+                effective_system_prompt + "\n\n" + agent.ephemeral_system_prompt
+            ).strip()
+        native_result = agent._run_claude_agent_sdk_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            current_turn_user_idx=current_turn_user_idx,
+            active_system_prompt=effective_system_prompt,
+            should_review_memory=_should_review_memory,
+            moa_config=moa_config,
+        )
+        if not native_result.get("_claude_agent_sdk_continue_standard_loop"):
+            return native_result
+
+        # Claude reached a terminal native failure and activated Hermes' next
+        # configured provider. Continue below with the already-prepared turn:
+        # do not rerun build_turn_context(), append the user row again, or
+        # duplicate pre_llm_call/memory-prefetch side effects.
+        api_call_count = max(0, int(native_result.get("api_calls") or 0))
+        _pending_verification_response = native_result.get(
+            "pending_verification_response"
+        )
+        _pending_verification_response_previewed = bool(
+            native_result.get("pending_verification_response_previewed")
+        )
+        if messages and messages[-1].get("_provider_fallback_synthetic"):
+            current_turn_user_idx = len(messages) - 1
+        active_system_prompt = (
+            getattr(agent, "_cached_system_prompt", None) or active_system_prompt
+        )
+
+    def _run_active_claude_agent_sdk_fallback() -> Dict[str, Any]:
+        """Hand the already-prepared turn to a newly activated native fallback."""
+        native_tail = messages[-1] if messages else None
+        if not (
+            isinstance(native_tail, dict)
+            and native_tail.get("role") == "user"
+        ):
+            if (
+                isinstance(native_tail, dict)
+                and native_tail.get("role") == "assistant"
+                and not native_tail.get("tool_calls")
+            ):
+                native_tail["_provider_fallback_synthetic"] = True
+                native_tail.pop("_db_persisted", None)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "[System: The previous inference runtime stopped "
+                        "before finishing. Continue the same task from the "
+                        "transcript and produce the complete answer.]"
+                    ),
+                    "_provider_fallback_synthetic": True,
+                }
+            )
+        effective_system_prompt = active_system_prompt or ""
+        if agent.ephemeral_system_prompt:
+            effective_system_prompt = (
+                effective_system_prompt
+                + "\n\n"
+                + agent.ephemeral_system_prompt
+            ).strip()
+        return agent._run_claude_agent_sdk_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            current_turn_user_idx=len(messages) - 1,
+            active_system_prompt=effective_system_prompt,
+            should_review_memory=_should_review_memory,
+            moa_config=moa_config,
+            _moa_applied=True,
+            _api_calls_before=api_call_count,
+            _pending_verification_response=_pending_verification_response,
+            _pending_verification_response_previewed=(
+                _pending_verification_response_previewed
+            ),
+        )
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # A standard HTTP iteration may activate a subscription-backed Claude
+        # CLI entry from fallback_providers. The early runtime dispatch above
+        # has already passed by then, so hand the *prepared* turn over here on
+        # the next loop iteration. Re-running build_turn_context would append
+        # the user row and repeat memory/plugin side effects.
+        if agent.api_mode == "claude_agent_sdk":
+            return _run_active_claude_agent_sdk_fallback()
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1961,6 +2062,9 @@ def run_conversation(
             # Strip length-continuation marks; not every transport drops underscore keys.
             api_msg.pop("_length_continuation_fragment", None)
             api_msg.pop("_length_continuation_nudge", None)
+            # Provider fallback synthesis has already been normalized above;
+            # it is bookkeeping only and must never reach a strict provider.
+            api_msg.pop("_provider_fallback_synthetic", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields
@@ -2480,6 +2584,12 @@ def run_conversation(
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
+            # Most fallback decisions happen inside this retry loop. A
+            # ``continue`` after activating claude_agent_sdk therefore returns here,
+            # not to the outer agent loop where the runtime gate also lives.
+            if agent.api_mode == "claude_agent_sdk":
+                return _run_active_claude_agent_sdk_fallback()
+
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt

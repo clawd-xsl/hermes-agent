@@ -109,6 +109,34 @@ def test_session_only_switch_does_not_touch_config(monkeypatch):
     assert save_calls == []
 
 
+def test_picker_switch_to_claude_agent_sdk_clears_stale_http_runtime(monkeypatch):
+    import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *a, **k: None)
+    result = ModelSwitchResult(
+        success=True,
+        new_model="claude-opus-4-6",
+        target_provider="anthropic",
+        provider_changed=True,
+        api_key="",
+        base_url="",
+        api_mode="claude_agent_sdk",
+        warning_message="",
+        provider_label="Anthropic subscription",
+        resolved_via_alias=False,
+        capabilities=None,
+        model_info=None,
+        is_global=False,
+    )
+    cli = _StubCLI()
+
+    cli_mod.HermesCLI._apply_model_switch_result(cli, result, False)
+
+    assert cli.api_mode == "claude_agent_sdk"
+    assert cli.api_key == ""
+    assert cli.base_url == ""
+
+
 def _run_apply(monkeypatch, result, persist_global=True):
     """Drives `_apply_model_switch_result` directly — the interactive-picker
     sibling of `_handle_model_switch`. Unlike the tests above, and unlike
@@ -126,7 +154,6 @@ def _run_apply(monkeypatch, result, persist_global=True):
     monkeypatch.setattr(cli_mod, "save_config_value", _fake_save)
     cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, persist_global)
     return saved
-
 
 
 

@@ -3,6 +3,7 @@
 import asyncio
 import threading
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -57,6 +58,21 @@ def _make_runner(history: list[dict[str, str]]):
     runner.session_store.update_session = MagicMock()
     runner.session_store._save = MagicMock()
     runner._session_db = None
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=session_entry),
+        load_transcript=AsyncMock(return_value=history),
+        update_session=AsyncMock(return_value=None),
+        rewrite_transcript=AsyncMock(return_value=True),
+        _save=AsyncMock(return_value=None),
+    )
+
+    async def _direct_executor(func, *args):
+        return func(*args)
+
+    # These unit tests construct GatewayRunner without __init__ and exercise
+    # compression transaction semantics, not the owned thread-pool lifecycle.
+    runner._run_in_executor_with_context = _direct_executor
     return runner
 
 
@@ -102,6 +118,125 @@ async def test_compress_command_works_when_auto_compaction_disabled():
     assert "Compressed:" in result
     agent_instance._compress_context.assert_called_once()
     assert agent_instance._compress_context.call_args.kwargs.get("force") is True
+
+
+@pytest.mark.asyncio
+async def test_compress_command_allows_claude_agent_sdk_subscription_without_api_key():
+    history = _make_history()
+    runner = _make_runner(history)
+    entry = runner.session_store.get_or_create_session.return_value
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=entry),
+        load_transcript=AsyncMock(return_value=history),
+        update_session=AsyncMock(return_value=None),
+        rewrite_transcript=AsyncMock(return_value=True),
+        _save=AsyncMock(return_value=None),
+    )
+
+    async def _direct_executor(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _direct_executor
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance.api_mode = "claude_agent_sdk"
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.session_id = "sess-1"
+    agent_instance._last_compaction_in_place = False
+    agent_instance._compression_skipped_due_to_lock = False
+    compressor = agent_instance.context_compressor
+    compressor.has_content_to_compress.return_value = True
+    compressor._last_native_compaction = True
+    compressor._last_compress_aborted = False
+    compressor._last_summary_fallback_used = False
+    compressor._last_summary_error = None
+    compressor._last_aux_model_failure_model = None
+    agent_instance._compress_context.return_value = (list(history), "")
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "provider": "anthropic",
+                "api_mode": "claude_agent_sdk",
+                "api_key": "",
+                "base_url": "",
+            },
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="claude-opus-4-6"),
+        patch("run_agent.AIAgent", return_value=agent_instance) as mock_agent,
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    mock_agent.assert_called_once()
+    assert "Compacted Claude's native history" in result
+    runner.session_store.rewrite_transcript.assert_not_called()
+    assert agent_instance._claude_agent_sdk_session is None
+
+
+@pytest.mark.asyncio
+async def test_compress_here_preserves_external_engine_semantics_on_claude_agent_sdk():
+    history = _make_history()
+    runner = _make_runner(history)
+    entry = runner.session_store.get_or_create_session.return_value
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=entry),
+        load_transcript=AsyncMock(return_value=history),
+        update_session=AsyncMock(return_value=None),
+        rewrite_transcript=AsyncMock(return_value=True),
+        _save=AsyncMock(return_value=None),
+    )
+
+    async def _direct_executor(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _direct_executor
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance.api_mode = "claude_agent_sdk"
+    agent_instance._context_engine_is_external = True
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.session_id = "sess-1"
+    agent_instance._last_compaction_in_place = False
+    agent_instance._compression_skipped_due_to_lock = False
+    compressor = agent_instance.context_compressor
+    compressor.has_content_to_compress.return_value = True
+    compressor._last_native_compaction = False
+    compressor._last_compress_aborted = False
+    compressor._last_summary_fallback_used = False
+    compressor._last_summary_error = None
+    compressor._last_aux_model_failure_model = None
+    compressed_head = [{"role": "assistant", "content": "external summary"}]
+    agent_instance._compress_context.return_value = (compressed_head, "")
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "provider": "anthropic",
+                "api_mode": "claude_agent_sdk",
+                "api_key": "",
+                "base_url": "",
+            },
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="claude-opus-4-6"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+        patch("agent.claude_agent_sdk_runtime.detach_claude_agent_sdk_session") as detach,
+    ):
+        await runner._handle_compress_command(_make_event("/compress here 1"))
+
+    args, kwargs = agent_instance._compress_context.call_args
+    assert args[0] == history[:2]
+    assert kwargs["native_keep_last_exchanges"] is None
+    detach.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -346,6 +481,12 @@ async def test_compress_command_multiplexed_runs_under_profile_secret_scope(tmp_
         "OPENROUTER_BASE_URL=https://scoped.example/v1\n"
     )
     runner._resolve_profile_home_for_source = MagicMock(return_value=profile_home)
+    # This case specifically verifies ContextVar propagation across the real
+    # owned executor, so restore the production method overridden by the bare
+    # runner test fixture.
+    runner._run_in_executor_with_context = (
+        type(runner)._run_in_executor_with_context.__get__(runner, type(runner))
+    )
 
     agent_instance = MagicMock()
     agent_instance.shutdown_memory_provider = MagicMock()
@@ -447,6 +588,11 @@ async def test_compress_command_cleanup_does_not_block_event_loop():
         history[-1],
     ]
     runner = _make_runner(history)
+    # This case verifies that cleanup uses the real owned executor; the shared
+    # bare-runner fixture uses a direct executor for transaction-only tests.
+    runner._run_in_executor_with_context = (
+        type(runner)._run_in_executor_with_context.__get__(runner, type(runner))
+    )
 
     close_started = threading.Event()
     release_close = threading.Event()

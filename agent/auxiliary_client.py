@@ -1945,6 +1945,198 @@ class AsyncCodexAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+class _ClaudeAgentSdkCompletionsAdapter:
+    """OpenAI-shaped adapter for isolated Claude Code auxiliary calls."""
+
+    def __init__(self, model: str):
+        self._model = model
+
+    def create(self, **kwargs) -> Any:
+        from agent.claude_agent_sdk_runtime import run_claude_agent_sdk_auxiliary_completion
+
+        reasoning_config = kwargs.get("_reasoning_config")
+        extra_body = kwargs.get("extra_body")
+        if reasoning_config is None:
+            if isinstance(extra_body, dict):
+                candidate = extra_body.get("reasoning")
+                if isinstance(candidate, dict):
+                    reasoning_config = candidate
+        response_format = kwargs.get("response_format")
+        if response_format is None and isinstance(extra_body, dict):
+            response_format = extra_body.get("response_format")
+        json_schema = None
+        if isinstance(response_format, dict):
+            format_type = str(response_format.get("type") or "").strip()
+            if format_type == "json_schema":
+                schema_wrapper = response_format.get("json_schema")
+                if isinstance(schema_wrapper, dict):
+                    candidate = schema_wrapper.get("schema")
+                    if isinstance(candidate, dict):
+                        json_schema = candidate
+            elif format_type == "json_object":
+                json_schema = {"type": "object"}
+        native_kwargs = {
+            "messages": kwargs.get("messages") or [],
+            "model": str(kwargs.get("model") or self._model or ""),
+            "timeout": kwargs.get("timeout"),
+            "reasoning_config": reasoning_config,
+        }
+        max_tokens = (
+            kwargs.get("max_tokens")
+            if kwargs.get("max_tokens") is not None
+            else kwargs.get("max_completion_tokens")
+        )
+        if max_tokens is not None:
+            native_kwargs["max_tokens"] = max_tokens
+        if json_schema is not None:
+            native_kwargs["json_schema"] = json_schema
+        if kwargs.get("tools"):
+            native_kwargs["tools"] = kwargs["tools"]
+            if kwargs.get("tool_choice") is not None:
+                native_kwargs["tool_choice"] = kwargs["tool_choice"]
+        result = run_claude_agent_sdk_auxiliary_completion(
+            **native_kwargs,
+        )
+        raw_usage = getattr(result, "token_usage", None) or {}
+        prompt_tokens = sum(
+            int(raw_usage.get(key, 0) or 0)
+            for key in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+        )
+        completion_tokens = int(raw_usage.get("output_tokens", 0) or 0)
+        reasoning = None
+        tool_calls = []
+        for row in reversed(getattr(result, "projected_messages", None) or []):
+            if isinstance(row, dict) and row.get("role") == "assistant":
+                reasoning = reasoning or row.get("reasoning") or None
+                if row.get("tool_calls") and not tool_calls:
+                    for call in row.get("tool_calls") or []:
+                        if not isinstance(call, dict):
+                            continue
+                        function = call.get("function") or {}
+                        tool_calls.append(
+                            SimpleNamespace(
+                                id=str(call.get("id") or ""),
+                                type="function",
+                                function=SimpleNamespace(
+                                    name=str(function.get("name") or ""),
+                                    arguments=str(
+                                        function.get("arguments") or "{}"
+                                    ),
+                                ),
+                            )
+                        )
+                if reasoning and tool_calls:
+                    break
+        message = SimpleNamespace(
+            role="assistant",
+            content=str(getattr(result, "final_text", "") or ""),
+            tool_calls=tool_calls or None,
+            reasoning=reasoning,
+        )
+        native_stop_reason = str(
+            getattr(result, "last_stop_reason", "") or ""
+        ).strip().lower()
+        finish_reason = {
+            "end_turn": "stop",
+            "stop_sequence": "stop",
+            "tool_use": "tool_calls",
+            "max_tokens": "length",
+            "model_context_window_exceeded": "length",
+            "refusal": "content_filter",
+        }.get(native_stop_reason, native_stop_reason or "stop")
+        choice = SimpleNamespace(
+            index=0,
+            message=message,
+            finish_reason="tool_calls" if tool_calls else finish_reason,
+        )
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
+        return SimpleNamespace(
+            choices=[choice],
+            model=str(kwargs.get("model") or self._model or ""),
+            usage=usage,
+        )
+
+
+class _ClaudeAgentSdkChatShim:
+    def __init__(self, adapter: _ClaudeAgentSdkCompletionsAdapter):
+        self.completions = adapter
+
+
+class ClaudeAgentSdkAuxiliaryClient:
+    """Chat-completions facade backed by Claude Code keychain auth."""
+
+    def __init__(self, model: str):
+        self.chat = _ClaudeAgentSdkChatShim(_ClaudeAgentSdkCompletionsAdapter(model))
+        self.api_key = ""
+        self.base_url = "claude-agent-sdk://local"
+
+    def close(self):
+        return None
+
+
+class _AsyncClaudeAgentSdkCompletionsAdapter:
+    def __init__(self, sync_adapter: _ClaudeAgentSdkCompletionsAdapter):
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+
+        # Do not use asyncio's process-global default executor here. The
+        # Claude child is already a blocking subprocess boundary, and several
+        # Hermes hosts create/tear down short-lived event loops; waiting for a
+        # default ThreadPoolExecutor shutdown can then hold loop teardown open.
+        # A one-shot daemon preserves ContextVars (runtime/provider routing)
+        # without becoming event-loop-owned state.
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        context = contextvars.copy_context()
+
+        def _deliver(value: Any = None, error: Optional[BaseException] = None) -> None:
+            if future.done():
+                return
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(value)
+
+        def _run() -> None:
+            try:
+                value = context.run(self._sync.create, **kwargs)
+            except BaseException as exc:
+                loop.call_soon_threadsafe(_deliver, None, exc)
+            else:
+                loop.call_soon_threadsafe(_deliver, value, None)
+
+        threading.Thread(
+            target=_run,
+            daemon=True,
+            name="hermes-claude-agent-sdk-aux",
+        ).start()
+        return await future
+
+
+class _AsyncClaudeAgentSdkChatShim:
+    def __init__(self, adapter: _AsyncClaudeAgentSdkCompletionsAdapter):
+        self.completions = adapter
+
+
+class AsyncClaudeAgentSdkAuxiliaryClient:
+    def __init__(self, sync_wrapper: "ClaudeAgentSdkAuxiliaryClient"):
+        self.chat = _AsyncClaudeAgentSdkChatShim(
+            _AsyncClaudeAgentSdkCompletionsAdapter(sync_wrapper.chat.completions)
+        )
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
+
+
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
@@ -3052,6 +3244,34 @@ def _read_main_base_url() -> str:
     except Exception:
         pass
     return ""
+
+
+def _read_main_api_mode() -> str:
+    """Read the configured main transport when no live turn is bound.
+
+    Most API modes can be reconstructed from provider/model/base URL by the
+    normal resolver. ``claude_agent_sdk`` is different: it is an explicit runtime
+    choice backed by Claude Code's keychain and deliberately has no HTTP
+    credential or endpoint. Turn-external auxiliary consumers therefore need
+    this config fallback or they silently probe Anthropic HTTP auth.
+    """
+    override = _runtime_main_value("api_mode")
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(model_cfg, dict):
+            return ""
+        provider = str(model_cfg.get("provider") or "").strip().lower()
+        runtime = str(model_cfg.get("anthropic_runtime") or "").strip().lower()
+        if provider == "anthropic" and runtime == "claude_agent_sdk":
+            return "claude_agent_sdk"
+        return str(model_cfg.get("api_mode") or "").strip()
+    except Exception:
+        return ""
 
 
 def _resolve_moa_aggregator(preset_name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -5742,7 +5962,7 @@ def _resolve_auto_route(
     runtime_model = str(runtime.get("model") or "")
     runtime_base_url = str(runtime.get("base_url") or "")
     runtime_api_key = runtime.get("api_key", "")
-    runtime_api_mode = str(runtime.get("api_mode") or "")
+    runtime_api_mode = str(runtime.get("api_mode") or _read_main_api_mode() or "")
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -5968,6 +6188,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         return sync_client, model
     if isinstance(sync_client, CodexAuxiliaryClient):
         return AsyncCodexAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, ClaudeAgentSdkAuxiliaryClient):
+        return AsyncClaudeAgentSdkAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
     if isinstance(sync_client, BedrockAuxiliaryClient):
@@ -6081,7 +6303,8 @@ def resolve_provider_client(
         explicit_base_url: Optional direct OpenAI-compatible endpoint.
         explicit_api_key: Optional API key paired with explicit_base_url.
         api_mode: API mode override.  One of "chat_completions",
-            "codex_responses", or None (auto-detect).  When set to
+            "codex_responses", "anthropic_messages", "claude_agent_sdk", or None
+            (auto-detect).  When set to
             "codex_responses", the client is wrapped in
             CodexAuxiliaryClient to route through the Responses API.
 
@@ -6097,6 +6320,32 @@ def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+
+    # A concrete auxiliary slot normally persists only ``provider`` +
+    # ``model`` (the model pickers do not duplicate the main transport
+    # choice).  For Anthropic that distinction matters: a main agent running
+    # through Claude Code's keychain has no HTTP token, so resolving an
+    # explicit ``auxiliary.<task>.provider: anthropic`` without inheriting the
+    # matching main transport silently disables the task.  Keep explicit
+    # auxiliary HTTP configuration authoritative, but otherwise inherit the
+    # native runtime whenever this auxiliary provider is the active main
+    # provider.  Centralising this here also covers capability probes and
+    # plugin callers that bypass call_llm().
+    runtime = _normalize_main_runtime(main_runtime)
+    if (
+        provider == "anthropic"
+        and not str(api_mode or "").strip()
+        and not explicit_base_url
+        and not explicit_api_key
+    ):
+        main_provider = str(
+            runtime.get("provider") or _read_main_provider() or ""
+        ).strip().lower()
+        main_api_mode = str(
+            runtime.get("api_mode") or _read_main_api_mode() or ""
+        ).strip().lower()
+        if main_provider == "anthropic" and main_api_mode == "claude_agent_sdk":
+            api_mode = "claude_agent_sdk"
 
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
@@ -6169,6 +6418,22 @@ def resolve_provider_client(
     _nous_portal_vision = provider == "nous" and is_vision
     if not model and provider != "auto" and not _nous_portal_vision:
         model = _get_aux_model_for_provider(provider) or _read_main_model_for_aux() or model
+
+    # Claude Code subscription/keychain auth has no exportable HTTP API key.
+    # Route auxiliary work through an isolated native child so title
+    # generation, goal judging, smart approvals, summaries, and vision keep
+    # using the selected main model without contaminating its persistent
+    # native conversation.
+    if api_mode == "claude_agent_sdk" and provider == "anthropic":
+        final_model = _normalize_resolved_model(model or _read_main_model(), provider)
+        if not final_model:
+            logger.warning(
+                "resolve_provider_client: claude_agent_sdk requested without a model"
+            )
+            return None, None
+        client = ClaudeAgentSdkAuxiliaryClient(final_model)
+        return (_to_async_client(client, final_model, is_vision=is_vision)
+                if async_mode else (client, final_model))
 
     def _needs_codex_wrap(client_obj, base_url_str: str, model_str: str) -> bool:
         """Decide if a plain OpenAI client should be wrapped for Responses API.
@@ -7183,7 +7448,16 @@ def resolve_vision_provider_client(
                 # Step 1 can build a working client.
                 rpc_base_url = None
                 rpc_api_key = None
-                rpc_api_mode = resolved_api_mode
+                # The main runtime transport is authoritative when vision is
+                # following the active model. In particular, keychain-only
+                # Claude users must stay on claude_agent_sdk instead of silently
+                # attempting an Anthropic HTTP client with no token.
+                rpc_api_mode = (
+                    resolved_api_mode
+                    or runtime.get("api_mode")
+                    or _read_main_api_mode()
+                    or None
+                )
                 if main_provider == "custom" or main_provider.startswith("custom:"):
                     runtime_base_url = runtime.get("base_url")
                     if runtime_base_url:
@@ -7379,10 +7653,27 @@ def _client_cache_key(
     model: Optional[str] = None,
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
-    runtime_key = tuple(
-        _runtime_cache_discriminator(field, runtime.get(field, ""))
-        for field in _MAIN_RUNTIME_FIELDS
-    ) if provider == "auto" else ()
+    if provider == "auto":
+        if runtime:
+            runtime_key = tuple(
+                _runtime_cache_discriminator(field, runtime.get(field, ""))
+                for field in _MAIN_RUNTIME_FIELDS
+            )
+        else:
+            # Turn-external callers have no ContextVar snapshot. Include the
+            # non-secret configured identity so switching the same Claude
+            # model between HTTP and keychain runtimes cannot reuse a stale
+            # auto client from the other transport.
+            runtime_key = (
+                _read_main_provider(),
+                _read_main_model(),
+                "",
+                "",
+                _read_main_api_mode(),
+                "",
+            )
+    else:
+        runtime_key = ()
     # `auto` can now resolve through task-specific or main fallback policy,
     # so the task participates in the cache key. Non-auto providers keep the
     # old cache shape because the explicit provider/model tuple is sufficient.
@@ -9229,7 +9520,9 @@ def _call_llm_impl(
         kwargs["stream"] = True
         if stream_options:
             kwargs["stream_options"] = stream_options
-        if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
+        if task == "moa_aggregator" and isinstance(
+            client, (CodexAuxiliaryClient, ClaudeAgentSdkAuxiliaryClient)
+        ):
             # CodexAuxiliaryClient (openai-codex, xai-oauth, and any other
             # Responses-shim provider) consumes the provider stream internally
             # and returns a completed response object. Routing that nested

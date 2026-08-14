@@ -23,6 +23,7 @@ Flow:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -169,6 +170,7 @@ async def add_comment_reaction(
 
     Returns ``True`` on success, ``False`` on failure (errors are logged).
     """
+    agent = None
     try:
         from lark_oapi import AccessTokenType  # noqa: F401
     except ImportError:
@@ -1054,7 +1056,7 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
     """
     from run_agent import AIAgent
 
-    logger.info("[Feishu-Comment] _run_comment_agent: injecting lark client into tool thread-locals")
+    logger.info("[Feishu-Comment] _run_comment_agent: binding lark client to tool context")
     from tools.feishu_doc_tool import set_client as set_doc_client
     from tools.feishu_drive_tool import set_client as set_drive_client
     set_doc_client(client)
@@ -1076,14 +1078,25 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
             base_url=runtime_kwargs.get("base_url"),
             api_key=runtime_kwargs.get("api_key"),
             provider=runtime_kwargs.get("provider"),
+            requested_provider=runtime_kwargs.get("requested_provider"),
             api_mode=runtime_kwargs.get("api_mode"),
+            acp_command=runtime_kwargs.get("command"),
+            acp_args=list(runtime_kwargs.get("args") or []),
             credential_pool=runtime_kwargs.get("credential_pool"),
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
             max_iterations=15,
             enabled_toolsets=["feishu_doc", "feishu_drive"],
+            session_id=(
+                "feishu-comment-"
+                + hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:24]
+                if session_key
+                else None
+            ),
         )
+        if not session_key:
+            agent._claude_agent_sdk_persistent_binding = False
         logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)",
                     len(prompt), len(history))
         result = agent.run_conversation(prompt, conversation_history=history or None)
@@ -1103,6 +1116,13 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
         logger.exception("[Feishu-Comment] _run_comment_agent: agent failed: %s", e)
         return ""
     finally:
+        if agent is not None and not session_key:
+            try:
+                from agent.claude_agent_sdk_runtime import release_claude_agent_sdk_session
+
+                release_claude_agent_sdk_session(agent)
+            except Exception:
+                pass
         set_doc_client(None)
         set_drive_client(None)
 

@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -5331,6 +5334,96 @@ class TestFallbackAnthropicProvider:
             agent._try_activate_fallback()
 
         assert agent._use_prompt_caching is True
+
+    def test_fallback_to_subscription_claude_agent_sdk_needs_no_http_client(self, agent):
+        agent._fallback_activated = False
+        agent._fallback_model = {
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+            "api_mode": "claude_agent_sdk",
+        }
+        agent._fallback_chain = [agent._fallback_model]
+        agent._fallback_index = 0
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=AssertionError("subscription fallback must not resolve HTTP"),
+        ):
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        assert agent.api_mode == "claude_agent_sdk"
+        assert agent.provider == "anthropic"
+        assert agent.base_url == ""
+        assert agent.api_key == ""
+        assert agent.client is None
+        assert agent._anthropic_client is None
+
+
+def test_http_loop_hands_prepared_turn_to_claude_agent_sdk_fallback(agent, monkeypatch):
+    from agent.transports.claude_agent_sdk_session import ClaudeAgentSdkTurnResult
+
+    class NativeSession:
+        def __init__(self):
+            self.calls = []
+            self.synced = []
+
+        def run_turn(self, **kwargs):
+            self.calls.append(kwargs)
+            return ClaudeAgentSdkTurnResult(
+                final_text="subscription fallback answer",
+                projected_messages=[
+                    {
+                        "role": "assistant",
+                        "content": "subscription fallback answer",
+                    }
+                ],
+                native_session_id="fallback-native",
+                token_usage={"input_tokens": 4, "output_tokens": 2},
+                last_call_usage={"input_tokens": 4, "output_tokens": 2},
+            )
+
+        def sync_history_signature(self, messages):
+            self.synced.append(list(messages))
+
+        def interrupt(self):
+            return None
+
+        def close(self):
+            return None
+
+    native = NativeSession()
+    agent._fallback_chain = [
+        {
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+            "api_mode": "claude_agent_sdk",
+        }
+    ]
+    agent._fallback_model = agent._fallback_chain[0]
+    agent._fallback_index = 0
+    agent.client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[],
+        usage=None,
+        model="broken-primary",
+    )
+
+    def get_native(bound_agent, *, system_prompt):
+        assert bound_agent is agent
+        assert system_prompt
+        bound_agent._claude_agent_sdk_session = native
+        return native
+
+    monkeypatch.setattr("agent.claude_agent_sdk_runtime._get_session", get_native)
+    with patch.object(agent, "_sync_external_memory_for_turn", return_value=None):
+        result = agent.run_conversation("finish this")
+
+    assert result["final_response"] == "subscription fallback answer"
+    assert result["claude_session_id"] == "fallback-native"
+    assert native.calls[0]["user_input"] == "finish this"
+    assert [
+        row for row in result["messages"] if row.get("role") == "user"
+    ] == [{"role": "user", "content": "finish this"}]
 
 
 

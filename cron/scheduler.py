@@ -2476,7 +2476,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        def _send_from_fresh_event_loop():
+                            # Construct the coroutine inside the worker. If
+                            # submit itself fails during interpreter shutdown,
+                            # there is then no unawaited coroutine to leak.
+                            return asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    cleaned_delivery_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                )
+                            )
+
+                        future = pool.submit(_send_from_fresh_event_loop)
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -4429,6 +4444,10 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        # Isolated cron runs have a unique Hermes session per firing. Native
+        # persistence would create an orphan binding that can never be reused;
+        # ``wake_main`` jobs use the real main agent and do not pass here.
+        agent._claude_agent_sdk_persistent_binding = False
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

@@ -31,6 +31,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.context_engine import ContextEngine
 from agent.turn_context import TurnContext, build_turn_context
 from tests.agent.test_turn_context import _FakeAgent
 
@@ -64,6 +65,41 @@ def _stub_compressor(*, preflight=None, threshold_tokens=10**9):
     if preflight is not None:
         comp.should_compress_preflight = preflight
     return comp
+
+
+class _ExternalPreflightEngine(ContextEngine):
+    """Small real plugin-engine double for native-history ownership tests."""
+
+    protect_first_n = 2
+    protect_last_n = 2
+    threshold_tokens = 10**9
+    context_length = 10**9
+    last_prompt_tokens = 0
+
+    def __init__(self, preflight):
+        self._preflight = preflight
+
+    @property
+    def name(self):
+        return "external-preflight"
+
+    def update_from_response(self, usage):
+        return None
+
+    def should_compress(self, prompt_tokens=None):
+        return False
+
+    def should_compress_preflight(self, messages):
+        return self._preflight(messages)
+
+    def should_defer_preflight_to_real_usage(self, rough_tokens):
+        return False
+
+    def get_active_compression_failure_cooldown(self):
+        return None
+
+    def compress(self, messages, **kwargs):
+        return messages
 
 
 def _make_agent(compressor):
@@ -115,6 +151,43 @@ def test_default_false_hook_is_byte_identical_noop():
     agent._compress_context.assert_not_called()
     agent._emit_status.assert_not_called()
     assert ctx.preflight_compression_blocked is False
+
+
+def test_native_history_runtime_honors_external_engine_preflight():
+    hook = MagicMock(return_value=True)
+    agent = _make_agent(_ExternalPreflightEngine(hook))
+    agent.api_mode = "claude_agent_sdk"
+
+    ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    hook.assert_called_once()
+    agent._compress_context.assert_called_once()
+
+
+def test_native_history_runtime_skips_builtin_engine_preflight(tmp_path):
+    from agent.context_compressor import ContextCompressor
+
+    with patch(
+        "agent.context_compressor.get_model_context_length", return_value=1_000_000
+    ):
+        compressor = ContextCompressor(
+            model="test/model",
+            threshold_percent=0.85,
+            protect_first_n=2,
+            protect_last_n=2,
+            quiet_mode=True,
+        )
+    hook = MagicMock(return_value=True)
+    compressor.should_compress_preflight = hook
+    agent = _make_agent(compressor)
+    agent.api_mode = "claude_agent_sdk"
+
+    ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    hook.assert_not_called()
+    agent._compress_context.assert_not_called()
 
 
 

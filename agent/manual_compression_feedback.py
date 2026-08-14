@@ -48,7 +48,11 @@ def summarize_manual_compression(
     """Return consistent user-facing feedback for manual compression."""
     before_count = len(before_messages)
     after_count = len(after_messages)
-    noop = list(after_messages) == list(before_messages)
+    native_compaction = (
+        compression_state is not None
+        and getattr(compression_state, "_last_native_compaction", False) is True
+    )
+    noop = list(after_messages) == list(before_messages) and not native_compaction
     aborted = (
         compression_state is not None
         and getattr(compression_state, "_last_compress_aborted", False) is True
@@ -65,7 +69,12 @@ def summarize_manual_compression(
     if not isinstance(failure_reason, str) or not failure_reason.strip():
         failure_reason = None
 
-    if aborted:
+    if native_compaction:
+        headline = (
+            "Compacted Claude's native history; "
+            f"preserved {after_count} visible Hermes messages"
+        )
+    elif aborted:
         headline = f"Compression aborted: {before_count} messages preserved"
     elif fallback_used:
         headline = (
@@ -76,7 +85,12 @@ def summarize_manual_compression(
     else:
         headline = f"Compressed: {before_count} → {after_count} messages"
 
-    if noop and after_tokens == before_tokens:
+    if native_compaction:
+        token_line = (
+            f"Hermes recovery transcript: ~{after_tokens:,} tokens "
+            "(Claude's live context was compacted)"
+        )
+    elif noop and after_tokens == before_tokens:
         token_line = f"Approx request size: ~{before_tokens:,} tokens (unchanged)"
     else:
         token_line = (
@@ -85,7 +99,13 @@ def summarize_manual_compression(
         )
 
     note = None
-    if aborted:
+    if native_compaction:
+        note = (
+            "Claude owns this session's model context. Hermes keeps the full "
+            "visible transcript for search and crash recovery instead of "
+            "rewriting it into a second, divergent summary."
+        )
+    elif aborted:
         note = "Summary generation failed; no messages were removed."
     elif fallback_used:
         dropped_count = getattr(
@@ -112,6 +132,7 @@ def summarize_manual_compression(
 
     return {
         "noop": noop,
+        "native_compaction": native_compaction,
         "aborted": aborted,
         "fallback_used": fallback_used,
         "headline": headline,

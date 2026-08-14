@@ -51,6 +51,39 @@ def test_compress_here_compresses_head_only(capsys):
     assert call.kwargs.get("focus_topic") is None
 
 
+def test_external_engine_keeps_partial_semantics_on_claude_agent_sdk(capsys):
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    summary = [{"role": "user", "content": "[external summary]"}]
+    _wire_agent(shell, summary)
+    shell.agent.api_mode = "claude_agent_sdk"
+    shell.agent._context_engine_is_external = True
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        shell._manual_compress("/compress here 2")
+
+    call = shell.agent._compress_context.call_args
+    assert call.args[0] == history[:4]
+    assert "native_keep_last_exchanges" not in call.kwargs
+
+
+def test_builtin_compressor_maps_partial_to_native_claude_boundary(capsys):
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    _wire_agent(shell, list(history))
+    shell.agent.api_mode = "claude_agent_sdk"
+    shell.agent._context_engine_is_external = False
+
+    with patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100):
+        shell._manual_compress("/compress here 2")
+
+    call = shell.agent._compress_context.call_args
+    assert call.args[0] == history
+    assert call.kwargs["native_keep_last_exchanges"] == 2
+
+
 def test_compress_here_reappends_verbatim_tail(capsys):
     """The most recent exchanges are preserved verbatim after the summary."""
     shell = _make_cli()

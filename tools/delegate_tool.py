@@ -1479,7 +1479,9 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
-    # ACP transport overrides from trusted delegation config.
+    # Subprocess transport overrides from trusted delegation config.  The
+    # historical ``acp_*`` parameter names are shared by Copilot ACP and the
+    # native Claude Agent SDK runtime; ``override_api_mode`` disambiguates them.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
     # Per-call role controlling whether the child can further delegate.
@@ -1669,9 +1671,17 @@ def _build_child_agent(
         effective_api_mode = None  # force re-derivation from provider's defaults
     else:
         effective_api_mode = getattr(parent_agent, "api_mode", None)
+    if effective_api_mode == "claude_agent_sdk":
+        # Claude Code authenticates inside its own process.  An empty key/base
+        # URL is a meaningful resolved value here, not a request to inherit the
+        # parent's HTTP credentials.  Besides being the wrong transport
+        # identity, forwarding those values needlessly exposes parent secrets
+        # to child construction and diagnostics.
+        effective_base_url = ""
+        effective_api_key = ""
     # Defensive: validate trusted delegation.command exists on PATH before
-    # honoring it. Stale config should not force a child onto the ACP transport
-    # and then fail at subprocess startup.
+    # honoring it. Stale config should not force a child onto a subprocess
+    # transport and then fail at startup.
     if override_acp_command:
         import shutil as _shutil
 
@@ -1700,9 +1710,11 @@ def _build_child_agent(
         effective_acp_command = None
         effective_acp_args = []
 
-    if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
+    if override_acp_command and effective_api_mode != "claude_agent_sdk":
+        # A non-Claude command override is the legacy Copilot ACP path, whose
+        # client selection is provider-driven.  Native Claude Agent SDK also carries
+        # its executable through ``acp_command`` for compatibility, but its
+        # already-resolved anthropic/claude_agent_sdk identity must remain intact.
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
@@ -1816,6 +1828,9 @@ def _build_child_agent(
             iteration_budget=None,  # fresh budget per subagent
             **child_optional_kwargs,
         )
+        # A delegated child owns one logical run and is explicitly torn down;
+        # only the parent conversation needs cross-turn native resumption.
+        child._claude_agent_sdk_persistent_binding = False
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -4289,7 +4304,11 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         ) from exc
 
     api_key = runtime.get("api_key", "")
-    if not api_key:
+    api_mode = str(runtime.get("api_mode") or "")
+    # Subscription-backed Claude Code authenticates in its own process and
+    # intentionally resolves with an empty API key. Treating that sentinel as
+    # missing credentials disables explicitly configured Claude Agent SDK delegates.
+    if not api_key and api_mode != "claude_agent_sdk":
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
             f"Set the appropriate environment variable or run 'hermes auth'."
@@ -4300,7 +4319,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
-        "api_mode": runtime.get("api_mode"),
+        "api_mode": api_mode,
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "max_output_tokens": runtime.get("max_output_tokens"),
         "command": runtime.get("command"),

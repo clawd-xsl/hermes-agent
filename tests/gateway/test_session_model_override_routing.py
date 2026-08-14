@@ -82,6 +82,34 @@ def _explode_runtime_resolution():
     )
 
 
+def test_subscription_claude_override_is_complete_without_api_key(monkeypatch):
+    runner = _make_runner()
+    session_key = "agent:main:signal:dm:me"
+    runner._session_state(session_key).conversation.model_override = {
+        "model": "claude-opus-4-6",
+        "provider": "anthropic",
+        "api_key": "",
+        "base_url": "",
+        "api_mode": "claude_agent_sdk",
+        "credential_pool": None,
+    }
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        _explode_runtime_resolution,
+    )
+
+    model, runtime = runner._resolve_session_agent_runtime(
+        session_key=session_key,
+        user_config={"model": {"default": "fallback"}},
+    )
+
+    assert model == "claude-opus-4-6"
+    assert runtime["provider"] == "anthropic"
+    assert runtime["api_mode"] == "claude_agent_sdk"
+    assert runtime["api_key"] == ""
+
+
 def test_gateway_auth_fallback_uses_fallback_model_from_config(tmp_path, monkeypatch):
     """Regression: fallback provider must not inherit the primary model.
 
@@ -135,5 +163,4 @@ fallback_providers:
     assert model == "minimax/minimax-m2.7"
     assert runtime_kwargs["provider"] == "openrouter"
     assert runtime_kwargs["api_key"] == "sk-openrouter"
-
 

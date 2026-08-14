@@ -313,6 +313,7 @@ def _process_single_prompt(
         if config.get("verbose"):
             print(f"   Prompt {prompt_index}: Using container image {container_image}")
     
+    agent = None
     try:
         # Sample toolsets from distribution for this prompt
         selected_toolsets = sample_toolsets_from_distribution(config["distribution"])
@@ -325,6 +326,11 @@ def _process_single_prompt(
         agent = AIAgent(
             base_url=config.get("base_url"),
             api_key=config.get("api_key"),
+            provider=config.get("provider"),
+            requested_provider=config.get("requested_provider"),
+            api_mode=config.get("api_mode"),
+            acp_command=config.get("command"),
+            acp_args=config.get("args"),
             model=config["model"],
             max_iterations=config["max_iterations"],
             enabled_toolsets=selected_toolsets,
@@ -344,6 +350,7 @@ def _process_single_prompt(
             skip_context_files=True,  # Don't pollute trajectories with SOUL.md/AGENTS.md
             skip_memory=True,  # Don't use persistent memory in batch runs
         )
+        agent._claude_agent_sdk_persistent_binding = False
 
         # Run the agent with task_id to ensure each task gets its own isolated VM
         result = agent.run_conversation(prompt, task_id=task_id)
@@ -395,6 +402,17 @@ def _process_single_prompt(
                 "timestamp": datetime.now().isoformat()
             }
         }
+    finally:
+        # Batch samples are independent one-shot conversations. Retire only
+        # the native inference child here; broader task-environment teardown
+        # remains owned by the batch runner's existing lifecycle.
+        if agent is not None:
+            try:
+                from agent.claude_agent_sdk_runtime import release_claude_agent_sdk_session
+
+                release_claude_agent_sdk_session(agent)
+            except Exception:
+                pass
 
 
 def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
@@ -408,6 +426,31 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
         Dict: Batch results with statistics
     """
     batch_num, batch_data, output_dir, completed_prompts_set, config = args
+    config = dict(config)
+    if config.pop("resolve_runtime_in_worker", False):
+        # Keychain/OAuth runtimes and callable bearer providers cannot be
+        # represented by the old base_url/api_key-only worker payload. Resolve
+        # the full runtime inside each process so ``claude_agent_sdk`` stays native
+        # and callable credentials are rebuilt in their owning process.
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested=config.get("requested_provider")
+            or config.get("provider")
+            or None,
+            target_model=config.get("model") or None,
+        )
+        config.update(
+            {
+                "base_url": runtime.get("base_url"),
+                "api_key": runtime.get("api_key"),
+                "provider": runtime.get("provider"),
+                "requested_provider": runtime.get("requested_provider"),
+                "api_mode": runtime.get("api_mode"),
+                "command": runtime.get("command") or config.get("command"),
+                "args": list(runtime.get("args") or config.get("args") or []),
+            }
+        )
     
     output_dir = Path(output_dir)
     print(f"\n🔄 Batch {batch_num}: Starting ({len(batch_data)} prompts)")
@@ -540,6 +583,11 @@ class BatchRunner:
         max_iterations: int = 10,
         base_url: str = None,
         api_key: str = None,
+        provider: str = None,
+        requested_provider: str = None,
+        api_mode: str = None,
+        command: str = None,
+        args: List[str] = None,
         model: str = "claude-opus-4-20250514",
         num_workers: int = 4,
         verbose: bool = False,
@@ -566,6 +614,11 @@ class BatchRunner:
             max_iterations (int): Max iterations per agent run
             base_url (str): Base URL for model API
             api_key (str): API key for model
+            provider (str): Runtime provider identity
+            requested_provider (str): User-selected provider identity
+            api_mode (str): Inference transport (including ``claude_agent_sdk``)
+            command (str): Optional native runtime executable
+            args (List[str]): Optional native runtime arguments
             model (str): Model name to use
             num_workers (int): Number of parallel workers
             verbose (bool): Enable verbose logging
@@ -590,6 +643,11 @@ class BatchRunner:
         self.max_iterations = max_iterations
         self.base_url = base_url
         self.api_key = api_key
+        self.provider = provider
+        self.requested_provider = requested_provider
+        self.api_mode = api_mode
+        self.command = command
+        self.args = list(args or [])
         self.model = model
         self.num_workers = num_workers
         self.verbose = verbose
@@ -884,12 +942,27 @@ class BatchRunner:
         else:
             worker_api_key = self.api_key
 
+        resolve_runtime_in_worker = bool(
+            (callable(self.api_key) and not isinstance(self.api_key, str))
+            or (
+                worker_api_key is None
+                and not self.provider
+                and not self.api_mode
+            )
+        )
+
         config = {
             "distribution": self.distribution,
             "model": self.model,
             "max_iterations": self.max_iterations,
             "base_url": self.base_url,
             "api_key": worker_api_key,
+            "provider": self.provider,
+            "requested_provider": self.requested_provider,
+            "api_mode": self.api_mode,
+            "command": self.command,
+            "args": list(self.args),
+            "resolve_runtime_in_worker": resolve_runtime_in_worker,
             "verbose": self.verbose,
             "ephemeral_system_prompt": self.ephemeral_system_prompt,
             "log_prefix_chars": self.log_prefix_chars,
@@ -1161,6 +1234,10 @@ def main(
     model: str = "anthropic/claude-sonnet-4.6",
     api_key: str = None,
     base_url: str = "https://openrouter.ai/api/v1",
+    provider: str = None,
+    api_mode: str = None,
+    command: str = None,
+    args: str = None,
     max_turns: int = 10,
     num_workers: int = 4,
     resume: bool = False,
@@ -1189,6 +1266,10 @@ def main(
         model (str): Model name to use (default: "claude-opus-4-20250514")
         api_key (str): API key for model authentication
         base_url (str): Base URL for model API
+        provider (str): Runtime provider identity (for example ``anthropic``)
+        api_mode (str): Inference transport (for example ``claude_agent_sdk``)
+        command (str): Optional native runtime executable
+        args (str): Shell-style arguments for the native runtime executable
         max_turns (int): Maximum number of tool calling iterations per prompt (default: 10)
         num_workers (int): Number of parallel worker processes (default: 4)
         resume (bool): Resume from checkpoint if run was interrupted (default: False)
@@ -1260,6 +1341,12 @@ def main(
     providers_allowed_list = [p.strip() for p in providers_allowed.split(",")] if providers_allowed else None
     providers_ignored_list = [p.strip() for p in providers_ignored.split(",")] if providers_ignored else None
     providers_order_list = [p.strip() for p in providers_order.split(",")] if providers_order else None
+
+    command_args = None
+    if args:
+        import shlex
+
+        command_args = shlex.split(args)
     
     # Build reasoning_config from CLI flags
     # --reasoning_disabled takes priority, then --reasoning_effort, then default (medium)
@@ -1301,6 +1388,11 @@ def main(
             max_iterations=max_turns,
             base_url=base_url,
             api_key=api_key,
+            provider=provider,
+            requested_provider=provider,
+            api_mode=api_mode,
+            command=command,
+            args=command_args,
             model=model,
             num_workers=num_workers,
             verbose=verbose,
@@ -1327,4 +1419,3 @@ def main(
 
 if __name__ == "__main__":
     fire.Fire(main)
-

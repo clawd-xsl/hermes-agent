@@ -4881,11 +4881,16 @@ def _compress_session_history(
     # back to full compression so the user still gets an action.
     tail: list = []
     head = history
+    native_keep_last_exchanges = None
     if partial:
         head, tail = split_history_for_partial_compress(history, keep_last)
         if not tail:
             partial = False
             head = history
+        elif getattr(agent, "api_mode", None) == "claude_agent_sdk":
+            native_keep_last_exchanges = keep_last
+            head = history
+            tail = []
     if approx_tokens is None:
         # Include system prompt + tool schemas so the figure reflects real
         # request pressure, not a transcript-only underestimate (#6217).
@@ -4913,6 +4918,7 @@ def _compress_session_history(
             # parse_partial_compress_args returns focus_topic=None for the
             # boundary-aware forms).
             focus_topic=focus_topic or None,
+            native_keep_last_exchanges=native_keep_last_exchanges,
             force=True,
             defer_context_engine_notification=True,
         )
@@ -5116,7 +5122,7 @@ def _probe_credentials(agent) -> str:
     try:
         key = getattr(agent, "api_key", "") or ""
         provider = getattr(agent, "provider", "") or ""
-        if not key:
+        if not key and getattr(agent, "api_mode", "") != "claude_agent_sdk":
             return f"No API key configured for provider '{provider}'. First message will fail."
     except Exception:
         pass
@@ -6199,9 +6205,13 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "base_url": getattr(agent, "base_url", None) or None,
         "api_key": getattr(agent, "api_key", None) or None,
         "provider": getattr(agent, "provider", None) or None,
+        "requested_provider": getattr(agent, "requested_provider", None)
+        or getattr(agent, "provider", None)
+        or None,
         "api_mode": getattr(agent, "api_mode", None) or None,
         "acp_command": getattr(agent, "acp_command", None) or None,
         "acp_args": getattr(agent, "acp_args", None) or None,
+        "credential_pool": getattr(agent, "_credential_pool", None),
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
@@ -6683,6 +6693,8 @@ def _make_agent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
+        requested_provider=runtime.get("requested_provider")
+        or requested_provider,
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),

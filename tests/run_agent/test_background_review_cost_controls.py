@@ -1,10 +1,10 @@
-"""Unit coverage for the background-review aux-model selector + routed digest.
+"""Unit coverage for background-review runtime selection + cold digest.
 
 Covers the two behaviors this change adds:
   • _resolve_review_runtime — auto/same-model → not routed (main model, warm
     cache); a configured different model → routed with resolved credentials.
-  • _digest_history — compact replay used ONLY on the routed path (recent tail
-    verbatim + a digest of older turns), preserving role alternation.
+  • _digest_history — compact replay for routed/native-isolated paths (recent
+    semantics with bounded payloads + a bounded digest of older turns).
 
 Pure-function / config-driven; no live model calls.
 """
@@ -112,7 +112,7 @@ def test_routing_resolution_failure_falls_back_to_parent():
 
 
 # ---------------------------------------------------------------------------
-# _digest_history — routed-path compact replay
+# _digest_history — cold/isolated compact replay
 # ---------------------------------------------------------------------------
 
 def test_digest_under_tail_returns_full():
@@ -126,12 +126,19 @@ def test_digest_collapses_old_keeps_tail_verbatim():
         msgs.append(_msg("user", f"u{i} " + "x" * 50))
         msgs.append(_msg("assistant", f"a{i} " + "y" * 50))
     out = br._digest_history(msgs, tail=10)
-    # First message is the synthetic digest (user role → alternation preserved).
+    # The digest merges into the first retained user row so strict role
+    # alternation remains valid.
     assert out[0]["role"] == "user"
     assert out[0]["content"].startswith("[Earlier conversation digest")
-    # Recent tail preserved verbatim.
+    # Other recent rows preserve their semantic content.
     assert out[-1] == msgs[-1]
-    assert len(out) == 11  # 1 digest + 10 tail
+    assert len(out) == 10
+    assert all(
+        left["role"] != right["role"]
+        for left, right in zip(out, out[1:])
+        if left["role"] in {"user", "assistant"}
+        and right["role"] in {"user", "assistant"}
+    )
 
 
 def test_digest_does_not_open_tail_on_a_tool_message():
@@ -158,3 +165,45 @@ def test_digest_records_tool_names_in_arc():
     digest = out[0]["content"]
     assert "USER: do the thing" in digest
     assert "tools: skill_view, patch" in digest
+
+
+def test_digest_bounds_unbounded_lossless_native_history():
+    msgs = []
+    for i in range(300):
+        msgs.append(_msg("user", f"u{i} " + "x" * 200))
+        msgs.append(_msg("assistant", f"a{i} " + "y" * 200))
+
+    out = br._digest_history(msgs, tail=24, max_digest_chars=2_000)
+
+    assert len(out) == 24
+    assert out[-1] == msgs[-1]
+    assert "older digest entries omitted" in out[0]["content"]
+    assert len(out[0]["content"]) < 2_500
+
+
+def test_digest_bounds_recent_tool_payloads_and_omits_binary_attachments():
+    huge = "x" * 50_000
+    msgs = [
+        _msg("user", [{"type": "image_url", "image_url": {"url": huge}}]),
+        _msg(
+            "assistant",
+            huge,
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": huge},
+                }
+            ],
+        ),
+        {"role": "tool", "tool_call_id": "call-1", "content": huge},
+        _msg("assistant", "done"),
+    ]
+
+    out = br._digest_history(msgs, tail=24, max_tail_message_chars=1_000)
+
+    encoded = str(out)
+    assert len(encoded) < 8_000
+    assert huge not in encoded
+    assert "attachment omitted" in encoded
+    assert out[1]["tool_calls"][0]["function"]["arguments"].startswith("{")

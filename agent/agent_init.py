@@ -669,7 +669,7 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server", "claude_agent_sdk"}:
         agent.api_mode = api_mode
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"
@@ -708,6 +708,23 @@ def init_agent(
         agent.api_mode = nous_api_mode(agent.model)
     else:
         agent.api_mode = "chat_completions"
+
+    # ``acp_command`` is shared by several subprocess transports. Keep a
+    # Claude-specific copy only when it was supplied for an actual native
+    # Claude runtime, so a later HTTP/ACP -> Claude fallback cannot mistake a
+    # stale Copilot command for the Claude executable.
+    agent._claude_agent_sdk_command = (
+        agent.acp_command if agent.api_mode == "claude_agent_sdk" else None
+    )
+    agent._claude_agent_sdk_args = (
+        list(agent.acp_args) if agent.api_mode == "claude_agent_sdk" else []
+    )
+    # Long-lived chat sessions keep a resumable Claude binding by default.
+    # One-shot surfaces (cron, background jobs, batch samples, curator passes,
+    # and delegated children) opt this internal flag out before their first
+    # turn: their generated session ids are never reused, so persisting those
+    # bindings only fills the native-session pool and runtime directory.
+    agent._claude_agent_sdk_persistent_binding = True
 
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent
@@ -1077,7 +1094,17 @@ def init_agent(
     # Claude uses its own timeout path and is not covered here.
     _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
 
-    if agent.api_mode == "anthropic_messages":
+    if agent.api_mode == "claude_agent_sdk":
+        # Claude Code owns inference, authentication, native history, and
+        # compaction for this runtime. Do not construct an Anthropic/OpenAI
+        # HTTP client or resolve/copy subscription credentials into Hermes.
+        agent.client = None
+        agent.api_key = ""
+        agent.base_url = ""
+        agent._client_kwargs = {}
+        if not agent.quiet_mode:
+            print(f"🤖 AI Agent initialized with model: {agent.model} (Claude Agent SDK)")
+    elif agent.api_mode == "anthropic_messages":
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
         # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
         # (prompt caching, thinking budgets, adaptive thinking).
@@ -2553,6 +2580,12 @@ def init_agent(
             )
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
+    # Keep selection provenance explicit. A plugin may legitimately subclass
+    # ContextCompressor to reuse its helpers; runtime ownership decisions must
+    # still treat that configured instance as external rather than guessing
+    # solely from its Python type.
+    agent._context_engine_is_external = _selected_engine is not None
+
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy: the host compression
@@ -2898,6 +2931,8 @@ def init_agent(
         "requested_provider": agent.requested_provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "claude_agent_sdk_command": getattr(agent, "_claude_agent_sdk_command", None),
+        "claude_agent_sdk_args": list(getattr(agent, "_claude_agent_sdk_args", []) or []),
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,

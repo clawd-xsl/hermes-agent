@@ -49,6 +49,171 @@ def test_noauth_lmstudio_still_resolves(monkeypatch):
     assert resolved["api_key"]
 
 
+def test_anthropic_claude_agent_sdk_runtime_needs_no_copied_credential(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "anthropic",
+            "default": "claude-opus-4-6",
+            "anthropic_runtime": "claude_agent_sdk",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved == {
+        "provider": "anthropic",
+        "api_mode": "claude_agent_sdk",
+        "base_url": "",
+        "api_key": "",
+        "source": "claude-code",
+        "requested_provider": "anthropic",
+        "command": "",
+        "args": [],
+    }
+
+
+def test_anthropic_claude_agent_sdk_runtime_includes_process_config(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "anthropic",
+            "default": "claude-opus-4-6",
+            "anthropic_runtime": "claude_agent_sdk",
+            "claude_agent_sdk": {
+                "command": "/opt/claude",
+                "args": ["--debug-to-stderr"],
+            },
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved["command"] == "/opt/claude"
+    assert resolved["args"] == ["--debug-to-stderr"]
+
+
+def test_anthropic_claude_agent_sdk_runtime_resolves_from_real_profile_config(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: anthropic\n"
+        "  default: claude-sonnet-4-6\n"
+        "  anthropic_runtime: claude_agent_sdk\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+
+    resolved = rp.resolve_runtime_provider()
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["api_mode"] == "claude_agent_sdk"
+    assert resolved["api_key"] == ""
+
+
+def test_anthropic_claude_agent_sdk_runtime_drops_pool_bearer(monkeypatch):
+    entry = SimpleNamespace(
+        access_token="secret-oauth-bearer",
+        source="manual",
+        base_url="https://api.anthropic.com",
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return entry
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "anthropic", "anthropic_runtime": "claude_agent_sdk"},
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved["api_mode"] == "claude_agent_sdk"
+    assert resolved["api_key"] == ""
+    assert resolved["base_url"] == ""
+    assert resolved["credential_pool"] is None
+
+
+def test_cli_runtime_setup_accepts_subscription_without_http_credentials(monkeypatch):
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    class _CLI(CLIAgentSetupMixin):
+        requested_provider = "anthropic"
+        _explicit_api_key = None
+        _explicit_base_url = None
+        _fallback_model = []
+        model = "claude-opus-4-6"
+        provider = "anthropic"
+        api_mode = "chat_completions"
+        api_key = None
+        base_url = None
+        acp_command = None
+        acp_args = []
+        _credential_pool = None
+        agent = None
+
+        def _normalize_model_for_provider(self, _provider):
+            return False
+
+    monkeypatch.setattr(
+        rp,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "anthropic",
+            "api_mode": "claude_agent_sdk",
+            "base_url": "",
+            "api_key": "",
+            "source": "claude-code",
+            "credential_pool": None,
+        },
+    )
+
+    cli = _CLI()
+    assert cli._ensure_runtime_credentials() is True
+    assert cli.api_mode == "claude_agent_sdk"
+    assert cli.api_key == ""
+    assert cli.base_url == ""
+
+
+def test_subscription_model_validation_never_probes_missing_http_credentials(
+    monkeypatch,
+):
+    from hermes_cli import models
+
+    monkeypatch.setattr(
+        models,
+        "_fetch_anthropic_models",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Claude subscription validation must not probe HTTP")
+        ),
+    )
+    result = models.validate_requested_model(
+        "claude-future-entitlement-model",
+        "anthropic",
+        api_key="",
+        base_url="",
+        api_mode="claude_agent_sdk",
+    )
+
+    assert result["accepted"] is True
+    assert result["persist"] is True
+    assert result["recognized"] is False
+    assert "Claude Code" in result["message"]
+
+
 def _fake_invoke_jwt(ttl_seconds=3600):
     header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
     payload = base64.urlsafe_b64encode(

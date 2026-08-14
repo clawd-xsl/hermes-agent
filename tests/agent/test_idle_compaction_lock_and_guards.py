@@ -112,6 +112,27 @@ def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
     ), f"expected idle status line, got: {events}"
 
 
+def test_idle_compaction_crosses_claude_native_boundary(tmp_path: Path) -> None:
+    """The opt-in idle trigger must not be swallowed by native auto mode."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_CLAUDE_NATIVE"
+    db.create_session(sid, source="cli")
+    agent = _prep_idle_agent(db, sid)
+    agent.api_mode = "claude_agent_sdk"
+    calls = []
+
+    def _compress(messages, system_message, **kwargs):
+        calls.append((messages, system_message, kwargs))
+        return messages, agent._cached_system_prompt
+
+    agent._compress_context = _compress
+
+    _run_prologue(agent, _history())
+
+    assert len(calls) == 1
+    assert calls[0][2]["native_trigger_source"] == "idle"
+
+
 def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -> None:
     """An idle-triggered compress racing another path must sit the round out.
 
@@ -183,7 +204,6 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
     compressor.compress.assert_not_called()
     assert agent.session_id == sid
     assert len(ctx.messages) == len(_history()) + 1
-
 
 
 

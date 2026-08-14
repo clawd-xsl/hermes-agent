@@ -720,6 +720,26 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIn("no API key", str(ctx.exception))
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_subscription_claude_agent_sdk_provider_needs_no_api_key(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+            "base_url": "",
+            "api_key": "",
+            "api_mode": "claude_agent_sdk",
+            "credential_pool": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "claude-opus-4-6", "provider": "anthropic"}
+
+        creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["provider"], "anthropic")
+        self.assertEqual(creds["api_mode"], "claude_agent_sdk")
+        self.assertEqual(creds["api_key"], "")
+        self.assertEqual(creds["base_url"], "")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_named_custom_provider_preserves_provider_name(self, mock_resolve):
         """Named custom provider (e.g. crof.ai) resolves to 'custom' at runtime level
         but the subagent must retain the original provider identity so that
@@ -748,6 +768,94 @@ class TestDelegationCredentialResolution(unittest.TestCase):
 
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_default_child_inherits_subscription_claude_agent_sdk_runtime(
+        self, mock_creds, mock_cfg
+    ):
+        mock_cfg.return_value = {"max_iterations": 45}
+        mock_creds.return_value = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.model = "claude-opus-4-6"
+        parent.provider = "anthropic"
+        parent.api_mode = "claude_agent_sdk"
+        parent.api_key = ""
+        parent.base_url = ""
+        parent._client_kwargs = {}
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Use the parent subscription", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "anthropic")
+            self.assertEqual(kwargs["api_mode"], "claude_agent_sdk")
+            self.assertFalse(kwargs["api_key"])
+            self.assertFalse(kwargs["base_url"])
+            self.assertIs(mock_child._claude_agent_sdk_persistent_binding, False)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("shutil.which", return_value="/opt/claude")
+    def test_configured_subscription_claude_agent_sdk_command_keeps_native_runtime(
+        self, mock_which, mock_creds, mock_cfg
+    ):
+        """A Claude executable override is not a Copilot ACP override."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "claude-opus-4-6",
+            "provider": "anthropic",
+        }
+        mock_creds.return_value = {
+            "model": "claude-opus-4-6",
+            "provider": "anthropic",
+            "base_url": "",
+            "api_key": "",
+            "api_mode": "claude_agent_sdk",
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "command": "claude",
+            "args": ["--permission-mode", "bypassPermissions"],
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Use configured Claude subscription", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "anthropic")
+            self.assertEqual(kwargs["api_mode"], "claude_agent_sdk")
+            self.assertEqual(kwargs["acp_command"], "claude")
+            self.assertEqual(
+                kwargs["acp_args"], ["--permission-mode", "bypassPermissions"]
+            )
+            self.assertFalse(kwargs["api_key"])
+            self.assertFalse(kwargs["base_url"])
+            self.assertIs(mock_child._claude_agent_sdk_persistent_binding, False)
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")

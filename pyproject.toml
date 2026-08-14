@@ -167,6 +167,10 @@ dependencies = [
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
+# Official persistent Claude Agent SDK backend used only when
+# model.anthropic_runtime=claude_agent_sdk. Kept separate from the direct Messages
+# provider so API-key users do not install a second agent runtime.
+claude-agent-sdk = ["claude-agent-sdk==0.2.137"]
 # Web search backends — each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
 exa = ["exa-py==2.10.2"]
@@ -386,7 +390,7 @@ exclude-newer = "14 days"
 # request-smuggling) fix in 4.4.1, published 2026-08-03. Remove after 2026-08-17.
 # aiohttp, cryptography: same shape — the advisory fixes are newer than the
 # 14-day window, so the resolver cannot see them without an exception.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, claude-agent-sdk = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
