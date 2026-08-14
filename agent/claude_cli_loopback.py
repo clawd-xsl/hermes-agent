@@ -326,11 +326,12 @@ class ClaudeToolLoopback:
     def observe_stream_event(self, event: dict[str, Any]) -> None:
         """Build the provisional tool batch from partial provider events.
 
-        ``message_stop`` precedes MCP execution at the provider protocol
-        boundary even when Claude withholds the later complete assistant row
-        until after MCP returns. Its tool ids, names, and complete JSON inputs
-        are enough to prepare the effect WAL and preserve batch planning.
-        Narration and reasoning still come only from the authoritative row.
+        When ``message_stop`` wins the race with MCP execution, its tool ids,
+        names, and complete JSON inputs are enough to prepare the effect WAL
+        and preserve batch planning. Claude may instead withhold this entire
+        stream until MCP returns; that order is handled by the request identity
+        fallback in :meth:`_call_tool`. Narration and reasoning still come only
+        from the authoritative row.
         """
         if not isinstance(event, dict):
             return
@@ -419,6 +420,17 @@ class ClaudeToolLoopback:
                     None,
                 )
                 if match is None:
+                    match = next(
+                        (
+                            entry
+                            for entry in self._tool_projections
+                            if entry.claude_id is None
+                            and entry.signature == signature
+                            and id(entry) not in matched_projection_ids
+                        ),
+                        None,
+                    )
+                if match is None:
                     match = _ToolProjection(
                         signature=signature,
                         local_id=_unique_projection_id(
@@ -429,24 +441,50 @@ class ClaudeToolLoopback:
                         claude_id=claude_id or None,
                     )
                     self._tool_projections.append(match)
+                elif match.claude_id is None:
+                    match.claude_id = claude_id or None
+                    if self._journal is not None and claude_id:
+                        self._journal.bind_native_id(match.local_id, claude_id)
                 matched_projection_ids.add(id(match))
-                match.batch_id = batch_id
-                projections.append(match)
-
-            batch = self._tool_batches.get(batch_id)
-            if batch is None:
-                batch = _ToolBatch(
-                    batch_id=batch_id,
-                    projections=projections,
-                    sealed=True,
+                existing_batch = (
+                    self._tool_batches.get(match.batch_id)
+                    if match.batch_id is not None
+                    else None
                 )
-                self._tool_batches[batch_id] = batch
-            else:
-                if batch.projections != projections:
-                    batch.journal_prepared = False
-                batch.projections = projections
-                batch.sealed = True
-            self._prepare_batch_journal(batch)
+                execution_locked = bool(
+                    match.claimed
+                    or (
+                        existing_batch is not None
+                        and (existing_batch.started or existing_batch.completed)
+                    )
+                )
+                if not execution_locked:
+                    previous_batch_id = match.batch_id
+                    match.batch_id = batch_id
+                    projections.append(match)
+                    if (
+                        previous_batch_id is not None
+                        and previous_batch_id != batch_id
+                        and existing_batch is not None
+                        and existing_batch.projections == [match]
+                    ):
+                        self._tool_batches.pop(previous_batch_id, None)
+
+            if projections:
+                batch = self._tool_batches.get(batch_id)
+                if batch is None:
+                    batch = _ToolBatch(
+                        batch_id=batch_id,
+                        projections=projections,
+                        sealed=True,
+                    )
+                    self._tool_batches[batch_id] = batch
+                else:
+                    if batch.projections != projections:
+                        batch.journal_prepared = False
+                    batch.projections = projections
+                    batch.sealed = True
+                self._prepare_batch_journal(batch)
             self._projection_condition.notify_all()
 
     def reconcile_authoritative_projection(
@@ -502,6 +540,10 @@ class ClaudeToolLoopback:
                         if match is not None:
                             matched_projection_ids.add(id(match))
                             match.claude_id = claude_id
+                            if self._journal is not None and claude_id:
+                                self._journal.bind_native_id(
+                                    match.local_id, claude_id
+                                )
                             match.name = name
                             match.arguments = arguments
                             match.authoritative_seen = True
@@ -529,41 +571,37 @@ class ClaudeToolLoopback:
                         kept_calls.append(kept_call)
                         row_projections.append(match)
                     if kept_calls:
-                        existing_batch_id = next(
-                            (
-                                entry.batch_id
-                                for entry in row_projections
-                                if entry.batch_id is not None
-                            ),
-                            None,
-                        )
-                        batch_id = existing_batch_id or secrets.token_hex(12)
-                        batch = self._tool_batches.get(batch_id)
-                        if batch is None:
+                        # Calls first seen together in this authoritative row
+                        # retain Hermes' normal batch planner. MCP-correlated
+                        # calls that already started independently keep their
+                        # own execution batches; merging a running batch here
+                        # would corrupt leader/completion ownership.
+                        unbatched = [
+                            entry
+                            for entry in row_projections
+                            if entry.batch_id is None
+                        ]
+                        if unbatched:
+                            batch_id = secrets.token_hex(12)
                             batch = _ToolBatch(
                                 batch_id=batch_id,
-                                projections=list(row_projections),
+                                projections=list(unbatched),
                             )
                             self._tool_batches[batch_id] = batch
-                        else:
-                            # Partial events or a permission request can
-                            # establish the batch before this complete record.
-                            # Preserve its order and cached executions, adding
-                            # only forward-compatible calls first seen here.
-                            known = {id(entry) for entry in batch.projections}
-                            added = [
-                                entry
-                                for entry in row_projections
-                                if id(entry) not in known
-                            ]
-                            if added:
-                                batch.projections.extend(added)
-                                batch.journal_prepared = False
+                            for entry in unbatched:
+                                entry.batch_id = batch_id
+
+                        involved_batches: dict[str, _ToolBatch] = {}
                         for entry in row_projections:
-                            entry.batch_id = batch_id
-                        batch.sealed = True
-                        batch.authoritative_seen = True
-                        self._prepare_batch_journal(batch)
+                            if entry.batch_id is None:
+                                continue
+                            batch = self._tool_batches.get(entry.batch_id)
+                            if batch is not None:
+                                involved_batches[batch.batch_id] = batch
+                        for batch in involved_batches.values():
+                            batch.sealed = True
+                            batch.authoritative_seen = True
+                            self._prepare_batch_journal(batch)
                         kept = dict(row)
                         kept["tool_calls"] = kept_calls
                         reconciled.append(kept)
@@ -571,10 +609,13 @@ class ClaudeToolLoopback:
                         # completed results. Persist them immediately after
                         # the delayed authoritative assistant row. The later
                         # native user/tool-result record is then a duplicate.
-                        if batch.completed:
-                            for entry in batch.projections:
-                                if entry.result_ready and entry.result_row is not None:
-                                    reconciled.append(dict(entry.result_row))
+                        for entry in row_projections:
+                            if (
+                                entry.result_ready
+                                and not entry.result_projected
+                                and entry.result_row is not None
+                            ):
+                                reconciled.append(dict(entry.result_row))
                     continue
 
                 if row.get("role") == "assistant":
@@ -796,7 +837,13 @@ class ClaudeToolLoopback:
             if method == "list_tools":
                 return {"id": request_id, "result": self._list_tools()}
             if method == "call_tool":
-                return {"id": request_id, "result": self._call_tool(params)}
+                return {
+                    "id": request_id,
+                    "result": self._call_tool(
+                        params,
+                        execution_id=str(request.get("execution_id") or ""),
+                    ),
+                }
             raise ValueError(f"unknown loopback method: {method}")
         except Exception as exc:
             logger.debug("Claude tool loopback request failed", exc_info=True)
@@ -822,7 +869,12 @@ class ClaudeToolLoopback:
             )
         return result
 
-    def _call_tool(self, params: dict[str, Any]) -> Any:
+    def _call_tool(
+        self,
+        params: dict[str, Any],
+        *,
+        execution_id: str = "",
+    ) -> Any:
         name = str(params.get("name") or "").strip()
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
@@ -886,11 +938,27 @@ class ClaudeToolLoopback:
             )
             if projection is None:
                 raw_local_id = str(params.get("tool_call_id") or "")
+                if not raw_local_id and execution_id:
+                    # tools/call is already an authenticated, uniquely
+                    # correlated execution request. Admit it immediately under
+                    # a hashed request-local id, write that intent to the
+                    # effect WAL, and alias the delayed native tool_use_id
+                    # during stream / authoritative reconciliation. Requiring
+                    # the transcript id here recreates a protocol cycle because
+                    # Claude may be waiting for this result before flushing it.
+                    raw_local_id = "mcp_" + hashlib.sha256(
+                        execution_id.encode("utf-8")
+                    ).hexdigest()[:32]
+                    logger.debug(
+                        "Claude MCP call %s used protocol request identity "
+                        "before the native tool_use_id arrived",
+                        name,
+                    )
                 if not raw_local_id:
                     raise RuntimeError(
-                        "Claude CLI MCP request arrived before Hermes observed "
-                        "a durable native tool_use_id; refusing to execute the "
-                        "side effect"
+                        "Claude CLI tool execution has neither a native "
+                        "tool_use_id nor an MCP request correlation id; "
+                        "refusing to execute the side effect"
                     )
                 projection = _ToolProjection(
                     signature=signature,
@@ -902,7 +970,7 @@ class ClaudeToolLoopback:
                     claimed=True,
                 )
                 self._tool_projections.append(projection)
-            else:
+            if not projection.claimed:
                 projection.name = name
                 projection.arguments = dict(arguments)
                 projection.claimed = True

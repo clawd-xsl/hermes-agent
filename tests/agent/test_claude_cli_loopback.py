@@ -7,6 +7,8 @@ import time
 import types
 from types import SimpleNamespace
 
+import pytest
+
 from agent.claude_cli_journal import ClaudeCliToolJournal
 from agent.claude_cli_loopback import ClaudeToolLoopback
 
@@ -937,12 +939,245 @@ def test_mcp_first_race_uses_wal_then_reconciles_delayed_authoritative_record(
         loopback.close()
 
 
-def test_mcp_call_without_observed_native_tool_id_fails_closed():
+def test_mcp_call_without_native_id_uses_request_correlation_then_aliases(
+    monkeypatch,
+    tmp_path,
+):
     agent = _Agent()
-    loopback = ClaudeToolLoopback(agent, serve=False)
+    executed_ids = []
+
+    def execute(
+        assistant,
+        messages,
+        _task_id,
+        _api_call_count=0,
+        *,
+        persist_progress=True,
+    ):
+        assert persist_progress is False
+        executed_ids.append(assistant.tool_calls[0].id)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": assistant.tool_calls[0].id,
+                "content": "done",
+            }
+        )
+
+    agent._execute_tool_calls = execute
+    journal = ClaudeCliToolJournal("request-correlation", root=tmp_path)
+    loopback = ClaudeToolLoopback(agent, serve=False, journal=journal)
+    monkeypatch.setattr(
+        loopback._projection_condition,
+        "wait",
+        lambda *_args, **_kwargs: pytest.fail(
+            "MCP-first execution must not poll for the native stream"
+        ),
+    )
+    history = [{"role": "user", "content": "run it"}]
     try:
         loopback.begin_turn(
             task_id="missing-id",
+            user_task="run it",
+            messages=history,
+            projection_callback=history.extend,
+        )
+
+        response = _request(
+            loopback,
+            {
+                "id": "call",
+                "token": loopback.token,
+                "method": "call_tool",
+                "execution_id": "proxy-instance:42",
+                "params": {"name": "echo", "arguments": {"value": "hi"}},
+            },
+        )
+
+        assert response == {"id": "call", "result": "done"}
+        local_id = executed_ids[0]
+        assert local_id.startswith("mcp_")
+        assert journal.snapshot()[local_id]["state"] == "completed"
+
+        # Claude may not flush the native stream event until after the MCP
+        # response. It must alias the already-completed request, not create a
+        # second projection or execute the side effect again.
+        loopback.observe_stream_event(
+            {"type": "message_start", "message": {"id": "assistant-late"}}
+        )
+        loopback.observe_stream_event(
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "native-late-id",
+                    "name": "mcp__hermes__echo",
+                    "input": {},
+                },
+            }
+        )
+        loopback.observe_stream_event(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"value":"hi"}',
+                },
+            }
+        )
+        loopback.observe_stream_event(
+            {"type": "content_block_stop", "index": 0}
+        )
+        loopback.observe_stream_event({"type": "message_stop"})
+        assert journal.snapshot()[local_id]["native_tool_use_id"] == (
+            "native-late-id"
+        )
+
+        authoritative = loopback.reconcile_authoritative_projection(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Running it.",
+                    "tool_calls": [
+                        {
+                            "id": "native-late-id",
+                            "type": "function",
+                            "function": {
+                                "name": "echo",
+                                "arguments": '{"value":"hi"}',
+                            },
+                        }
+                    ],
+                }
+            ]
+        )
+        history.extend(authoritative)
+        loopback.mark_authoritative_projection_persisted(
+            authoritative, succeeded=True
+        )
+
+        assert history[1]["tool_calls"][0]["id"] == local_id
+        assert history[2]["tool_call_id"] == local_id
+        record = journal.snapshot()[local_id]
+        assert record["native_tool_use_id"] == "native-late-id"
+        assert record["state"] == "reconciled"
+    finally:
+        loopback.end_turn()
+        loopback.close()
+
+
+def test_delayed_authoritative_batch_does_not_merge_completed_mcp_calls(tmp_path):
+    class BatchAgent(_Agent):
+        def __init__(self):
+            self.batch_sizes = []
+            self.local_ids = {}
+
+        def _execute_tool_calls(
+            self,
+            assistant,
+            messages,
+            _task_id,
+            _api_call_count=0,
+            *,
+            persist_progress=True,
+        ):
+            assert persist_progress is False
+            self.batch_sizes.append(len(assistant.tool_calls))
+            for call in assistant.tool_calls:
+                value = json.loads(call.function.arguments)["value"]
+                self.local_ids[value] = call.id
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": call.function.name,
+                        "tool_call_id": call.id,
+                        "content": f"done:{value}",
+                    }
+                )
+
+    agent = BatchAgent()
+    journal = ClaudeCliToolJournal("delayed-batch", root=tmp_path)
+    loopback = ClaudeToolLoopback(agent, serve=False, journal=journal)
+    history = [{"role": "user", "content": "run both"}]
+    try:
+        loopback.begin_turn(
+            task_id="delayed-batch",
+            user_task="run both",
+            messages=history,
+            projection_callback=history.extend,
+        )
+        for index, value in enumerate(("a", "b")):
+            response = _request(
+                loopback,
+                {
+                    "id": f"transport-{index}",
+                    "token": loopback.token,
+                    "method": "call_tool",
+                    "execution_id": f"proxy-instance:{index}",
+                    "params": {
+                        "name": "echo",
+                        "arguments": {"value": value},
+                    },
+                },
+            )
+            assert response["result"] == f"done:{value}"
+
+        assert agent.batch_sizes == [1, 1]
+        assert history == [{"role": "user", "content": "run both"}]
+
+        authoritative = loopback.reconcile_authoritative_projection(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Running both.",
+                    "tool_calls": [
+                        {
+                            "id": f"native-{value}",
+                            "type": "function",
+                            "function": {
+                                "name": "echo",
+                                "arguments": json.dumps({"value": value}),
+                            },
+                        }
+                        for value in ("a", "b")
+                    ],
+                }
+            ]
+        )
+        history.extend(authoritative)
+        loopback.mark_authoritative_projection_persisted(
+            authoritative, succeeded=True
+        )
+
+        assert [row["role"] for row in history] == [
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+        ]
+        expected_ids = [agent.local_ids[value] for value in ("a", "b")]
+        assert [call["id"] for call in history[1]["tool_calls"]] == expected_ids
+        assert [row["tool_call_id"] for row in history[2:]] == expected_ids
+        snapshot = journal.snapshot()
+        assert [snapshot[local_id]["native_tool_use_id"] for local_id in expected_ids] == [
+            "native-a",
+            "native-b",
+        ]
+        assert {snapshot[local_id]["state"] for local_id in expected_ids} == {
+            "reconciled"
+        }
+    finally:
+        loopback.end_turn()
+        loopback.close()
+
+
+def test_tool_execution_without_native_or_request_identity_fails_closed():
+    loopback = ClaudeToolLoopback(_Agent(), serve=False)
+    try:
+        loopback.begin_turn(
+            task_id="no-identity",
             user_task="run it",
             messages=[{"role": "user", "content": "run it"}],
         )
@@ -958,7 +1193,7 @@ def test_mcp_call_without_observed_native_tool_id_fails_closed():
         )
 
         assert response["error"]["type"] == "RuntimeError"
-        assert "durable native tool_use_id" in response["error"]["message"]
+        assert "neither a native" in response["error"]["message"]
     finally:
         loopback.end_turn()
         loopback.close()

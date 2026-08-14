@@ -86,6 +86,10 @@ def _intent_signature(name: str, arguments: dict[str, Any]) -> str:
     return hashlib.sha256(f"{name}\0{payload}".encode("utf-8")).hexdigest()
 
 
+def _is_mcp_request_correlation(tool_use_id: str) -> bool:
+    return str(tool_use_id).startswith("mcp_")
+
+
 def _safe_copy(value: Any) -> Any:
     """Return a JSON-safe copy without mutating a live tool result."""
     cloned = copy.deepcopy(value)
@@ -263,6 +267,11 @@ class ClaudeCliToolJournal:
             "signature": _intent_signature(intent.name, intent.arguments),
             "batch_id": intent.batch_id,
             "ordinal": int(intent.ordinal),
+            "id_source": (
+                "mcp_request"
+                if _is_mcp_request_correlation(intent.tool_use_id)
+                else "native_tool_use"
+            ),
             "state": "prepared",
             "prepared_at": now,
             "updated_at": now,
@@ -298,6 +307,32 @@ class ClaudeCliToolJournal:
             changed = self._prune_reconciled()
             for intent in materialized:
                 record = self._records.get(intent.tool_use_id)
+                candidates = [
+                    (candidate_id, candidate)
+                    for candidate_id, candidate in self._records.items()
+                    if candidate_id != intent.tool_use_id
+                    and candidate.get("native_tool_use_id")
+                    == intent.tool_use_id
+                ]
+                if candidates and (record is not None or len(candidates) > 1):
+                    raise ClaudeCliToolJournalError(
+                        "Claude CLI effect journal maps multiple requests "
+                        f"to native tool_use_id {intent.tool_use_id!r}"
+                    )
+                if record is None and candidates:
+                    previous_id, record = candidates[0]
+                    self._records.pop(previous_id)
+                    record["tool_use_id"] = intent.tool_use_id
+                    record["batch_id"] = intent.batch_id
+                    record["ordinal"] = int(intent.ordinal)
+                    record["id_source"] = "native_tool_use"
+                    record["recovered_from_request_id"] = previous_id
+                    record["updated_at"] = time.time()
+                    result_row = record.get("result_row")
+                    if isinstance(result_row, dict):
+                        result_row["tool_call_id"] = intent.tool_use_id
+                    self._records[intent.tool_use_id] = record
+                    changed = True
                 if record is None:
                     self._records[intent.tool_use_id] = self._record_for(intent)
                     changed = True
@@ -305,6 +340,33 @@ class ClaudeCliToolJournal:
                     self._assert_same_intent(record, intent)
             if changed:
                 self._persist()
+
+    def bind_native_id(self, tool_use_id: str, native_tool_use_id: str) -> None:
+        """Attach Claude's delayed transcript id to an MCP-admitted intent."""
+        local_id = str(tool_use_id or "")
+        native_id = str(native_tool_use_id or "")
+        if not local_id or not native_id or local_id == native_id:
+            return
+        with (
+            self._lock,
+            _process_lock(self.lock_path),
+            _exclusive_file_lock(self.lock_path),
+        ):
+            self._load()
+            record = self._records.get(local_id)
+            if record is None:
+                return
+            previous = str(record.get("native_tool_use_id") or "")
+            if previous and previous != native_id:
+                raise ClaudeCliToolJournalError(
+                    f"Claude CLI intent {local_id!r} changed native tool_use_id "
+                    f"from {previous!r} to {native_id!r}"
+                )
+            if previous == native_id:
+                return
+            record["native_tool_use_id"] = native_id
+            record["updated_at"] = time.time()
+            self._persist()
 
     def claim_batch(self, intents: Iterable[ToolIntent]) -> list[ToolClaim]:
         """Atomically claim new intents and identify safe replay/uncertainty.

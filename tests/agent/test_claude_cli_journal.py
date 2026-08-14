@@ -55,6 +55,60 @@ def test_running_effect_is_unknown_after_restart_and_never_replayed(tmp_path):
     assert claim.result_row is None
 
 
+def test_running_mcp_request_recovers_through_durable_native_alias(tmp_path):
+    first = ClaudeCliToolJournal("owner", root=tmp_path)
+    old = _intent("mcp_old_request")
+    assert first.claim_batch([old])[0].disposition == "execute"
+    first.bind_native_id("mcp_old_request", "toolu_native")
+
+    recovered = ClaudeCliToolJournal("owner", root=tmp_path)
+    claim = recovered.claim_batch([_intent("toolu_native")])[0]
+    snapshot = recovered.snapshot()
+
+    assert claim.disposition == "unknown"
+    assert "mcp_old_request" not in snapshot
+    assert snapshot["toolu_native"]["state"] == "running"
+    assert snapshot["toolu_native"]["recovered_from_request_id"] == (
+        "mcp_old_request"
+    )
+
+
+def test_completed_mcp_request_replays_through_durable_native_alias(tmp_path):
+    first = ClaudeCliToolJournal("owner", root=tmp_path)
+    old = _intent("mcp_old_request")
+    assert first.claim_batch([old])[0].disposition == "execute"
+    first.complete([_result("mcp_old_request")])
+    first.bind_native_id("mcp_old_request", "toolu_native")
+
+    recovered = ClaudeCliToolJournal("owner", root=tmp_path)
+    claim = recovered.claim_batch([_intent("toolu_native")])[0]
+
+    assert claim.disposition == "replay"
+    assert claim.result_row == _result("toolu_native")
+
+
+def test_native_id_alias_is_durable_and_cannot_change(tmp_path):
+    journal = ClaudeCliToolJournal("owner", root=tmp_path)
+    intent = _intent("mcp_request")
+    journal.prepare_batch([intent])
+
+    journal.bind_native_id("mcp_request", "toolu_native")
+
+    assert journal.snapshot()["mcp_request"]["native_tool_use_id"] == (
+        "toolu_native"
+    )
+    with pytest.raises(ClaudeCliToolJournalError, match="changed native"):
+        journal.bind_native_id("mcp_request", "toolu_different")
+
+    # Duplicate provider ids remain usable in the live turn (the loopback
+    # repairs their local ids), but are deliberately ambiguous for recovery.
+    journal.prepare_batch([_intent("mcp_other", value="other")])
+    journal.bind_native_id("mcp_other", "toolu_native")
+    recovered = ClaudeCliToolJournal("owner", root=tmp_path)
+    with pytest.raises(ClaudeCliToolJournalError, match="multiple requests"):
+        recovered.prepare_batch([_intent("toolu_native")])
+
+
 def test_concurrent_journal_instances_cannot_both_claim_one_effect(tmp_path):
     first = ClaudeCliToolJournal("owner", root=tmp_path)
     second = ClaudeCliToolJournal("owner", root=tmp_path)

@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import base64
 
-from agent.claude_cli_mcp_proxy import _normalized_mcp_content
+from agent.claude_cli_mcp_proxy import (
+    _mcp_execution_id,
+    _normalized_mcp_content,
+)
+
+
+def test_mcp_execution_id_namespaces_json_rpc_ids_by_proxy_instance():
+    assert _mcp_execution_id("proxy-a", 7) == "proxy-a:7"
+    assert _mcp_execution_id("proxy-a", "7") == 'proxy-a:"7"'
+    assert _mcp_execution_id("proxy-b", 7) != _mcp_execution_id("proxy-a", 7)
 
 
 def test_loopback_client_uses_native_turn_timeout(monkeypatch):

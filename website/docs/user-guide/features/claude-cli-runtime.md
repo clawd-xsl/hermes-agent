@@ -160,14 +160,22 @@ Tool intent is persisted before execution and its result immediately after.
 This uses a private effect write-ahead log, separate from conversation history,
 because Claude's stdout record and parallel MCP request may arrive in either
 order. Requiring the complete assistant record first would deadlock when Claude
-waits for MCP before emitting that record. The bridge instead advances each
-effect through `prepared → running → completed → reconciled`, then merges the
-complete assistant row and cached results into the transcript in strict role
-order. A `running` effect left by a process crash has an unknown outcome and is
-never executed again automatically; a `completed` result can be replayed
-without repeating the side effect. If Claude reuses an id inside one batch,
-Hermes applies the same deterministic `_d2`, `_d3`, ... repair as the standard
-agent loop so later results cannot overwrite earlier calls.
+waits for MCP before emitting that record. If the native `tool_use_id` has not
+arrived, the bridge immediately derives a provisional execution identity from
+the MCP JSON-RPC request id, namespaced to that proxy process. It writes the WAL
+before dispatch and binds Claude's native id when stdout catches up; it never
+adds a polling delay to the tool path. The bridge advances each effect through
+`prepared → running → completed → reconciled`, then merges the complete
+assistant row and cached results into the transcript in strict role order.
+
+A `running` effect left by a process crash has an unknown outcome and is never
+executed again automatically; a `completed` result can be replayed without
+repeating the side effect. Recovery only follows an exact request id or a
+durably recorded native-id alias—Hermes does not guess from a matching tool name
+and arguments, because two legitimate calls can be identical. If Claude reuses
+an id inside one batch, Hermes applies the same deterministic `_d2`, `_d3`, ...
+repair as the standard agent loop so later results cannot overwrite earlier
+calls.
 
 The Claude subprocess is not given Hermes' Anthropic HTTP API credentials. An
 explicit `CLAUDE_CODE_OAUTH_TOKEN` is passed through only as Claude Code's own

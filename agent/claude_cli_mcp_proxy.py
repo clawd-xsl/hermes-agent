@@ -124,7 +124,13 @@ class LoopbackClient:
         if not self._port or not self._token:
             raise RuntimeError("Claude tool loopback configuration is missing")
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        execution_id: str = "",
+    ) -> Any:
         request_id = uuid.uuid4().hex
         payload = json.dumps(
             {
@@ -132,6 +138,7 @@ class LoopbackClient:
                 "token": self._token,
                 "method": method,
                 "params": params or {},
+                "execution_id": execution_id,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -156,6 +163,12 @@ class LoopbackClient:
         return response.get("result")
 
 
+def _mcp_execution_id(proxy_instance_id: str, request_id: Any) -> str:
+    """Namespace one MCP JSON-RPC request id across proxy lifetimes."""
+    encoded = json.dumps(request_id, ensure_ascii=True, separators=(",", ":"))
+    return f"{proxy_instance_id}:{encoded}"
+
+
 async def run() -> None:
     try:
         import mcp.server.stdio
@@ -169,6 +182,7 @@ async def run() -> None:
 
     client = LoopbackClient()
     server = Server("hermes-agent-loopback")
+    proxy_instance_id = uuid.uuid4().hex
 
     @server.list_tools()
     async def list_tools() -> list[Any]:
@@ -185,10 +199,15 @@ async def run() -> None:
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[Any]:
+        execution_id = _mcp_execution_id(
+            proxy_instance_id,
+            server.request_context.request_id,
+        )
         result = await asyncio.to_thread(
             client.request,
             "call_tool",
             {"name": name, "arguments": arguments or {}},
+            execution_id=execution_id,
         )
         content: list[Any] = []
         for part in _normalized_mcp_content(result):
