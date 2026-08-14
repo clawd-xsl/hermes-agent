@@ -71,6 +71,28 @@ def test_merge_entries_respects_limit_and_reports_overflow():
 
 
 
+def test_resolve_selected_options_supports_presets():
+    mod = load_module()
+    default = mod.resolve_selected_options()
+    personal = mod.resolve_selected_options(preset="personal-assistant")
+    user_data = mod.resolve_selected_options(preset="user-data")
+    full = mod.resolve_selected_options(preset="full")
+    assert {
+        "signal-settings",
+        "current-session",
+        "main-session-defaults",
+        "claude-runtime",
+        "cron-jobs",
+        "hooks-config",
+    } <= personal
+    assert "model-config" not in personal
+    assert "session-config" not in personal
+    assert "secret-settings" not in user_data
+    assert "secret-settings" in full
+    assert default == full
+    assert "main-session-defaults" not in default
+    assert "claude-runtime" not in default
+    assert user_data < full
 
 
 
@@ -440,6 +462,351 @@ def test_slack_settings_migrated(tmp_path: Path):
     assert "SLACK_ALLOWED_USERS=U111,U222" in env_text
 
 
+def test_signal_settings_migrated(tmp_path: Path):
+    """Signal migrates as a direct persistent signal-ts runtime, never RPC."""
+    mod = load_module()
+    source = tmp_path / ".openclaw"
+    target = tmp_path / ".hermes"
+    target.mkdir()
+    (source / "signal-ts").mkdir(parents=True)
+    (source / "signal-ts" / "default.json").write_text(
+        json.dumps({"account": {"number": "+15551234567"}, "private": "state"}),
+        encoding="utf-8",
+    )
+    sdk = tmp_path / "signal-ts"
+    (sdk / "dist").mkdir(parents=True)
+    (sdk / "package.json").write_text("{}", encoding="utf-8")
+    (sdk / "dist" / "index.js").write_text("export {};\n", encoding="utf-8")
+
+    (source / "openclaw.json").write_text(
+        json.dumps({
+            "channels": {
+                "signal": {
+                    "account": "+15551234567",
+                    "backend": "signal-ts",
+                    "signalTsStatePath": str(source / "signal-ts" / "default.json"),
+                    "httpUrl": "http://localhost:8080",
+                    "allowFrom": ["+15559876543"],
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    migrator = mod.Migrator(
+        source_root=source, target_root=target, execute=True,
+        workspace_target=None, overwrite=False, migrate_secrets=False, output_dir=None,
+        selected_options={"signal-settings"},
+    )
+    migrator.migrate()
+
+    config = mod.load_yaml_file(target / "config.yaml")
+    signal = config["platforms"]["signal"]
+    assert signal["enabled"] is True
+    assert signal["home_channel"]["chat_id"] == "+15551234567"
+    assert signal["extra"]["sdk_path"] == str(sdk)
+    assert signal["extra"]["state_path"] == str(target / "signal-ts" / "default.json")
+    assert signal["extra"]["allow_from"] == ["+15559876543", "+15551234567"]
+    assert "http" not in json.dumps(signal).lower()
+    assert not (target / ".env").exists()
+    assert json.loads((target / "signal-ts" / "default.json").read_text())["private"] == "state"
+
+
+def test_extract_current_conversation_uses_post_compaction_active_branch(tmp_path: Path):
+    mod = load_module()
+    transcript = tmp_path / "session.jsonl"
+    rows = [
+        {"type": "message", "id": "old-user", "parentId": None,
+         "message": {"role": "user", "content": "old prompt"}},
+        {"type": "compaction", "id": "compact", "summary": "do not import summary"},
+        {"type": "message", "id": "user", "parentId": None,
+         "message": {"role": "user", "content": "visible ask\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>secret\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>"}},
+        {"type": "message", "id": "stale", "parentId": "user",
+         "message": {"role": "assistant", "content": "stale answer"}},
+        {"type": "message", "id": "answer", "parentId": "user",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "real answer"}]}},
+        {"type": "message", "id": "tool", "parentId": "answer",
+         "message": {"role": "toolResult", "content": "secret tool output"}},
+        {"type": "leaf", "id": "leaf", "parentId": "tool", "targetId": "answer"},
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    conversation = mod.extract_current_conversation(transcript)
+    assert [(turn["role"], turn["content"]) for turn in conversation] == [
+        ("user", "visible ask"),
+        ("assistant", "real answer"),
+    ]
+    assert all(isinstance(turn["timestamp"], float) for turn in conversation)
+
+
+def test_current_signal_session_import_binds_gateway_route(tmp_path: Path):
+    mod = load_module()
+    source = tmp_path / ".openclaw"
+    target = tmp_path / ".hermes"
+    sessions = source / "agents" / "main" / "sessions"
+    sessions.mkdir(parents=True)
+    target.mkdir()
+    account = "+15551234567"
+    session_id = "signal-session"
+    (source / "openclaw.json").write_text(
+        json.dumps({"channels": {"signal": {"account": account}}}), encoding="utf-8"
+    )
+    (sessions / "sessions.json").write_text(
+        json.dumps({
+            f"agent:main:signal:direct:{account}": {
+                "sessionId": session_id,
+                "updatedAt": 1_800_000_000_000,
+                "lastChannel": "signal",
+            }
+        }),
+        encoding="utf-8",
+    )
+    rows = [
+        {"type": "session", "id": session_id},
+        {"type": "message", "id": "u1", "parentId": None,
+         "message": {"role": "user", "content": "remember this", "timestamp": 1000}},
+        {"type": "message", "id": "a1", "parentId": "u1",
+         "message": {"role": "assistant", "content": "I will", "timestamp": 2000}},
+    ]
+    (sessions / f"{session_id}.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    migrator = mod.Migrator(
+        source_root=source,
+        target_root=target,
+        execute=True,
+        workspace_target=None,
+        overwrite=False,
+        migrate_secrets=False,
+        output_dir=target / "migration-report",
+        selected_options={"current-session"},
+    )
+    report = migrator.migrate()
+    imported = next(
+        item for item in report["items"]
+        if item["kind"] == "current-session" and item["status"] == "migrated"
+    )
+    assert any("Do not use /reset" in step for step in report["next_steps"])
+
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=target / "state.db")
+    try:
+        conversation = db.get_messages_as_conversation(imported["details"]["session_id"])
+        assert [(msg["role"], msg["content"]) for msg in conversation] == [
+            ("user", "remember this"),
+            ("assistant", "I will"),
+        ]
+        scope = str((target / "sessions").resolve())
+        route = json.loads(
+            db.load_gateway_routing_entries(scope=scope)[f"agent:main:signal:dm:{account}"]
+        )
+        assert route["session_id"] == imported["details"]["session_id"]
+    finally:
+        db.close()
+
+
+def test_personal_assistant_cron_import_forces_main_session(tmp_path: Path):
+    mod = load_module()
+    source = tmp_path / ".openclaw"
+    target = tmp_path / ".hermes"
+    (source / "cron").mkdir(parents=True)
+    target.mkdir()
+    (source / "openclaw.json").write_text("{}", encoding="utf-8")
+    (source / "cron" / "jobs.json").write_text(
+        json.dumps({
+            "version": 1,
+            "jobs": [{
+                "id": "morning",
+                "name": "Morning brief",
+                "enabled": True,
+                "schedule": {"kind": "every", "everyMs": 3_600_000},
+                "sessionTarget": "isolated",
+                "payload": {
+                    "kind": "agentTurn",
+                    "message": "Inspect my OpenClaw archive, then prepare my brief",
+                },
+                "state": {},
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    migrator = mod.Migrator(
+        source_root=source,
+        target_root=target,
+        execute=True,
+        workspace_target=None,
+        overwrite=False,
+        migrate_secrets=False,
+        output_dir=target / "migration-report",
+        selected_options={"cron-jobs"},
+        preset_name="personal-assistant",
+    )
+    migrator.migrate()
+    jobs = json.loads((target / "cron" / "jobs.json").read_text())["jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["prompt"] == "Inspect my OpenClaw archive, then prepare my brief"
+    assert jobs[0]["session"] == "main"
+    assert jobs[0]["schedule"] == {
+        "kind": "interval", "minutes": 60, "display": "every 60m"
+    }
+
+
+def test_current_openclaw_sqlite_cron_store_is_imported(tmp_path: Path):
+    mod = load_module()
+    source = tmp_path / ".openclaw"
+    target = tmp_path / ".hermes"
+    (source / "state").mkdir(parents=True)
+    target.mkdir()
+    (source / "openclaw.json").write_text("{}", encoding="utf-8")
+    database = source / "state" / "openclaw.sqlite"
+    connection = mod.sqlite3.connect(database)
+    try:
+        connection.execute(
+            "CREATE TABLE cron_jobs ("
+            "store_key TEXT NOT NULL, sort_order INTEGER NOT NULL, "
+            "job_json TEXT NOT NULL, state_json TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO cron_jobs VALUES (?, ?, ?, ?)",
+            (
+                "main",
+                0,
+                json.dumps({
+                    "id": "sqlite-job",
+                    "name": "SQLite job",
+                    "enabled": True,
+                    "schedule": {"kind": "cron", "expr": "15 9 * * *"},
+                    "payload": {"kind": "systemEvent", "text": "Morning check"},
+                }),
+                json.dumps({}),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrator = mod.Migrator(
+        source_root=source,
+        target_root=target,
+        execute=True,
+        workspace_target=None,
+        overwrite=False,
+        migrate_secrets=False,
+        output_dir=target / "migration-report",
+        selected_options={"cron-jobs"},
+        preset_name="personal-assistant",
+    )
+    migrator.migrate()
+
+    jobs = json.loads((target / "cron" / "jobs.json").read_text())["jobs"]
+    assert [(job["name"], job["session"]) for job in jobs] == [
+        ("SQLite job", "main")
+    ]
+    exported = list(
+        (target / "migration-report" / "archive" / "cron-store").glob(
+            "jobs-from-sqlite.json"
+        )
+    )
+    assert len(exported) == 1
+
+
+def test_main_session_defaults_preserve_other_config(tmp_path: Path):
+    mod = load_module()
+    source = tmp_path / ".openclaw"
+    target = tmp_path / ".hermes"
+    source.mkdir()
+    target.mkdir()
+    (source / "openclaw.json").write_text(
+        json.dumps({"agents": {"defaults": {"userTimezone": "America/Los_Angeles"}}}),
+        encoding="utf-8",
+    )
+    (target / "config.yaml").write_text("model:\n  default: claude-sonnet\n", encoding="utf-8")
+    migrator = mod.Migrator(
+        source_root=source,
+        target_root=target,
+        execute=True,
+        workspace_target=None,
+        overwrite=False,
+        migrate_secrets=False,
+        output_dir=target / "migration-report",
+        selected_options={"main-session-defaults"},
+    )
+    migrator.migrate()
+    config = mod.load_yaml_file(target / "config.yaml")
+    assert config["model"]["default"] == "claude-sonnet"
+    assert config["timezone"] == "America/Los_Angeles"
+    assert config["cron"]["session"] == "main"
+    assert config["platforms"]["webhook"]["extra"]["session"] == "main"
+
+
+def test_claude_runtime_preserves_existing_scalar_claude_model(tmp_path: Path):
+    mod = load_module()
+    source = tmp_path / ".openclaw"
+    target = tmp_path / ".hermes"
+    source.mkdir()
+    target.mkdir()
+    (source / "openclaw.json").write_text("{}", encoding="utf-8")
+    (target / "config.yaml").write_text(
+        "model: anthropic/claude-opus-4-6\ndisplay:\n  skin: custom\n",
+        encoding="utf-8",
+    )
+
+    migrator = mod.Migrator(
+        source_root=source,
+        target_root=target,
+        execute=True,
+        workspace_target=None,
+        overwrite=False,
+        migrate_secrets=False,
+        output_dir=target / "migration-report",
+        selected_options={"claude-runtime"},
+    )
+    report = migrator.migrate()
+
+    config = mod.load_yaml_file(target / "config.yaml")
+    assert config["display"]["skin"] == "custom"
+    assert config["model"] == {
+        "provider": "anthropic",
+        "default": "claude-opus-4-6",
+        "anthropic_runtime": "claude_agent_sdk",
+        "claude_agent_sdk": {"turn_timeout_seconds": 600},
+    }
+    assert any(item["kind"] == "claude-runtime" for item in report["items"])
+
+
+def test_claude_runtime_does_not_replace_non_claude_model_without_overwrite(tmp_path: Path):
+    mod = load_module()
+    source = tmp_path / ".openclaw"
+    target = tmp_path / ".hermes"
+    source.mkdir()
+    target.mkdir()
+    (source / "openclaw.json").write_text("{}", encoding="utf-8")
+    (target / "config.yaml").write_text(
+        "model: openai/gpt-5\n", encoding="utf-8"
+    )
+
+    migrator = mod.Migrator(
+        source_root=source,
+        target_root=target,
+        execute=True,
+        workspace_target=None,
+        overwrite=False,
+        migrate_secrets=False,
+        output_dir=None,
+        selected_options={"claude-runtime"},
+    )
+    report = migrator.migrate()
+
+    assert mod.load_yaml_file(target / "config.yaml")["model"] == "openai/gpt-5"
+    assert any(
+        item["kind"] == "claude-runtime" and item["status"] == "conflict"
+        for item in report["items"]
+    )
 
 
 def test_model_config_migrated(tmp_path: Path):
@@ -749,7 +1116,4 @@ def test_messaging_settings_handles_invalid_utf8_in_telegram_allowlist(tmp_path:
     assert items and items[0]["status"] == "migrated"
     env_text = (target / ".env").read_text(encoding="utf-8")
     assert "123456789" in env_text
-
-
-
 
