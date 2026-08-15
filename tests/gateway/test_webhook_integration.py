@@ -142,6 +142,7 @@ class TestGitHubPRWebhook:
         assert event.source.chat_type == "webhook"
         assert event.source.platform == Platform.WEBHOOK
         assert "github-pr" in event.source.chat_id
+        assert event.source.parent_chat_id == "webhook-hooks"
         assert event.message_id == "gh-delivery-001"
 
 
@@ -263,6 +264,7 @@ class TestMainSessionWebhook:
             review_event = captured_events[0]
             assert review_event.source.chat_type == "webhook_review"
             assert review_event.source.chat_id.startswith("webhook-review:")
+            assert review_event.source.parent_chat_id == "webhook-hooks"
             assert review_event.internal is True
             assert review_event.allow_gateway_control is False
             assert "reply with exactly NO_REPLY" in review_event.text
