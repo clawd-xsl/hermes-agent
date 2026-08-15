@@ -11,6 +11,8 @@ Each route defines:
   - secret: HMAC secret for signature validation (REQUIRED)
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
+  - model/provider: optional isolated-agent runtime override; route values
+    override the platform-wide defaults under platforms.webhook.extra
   - session: isolated (default) or main (the real gateway home conversation)
   - filter_before_main: for main routes, run a one-shot isolated reviewer first
     (default true); only a concise non-NO_REPLY handoff enters the main session
@@ -58,7 +60,7 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import ChannelOverride, Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -149,6 +151,7 @@ _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
 _MAIN_REVIEW_CHAT_PREFIX = "webhook-review:"
+_MODEL_OVERRIDE_CHANNEL_PREFIX = "__webhook_model__:"
 _MAX_MAIN_HANDOFF_CHARS = 2_000
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
@@ -215,10 +218,16 @@ class WebhookAdapter(BasePlatformAdapter):
         self._default_filter_before_main: Any = config.extra.get(
             "filter_before_main", True
         )
+        self._default_model = self._clean_runtime_name(config.extra.get("model"))
+        self._default_provider = self._clean_runtime_name(
+            config.extra.get("provider")
+        )
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
+        self._managed_model_override_channels: set[str] = set()
+        self._sync_model_channel_overrides()
         self._runner = None
         # Routes already warned about legacy V1 body-only signatures
         # (once-per-route so a busy sender doesn't spam the log).
@@ -670,6 +679,9 @@ class WebhookAdapter(BasePlatformAdapter):
             chat_type="webhook_review",
             user_id=f"webhook:{route_name}",
             user_name=route_name,
+            parent_chat_id=self._route_model_parent_id(
+                route_name, self._routes.get(route_name, {})
+            ),
         )
         profile = str(receipt.get("profile") or "default")
         if profile != "default":
@@ -905,6 +917,7 @@ class WebhookAdapter(BasePlatformAdapter):
             if self._dynamic_routes:
                 self._dynamic_routes = {}
                 self._routes = dict(self._static_routes)
+                self._sync_model_channel_overrides()
                 logger.debug("[webhook] Dynamic subscriptions file removed, cleared dynamic routes")
             return
         try:
@@ -953,6 +966,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 new_dynamic[k] = v
             self._dynamic_routes = new_dynamic
             self._routes = {**self._dynamic_routes, **self._static_routes}
+            self._sync_model_channel_overrides()
             self._dynamic_routes_mtime = mtime
             logger.info(
                 "[webhook] Reloaded %d dynamic route(s): %s",
@@ -986,6 +1000,69 @@ class WebhookAdapter(BasePlatformAdapter):
                 return False
             return default
         return bool(value)
+
+    @staticmethod
+    def _clean_runtime_name(value: Any) -> Optional[str]:
+        """Normalize an optional model/provider name from YAML or JSON."""
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    def _route_model_override(
+        self, route: Dict[str, Any]
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Resolve route model/provider over the platform-wide defaults."""
+        model = self._clean_runtime_name(route.get("model"))
+        provider = self._clean_runtime_name(route.get("provider"))
+        return model or self._default_model, provider or self._default_provider
+
+    @staticmethod
+    def _model_override_channel_id(route_name: str) -> str:
+        return f"{_MODEL_OVERRIDE_CHANNEL_PREFIX}{route_name}"
+
+    def _sync_model_channel_overrides(self) -> None:
+        """Bridge webhook model config into the existing channel resolver.
+
+        One-shot webhook chat IDs contain a delivery ID and therefore cannot
+        be targeted by a reusable exact channel override. Each event instead
+        inherits a stable, route-scoped parent channel. Synthesizing the
+        corresponding ``ChannelOverride`` here reuses the normal provider and
+        credential resolution path without mutating a session override or the
+        main conversation's model.
+        """
+        overrides = self.config.channel_overrides
+        for channel_id in self._managed_model_override_channels:
+            overrides.pop(channel_id, None)
+        self._managed_model_override_channels.clear()
+
+        for route_name, route in self._routes.items():
+            if not isinstance(route, dict):
+                continue
+            model, provider = self._route_model_override(route)
+            if not model and not provider:
+                continue
+            channel_id = self._model_override_channel_id(str(route_name))
+            if channel_id in overrides:
+                logger.warning(
+                    "[webhook] Reserved channel override %s already exists; "
+                    "keeping the explicit channel_overrides entry",
+                    channel_id,
+                )
+                continue
+            overrides[channel_id] = ChannelOverride(
+                model=model,
+                provider=provider,
+            )
+            self._managed_model_override_channels.add(channel_id)
+
+    def _route_model_parent_id(
+        self, route_name: str, route: Dict[str, Any]
+    ) -> Optional[str]:
+        model, provider = self._route_model_override(route)
+        if not model and not provider:
+            return None
+        return self._model_override_channel_id(route_name)
 
     def _route_filters_before_main(self, route: Dict[str, Any]) -> bool:
         configured = route.get("filter_before_main")
@@ -1531,6 +1608,9 @@ class WebhookAdapter(BasePlatformAdapter):
             chat_type="webhook",
             user_id=f"webhook:{route_name}",
             user_name=route_name,
+            parent_chat_id=self._route_model_parent_id(
+                route_name, route_config
+            ),
         )
         if profile and isinstance(profile, str):
             source.profile = profile

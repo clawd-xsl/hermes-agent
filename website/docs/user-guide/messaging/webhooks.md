@@ -86,6 +86,8 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `script` | No | Filter/transform script under `~/.hermes/scripts/`. The webhook payload is passed as JSON on stdin. JSON object stdout replaces the payload before templating; text stdout is exposed as `script_output`; empty stdout, `[SILENT]`, or a nonzero exit code ignores the webhook. |
 | `skills` | No | List of skill names to load for the agent run. On reviewed `session: main` routes, the reviewer stays minimal; the configured skill is applied only to the admitted handoff entering main. |
 | `toolsets` | No | List of toolset keys (e.g. `["terminal", "file", "web"]`) that **replaces** the platform-level webhook toolset for runs triggered by this route only. Manual config edit only — not settable via `hermes webhook subscribe`, so agent-created subscriptions cannot self-grant elevated tools. Names are validated the same way as `platform_toolsets` entries (unknown or platform-restricted names are dropped). See [Per-route toolsets](#per-route-toolsets). |
+| `model` | No | Model used by the route's isolated agent or reviewed-main classifier. Falls back to `platforms.webhook.extra.model`, then the normal global model. It never changes the real main conversation's model. |
+| `provider` | No | Provider paired with `model`. Falls back to `platforms.webhook.extra.provider`, then normal provider resolution. Credentials still come from the selected profile's configured provider. |
 | `session` | No | `isolated` (default) starts a one-shot webhook session. `main` targets the configured gateway home conversation; by default an isolated reviewer filters and summarizes the event before its handoff enters the real FIFO. |
 | `filter_before_main` | No | Applies to `session: main`. Defaults to `true`: run a zero-tool, read-only-memory isolated reviewer first; exact `NO_REPLY` drops the event, while a concise handoff enters main. Set `false` only when the raw rendered prompt should enter main directly. May also be set once under `platforms.webhook.extra`. |
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
@@ -103,6 +105,8 @@ platforms:
       secret: "global-fallback-secret"
       session: "isolated"       # platform-wide default; may be "main"
       filter_before_main: true   # default for main routes
+      model: "sonnet"            # default for isolated webhook agent runs
+      provider: "anthropic"
       routes:
         github-pr:
           events: ["pull_request"]
@@ -123,6 +127,8 @@ platforms:
         deploy-notify:
           events: ["push"]
           secret: "deploy-secret"
+          model: "anthropic/claude-sonnet-4.6"  # optional route override
+          provider: "openrouter"
           prompt: "New push to {repository.full_name} branch {ref}: {head_commit.message}"
           filters:
             - field: "ref"
@@ -143,6 +149,8 @@ platforms:
     extra:
       session: main
       filter_before_main: true
+      model: sonnet
+      provider: anthropic
       routes:
         personal-events:
           secret: "route-secret"
@@ -150,7 +158,9 @@ platforms:
 ```
 
 Hermes first runs each authenticated event in a unique isolated reviewer using
-the normal system prompt and memory recall. The reviewer has no tools by
+the normal system prompt and memory recall. When configured, the reviewer uses
+the webhook `model`/`provider`; an admitted handoff still runs on the main
+conversation's own model and provider. The reviewer has no tools by
 default, does not sync the event back into memory/context providers, and does
 not deliver a response. Exact `NO_REPLY` ends there. Otherwise, only its concise,
 self-contained handoff is submitted through the exact home conversation's FIFO.

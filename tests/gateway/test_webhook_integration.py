@@ -22,9 +22,9 @@ from gateway.config import (
     Platform,
     PlatformConfig,
 )
+from gateway.main_session import MainSessionEnqueueResult
 from gateway.platforms.base import MessageEvent, ProcessingOutcome, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
-from gateway.main_session import MainSessionEnqueueResult
 from gateway.session import SessionSource
 
 
@@ -101,7 +101,9 @@ class TestGitHubPRWebhook:
                 "deliver": "log",
             }
         }
-        adapter = _make_adapter(routes)
+        adapter = _make_adapter(
+            routes, model="sonnet", provider="anthropic"
+        )
 
         captured_events: list[MessageEvent] = []
 
@@ -142,7 +144,69 @@ class TestGitHubPRWebhook:
         assert event.source.chat_type == "webhook"
         assert event.source.platform == Platform.WEBHOOK
         assert "github-pr" in event.source.chat_id
+        assert event.source.parent_chat_id == "__webhook_model__:github-pr"
+        override = adapter.config.channel_overrides[event.source.parent_chat_id]
+        assert override.model == "sonnet"
+        assert override.provider == "anthropic"
         assert event.message_id == "gh-delivery-001"
+
+    def test_route_model_and_provider_override_platform_defaults(self):
+        routes = {
+            "alerts": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message}",
+                "model": "anthropic/claude-sonnet-4.6",
+                "provider": "openrouter",
+            }
+        }
+        adapter = _make_adapter(
+            routes, model="sonnet", provider="anthropic"
+        )
+
+        parent_id = adapter._route_model_parent_id("alerts", routes["alerts"])
+        override = adapter.config.channel_overrides[parent_id]
+
+        assert override.model == "anthropic/claude-sonnet-4.6"
+        assert override.provider == "openrouter"
+
+    def test_no_webhook_model_config_keeps_normal_global_resolution(self):
+        routes = {
+            "alerts": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "{message}",
+            }
+        }
+        adapter = _make_adapter(routes)
+
+        assert adapter._route_model_parent_id("alerts", routes["alerts"]) is None
+        assert adapter.config.channel_overrides == {}
+
+    def test_dynamic_route_reload_registers_platform_model(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "webhook_subscriptions.json").write_text(
+            json.dumps(
+                {
+                    "gmail": {
+                        "secret": "gmail-hook-secret",
+                        "prompt": "{message}",
+                        "session": "main",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        adapter = _make_adapter({}, model="sonnet", provider="anthropic")
+
+        adapter._reload_dynamic_routes()
+
+        channel_id = adapter._route_model_parent_id(
+            "gmail", adapter._routes["gmail"]
+        )
+        override = adapter.config.channel_overrides[channel_id]
+        assert override.model == "sonnet"
+        assert override.provider == "anthropic"
 
 
 class TestMainSessionWebhook:
@@ -157,7 +221,9 @@ class TestMainSessionWebhook:
                 "filter_before_main": False,
             }
         }
-        adapter = _make_adapter(routes)
+        adapter = _make_adapter(
+            routes, model="sonnet", provider="anthropic"
+        )
         runner = MagicMock()
         adapter.gateway_runner = runner
         adapter.handle_message = AsyncMock()
@@ -210,7 +276,9 @@ class TestMainSessionWebhook:
                 "session": "main",
             }
         }
-        adapter = _make_adapter(routes)
+        adapter = _make_adapter(
+            routes, model="sonnet", provider="anthropic"
+        )
         runner = MagicMock()
         adapter.gateway_runner = runner
         adapter._end_webhook_session = AsyncMock()
@@ -263,6 +331,10 @@ class TestMainSessionWebhook:
             review_event = captured_events[0]
             assert review_event.source.chat_type == "webhook_review"
             assert review_event.source.chat_id.startswith("webhook-review:")
+            assert (
+                review_event.source.parent_chat_id
+                == "__webhook_model__:personal-alert"
+            )
             assert review_event.internal is True
             assert review_event.allow_gateway_control is False
             assert "reply with exactly NO_REPLY" in review_event.text

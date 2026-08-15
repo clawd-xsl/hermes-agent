@@ -68,6 +68,32 @@ class TestGetChannelOverride:
         assert result is not None
         assert result.model == "topic-model"
 
+    def test_parent_id_lookup_when_delivery_chat_id_misses(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.WEBHOOK: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "__webhook_model__:gmail": ChannelOverride(
+                            model="sonnet",
+                            provider="anthropic",
+                        ),
+                    },
+                ),
+            },
+        )
+
+        result = _get_channel_override(
+            config,
+            Platform.WEBHOOK,
+            "webhook-review:gmail:delivery-1",
+            parent_id="__webhook_model__:gmail",
+        )
+
+        assert result is not None
+        assert result.model == "sonnet"
+        assert result.provider == "anthropic"
+
 
 class TestResolveModelForChannel:
     def test_uses_channel_override_when_present(self):
