@@ -1455,9 +1455,15 @@ def test_structured_result_preserves_typed_value_and_json_text(
     tmp_path, monkeypatch
 ):
     session = _session(tmp_path, monkeypatch)
+    begin_calls = []
     monkeypatch.setattr(session, "ensure_started", lambda: None)
     monkeypatch.setattr(session, "_write_json", lambda _payload: None)
     monkeypatch.setattr(type(session), "is_alive", property(lambda _self: True))
+    monkeypatch.setattr(
+        session.loopback,
+        "begin_turn",
+        lambda **kwargs: begin_calls.append(kwargs),
+    )
     session._events = queue.Queue()
     session._events.put(
         {"type": "stream_event", "event": {"type": "message_start"}}
@@ -1478,6 +1484,7 @@ def test_structured_result_preserves_typed_value_and_json_text(
         )
         assert result.structured_output == {"answer": "yes", "count": 2}
         assert result.final_text == '{"answer":"yes","count":2}'
+        assert begin_calls[0]["execute_tools"] is False
     finally:
         session.close()
 

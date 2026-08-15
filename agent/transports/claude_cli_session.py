@@ -1655,7 +1655,11 @@ class ClaudeCliSession:
             user_task=user_text,
             messages=messages,
             projection_callback=_project_from_loopback,
-            execute_tools=not is_tool_proposal,
+            # Summaries and auxiliary completions are explicitly toolless.
+            # Their lightweight agent facade intentionally has no tool
+            # executor, so binding one here both violates that isolation and
+            # crashes when the loopback reaches ``_execute_tool_calls``.
+            execute_tools=not (is_summary or is_tool_proposal),
             before_next_model_callback=_before_next_model,
         )
         first_record_at: Optional[float] = None
