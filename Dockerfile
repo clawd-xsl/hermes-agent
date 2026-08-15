@@ -1,3 +1,35 @@
+# Build the pinned personal Google Workspace CLI separately from the Hermes
+# runtime.  Only the static binary crosses the stage boundary: OAuth client
+# configuration and encrypted refresh tokens remain on the /opt/data volume.
+# Pin both the toolchain and source revision so a rebuild cannot silently pick
+# up a different gog release or a moving custom branch.
+ARG GOG_GO_VERSION=1.26.5
+FROM golang:${GOG_GO_VERSION}-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS gog_build
+ARG GOGCLI_REPOSITORY=https://github.com/clawd-xsl/gogcli.git
+ARG GOGCLI_COMMIT=4fe0390bcafdecf46e144924eb151a265886e3da
+ARG GOGCLI_VERSION=v0.35.0-4-g4fe0390b
+RUN apk add --no-cache ca-certificates git
+WORKDIR /src
+RUN git init . && \
+    git remote add origin "${GOGCLI_REPOSITORY}" && \
+    for attempt in 1 2 3; do \
+        git fetch --depth=1 origin "${GOGCLI_COMMIT}" && break; \
+        [ "${attempt}" -eq 3 ] && exit 1; \
+        sleep 5; \
+    done && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${GOGCLI_COMMIT}"
+RUN go mod download && \
+    commit="$(git rev-parse --short=12 HEAD)" && \
+    date="$(git show -s --format=%cI HEAD)" && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath \
+        -ldflags="-s -w \
+          -X github.com/openclaw/gogcli/internal/cmd.version=${GOGCLI_VERSION} \
+          -X github.com/openclaw/gogcli/internal/cmd.commit=${commit} \
+          -X github.com/openclaw/gogcli/internal/cmd.date=${date}" \
+        -o /out/gog ./cmd/gog && \
+    /out/gog --version
+
 # Debian 13 still ships SQLite 3.46.1, which contains the upstream WAL-reset
 # corruption bug. Build a pinned shared library for the runtime image instead
 # of relying on a distro backport that trixie does not currently provide.
@@ -306,6 +338,11 @@ RUN uv pip install --no-cache-dir --no-deps -e "."
 # read-only for the hermes user (go-w from the --chmod above).
 
 USER root
+# Personal Google Workspace automation uses the user's forked gog CLI.  Keep
+# the executable in the immutable image while GOG_HOME points at encrypted,
+# persistent state under /opt/data at runtime.  Copy it after the expensive
+# Python/frontend layers so a gog-only revision bump preserves those caches.
+COPY --chmod=0755 --from=gog_build /out/gog /opt/hermes/bin/gog
 RUN mkdir -p /opt/hermes/bin && \
     cp /opt/hermes/docker/hermes-exec-shim.sh /opt/hermes/bin/hermes && \
     chmod 0755 /opt/hermes/bin/hermes && \
