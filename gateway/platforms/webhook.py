@@ -149,10 +149,6 @@ _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
 _MAIN_REVIEW_CHAT_PREFIX = "webhook-review:"
-# Stable parent-channel identity for every one-shot webhook agent run. The
-# delivery-specific chat_id stays unique for isolation, while this parent lets
-# operators apply one webhook model policy without changing the main session.
-_WEBHOOK_AGENT_PARENT_ID = "webhook-hooks"
 _MAX_MAIN_HANDOFF_CHARS = 2_000
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
@@ -674,7 +670,6 @@ class WebhookAdapter(BasePlatformAdapter):
             chat_type="webhook_review",
             user_id=f"webhook:{route_name}",
             user_name=route_name,
-            parent_chat_id=_WEBHOOK_AGENT_PARENT_ID,
         )
         profile = str(receipt.get("profile") or "default")
         if profile != "default":
@@ -1536,7 +1531,6 @@ class WebhookAdapter(BasePlatformAdapter):
             chat_type="webhook",
             user_id=f"webhook:{route_name}",
             user_name=route_name,
-            parent_chat_id=_WEBHOOK_AGENT_PARENT_ID,
         )
         if profile and isinstance(profile, str):
             source.profile = profile
