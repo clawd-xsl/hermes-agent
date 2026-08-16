@@ -6473,7 +6473,7 @@ def _setup_signal():
     )
     home_channel = prompt(
         "  Home conversation for cron/notifications (optional)",
-        default=existing_home_id or account,
+        default=existing_home_id,
     ).strip()
 
     existing_allowed = existing.get("allow_from") or []
@@ -6481,7 +6481,7 @@ def _setup_signal():
         existing_allowed_text = ",".join(str(value) for value in existing_allowed)
     else:
         existing_allowed_text = str(existing_allowed)
-    default_allowed = existing_allowed_text or account
+    default_allowed = existing_allowed_text
     print()
     print_info("  Enter phone numbers or ACIs allowed to use this personal assistant.")
     allowed_text = prompt("  Allowed users (comma-separated)", default=default_allowed).strip()

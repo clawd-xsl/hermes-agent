@@ -102,6 +102,40 @@ def test_signal_setup_persists_config_without_signal_env(tmp_path, monkeypatch):
     assert not any(key.startswith("SIGNAL_") for key in load_env())
 
 
+def test_signal_setup_does_not_default_bot_account_as_home_or_allowed_user(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    import hermes_cli.gateway as gateway_cli
+    from hermes_cli.config import read_raw_config
+
+    sdk, state = _make_runtime_files(tmp_path)
+
+    def fake_prompt(question, *args, **kwargs):
+        if "Node executable" in question:
+            return sys.executable
+        if "signal-ts SDK path" in question:
+            return str(sdk)
+        if "Signal state file" in question:
+            return str(state)
+        if "Expected Signal number" in question:
+            return "+15551234567"
+        if "Home conversation" in question or "Allowed users" in question:
+            return kwargs.get("default", "")
+        raise AssertionError(f"unexpected prompt: {question}")
+
+    monkeypatch.setattr(gateway_cli, "prompt", fake_prompt)
+    monkeypatch.setattr(gateway_cli, "prompt_yes_no", lambda *args, **kwargs: False)
+
+    gateway_cli._setup_signal()
+
+    signal = read_raw_config()["platforms"]["signal"]
+    assert signal["extra"]["account"] == "+15551234567"
+    assert signal["extra"]["allow_from"] == []
+    assert "home_channel" not in signal
+
+
 def test_dashboard_signal_card_has_no_obsolete_env_bridge():
     from hermes_cli.web_server import _build_catalog_entry
 
