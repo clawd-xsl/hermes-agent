@@ -29,11 +29,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.main_session import MainSessionEnqueueResult
-from gateway.platforms.base import (
-    MessageEvent,
-    MessageType,
-    ProcessingOutcome,
-)
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.session import SessionSource, SessionStore
 
@@ -173,28 +169,7 @@ async def test_review_completion_captures_final_and_wakes_main_fifo(tmp_path):
     adapter.config.typing_indicator = False
 
     delivery_id = "review-close-001"
-    home_source = SessionSource(
-        platform=Platform.SIGNAL,
-        chat_id="+15551234567",
-        chat_type="dm",
-        user_id="+15551234567",
-    )
-    accepted = adapter._review_store.accept(
-        profile="default",
-        route="alerts",
-        delivery_id=delivery_id,
-        event_id=f"webhook:alerts:{delivery_id}",
-        event_type="deploy.failed",
-        review_prompt="internal reviewer turn",
-        skills=[],
-        main_source=home_source.to_dict(),
-    )
-    receipt = adapter._review_store.claim_due(
-        owner_token=adapter._review_owner_token
-    )[0]
-    receipt_id = accepted.receipt["receipt_id"]
-    assert receipt["receipt_id"] == receipt_id
-    chat_id = f"webhook-review:alerts:{receipt_id}"
+    chat_id = f"webhook-review:alerts:{delivery_id}"
     source = adapter.build_source(
         chat_id=chat_id,
         chat_name="webhook-review/alerts",
@@ -206,24 +181,28 @@ async def test_review_completion_captures_final_and_wakes_main_fifo(tmp_path):
         text="internal reviewer turn",
         message_type=MessageType.TEXT,
         source=source,
-        raw_message={"message": "deployment failed"},
+        raw_message=None,
         message_id=delivery_id,
         internal=True,
         allow_gateway_control=False,
-        metadata={
-            "skip_delivery_ledger": True,
-            "webhook_receipt_id": receipt_id,
-        },
+        metadata={"skip_delivery_ledger": True},
+    )
+    home_source = SessionSource(
+        platform=Platform.SIGNAL,
+        chat_id="+15551234567",
+        chat_type="dm",
+        user_id="+15551234567",
     )
     adapter._main_reviews[chat_id] = {
         "created_at": 1,
-        "receipt_id": receipt_id,
         "delivery_id": delivery_id,
+        "event_id": f"webhook:alerts:{delivery_id}",
         "route": "alerts",
         "event_type": "deploy.failed",
+        "skills": [],
+        "main_source": home_source,
         "response": "",
     }
-    adapter._review_inflight_receipts[receipt_id] = 1.0
 
     created = {}
 
@@ -239,19 +218,16 @@ async def test_review_completion_captures_final_and_wakes_main_fifo(tmp_path):
             chat_id, content, reply_to=reply_to, metadata=metadata
         )
 
-    # Keep this test on the delivery/capture contract without starting the
-    # adapter's long-lived retry executor, which is unrelated to the invariant.
+    # Keep this test on the delivery/capture contract.
     adapter._send_with_retry = _send_once
-    async def _enqueue_and_complete(*args, **kwargs):
-        await kwargs["processing_complete"](ProcessingOutcome.SUCCESS)
-        return MainSessionEnqueueResult(
+    enqueue = AsyncMock(
+        return_value=MainSessionEnqueueResult(
             session_key="agent:main:signal:dm:+15551234567",
             platform="signal",
             chat_id="+15551234567",
             queued=False,
         )
-
-    enqueue = AsyncMock(side_effect=_enqueue_and_complete)
+    )
     with patch("gateway.main_session.enqueue_main_session_turn", new=enqueue):
         await adapter.handle_message(event)
         await _drain_background_tasks(adapter)
@@ -263,7 +239,6 @@ async def test_review_completion_captures_final_and_wakes_main_fifo(tmp_path):
     assert queued["metadata"]["filtered"] is True
     assert queued["raw_message"] is None
     assert chat_id not in adapter._main_reviews
-    assert adapter._review_store.get(receipt_id)["state"] == "completed"
 
     row = store._db.get_session(created["session_id"])
     assert row is not None and row["ended_at"] is not None

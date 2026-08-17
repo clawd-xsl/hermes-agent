@@ -40,16 +40,13 @@ import base64
 import binascii
 import hashlib
 import hmac
-import inspect
 import json
 import logging
 import re
 import subprocess
 import sys
 import time
-import uuid
 from collections import deque
-from functools import partial
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -75,13 +72,6 @@ from gateway.platforms.webhook_filters import (
 from gateway.response_filters import (
     is_autonomous_silence_response,
     is_intentional_silence_response,
-)
-from gateway.webhook_review_store import (
-    LEASE_SECONDS,
-    MAIN_ENQUEUING,
-    REVIEWING,
-    TERMINAL_STATES,
-    WebhookReviewStore,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,15 +236,12 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
 
-        # One-shot isolated reviewers for main-session routes. Durable ingress
-        # state lives in webhook_review_receipts; this map contains only the
-        # live response-capture seam for an actively running reviewer.
+        # One-shot isolated reviewers for main-session routes.  The entry owns
+        # the exact resolved home source plus the final reviewer handoff.  It is
+        # never exposed as a delivery destination: send() captures only the
+        # final notify-marked response and on_processing_complete() conditionally
+        # enqueues it into the real home FIFO.
         self._main_reviews: Dict[str, dict] = {}
-        self._review_store = WebhookReviewStore()
-        self._review_owner_token = uuid.uuid4().hex
-        self._review_outbox_worker: Optional[asyncio.Task] = None
-        self._review_outbox_wakeup: Optional[asyncio.Event] = None
-        self._review_inflight_receipts: Dict[str, float] = {}
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -387,11 +374,6 @@ class WebhookAdapter(BasePlatformAdapter):
             self._port,
             route_names,
         )
-        # Recover receipts accepted by a previous adapter lifecycle. The
-        # durable worker may begin before this adapter is published in
-        # runner.adapters; reviewer turns remain safe, while a main enqueue
-        # whose target adapter is not connected yet returns to pending_main.
-        self._ensure_review_outbox_worker()
         return True
 
     async def disconnect(self) -> None:
@@ -504,323 +486,6 @@ class WebhookAdapter(BasePlatformAdapter):
         ]
         for chat_id in stale:
             self._main_reviews.pop(chat_id, None)
-
-    def _ensure_review_outbox_worker(self) -> None:
-        """Wake (or start) the durable reviewed-main dispatcher."""
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        if self._review_outbox_wakeup is None:
-            self._review_outbox_wakeup = asyncio.Event()
-        self._review_outbox_wakeup.set()
-        worker = self._review_outbox_worker
-        if worker is not None and not worker.done():
-            return
-        worker = asyncio.create_task(
-            self._review_outbox_loop(),
-            name="webhook-reviewed-main-outbox",
-        )
-        self._review_outbox_worker = worker
-        self._background_tasks.add(worker)
-
-        def _done(task: asyncio.Task) -> None:
-            self._background_tasks.discard(task)
-            if self._review_outbox_worker is task:
-                self._review_outbox_worker = None
-
-        worker.add_done_callback(_done)
-
-    async def _run_review_store_call(self, func, /, *args, **kwargs):
-        """Run durable-ingress I/O on the gateway-owned blocking executor.
-
-        A live adapter is attached to ``GatewayRunner`` before ``connect()``,
-        so normal HTTP and recovery work shares the runner's bounded executor
-        and its shutdown lifecycle. Directly constructed adapters (unit tests
-        and lightweight embedders) have no executor owner; their small SQLite
-        operation runs inline instead of creating an unowned default-executor
-        thread that can outlive the adapter.
-        """
-        call = partial(func, *args, **kwargs)
-        run_blocking = getattr(
-            self.gateway_runner, "_run_in_executor_with_context", None
-        )
-        if callable(run_blocking) and inspect.iscoroutinefunction(run_blocking):
-            return await run_blocking(call)
-        return call()
-
-    async def _review_outbox_loop(self) -> None:
-        """Claim durable receipts and dispatch their current stage.
-
-        Four live receipts is intentionally a host-side concurrency bound, not
-        a user-facing concept. It prevents a webhook burst from launching an
-        unbounded number of classifier turns while preserving independent
-        one-shot sessions and prompt-cache invariants.
-        """
-        while True:
-            wakeup = self._review_outbox_wakeup
-            if wakeup is None:
-                return
-            wakeup.clear()
-            lease_cutoff = time.time() - LEASE_SECONDS
-            for receipt_id, started_at in list(
-                self._review_inflight_receipts.items()
-            ):
-                if started_at <= lease_cutoff:
-                    self._review_inflight_receipts.pop(receipt_id, None)
-            capacity = max(0, 4 - len(self._review_inflight_receipts))
-            claimed: List[Dict[str, Any]] = []
-            if capacity:
-                try:
-                    claimed = await self._run_review_store_call(
-                        self._review_store.claim_due,
-                        owner_token=self._review_owner_token,
-                        limit=capacity,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception(
-                        "[webhook] Durable reviewed-main claim failed; retrying"
-                    )
-                    try:
-                        await asyncio.wait_for(wakeup.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        pass
-                    continue
-                for receipt in claimed:
-                    receipt_id = str(receipt["receipt_id"])
-                    self._review_inflight_receipts[receipt_id] = time.time()
-                    task = asyncio.create_task(
-                        self._process_claimed_review_receipt(receipt),
-                        name=f"webhook-review-receipt:{receipt_id}",
-                    )
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-            if claimed:
-                # Drain additional immediately-due work up to the live bound.
-                await asyncio.sleep(0)
-                continue
-
-            try:
-                delay = await self._run_review_store_call(
-                    self._review_store.next_wake_delay,
-                    owner_token=self._review_owner_token,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "[webhook] Durable reviewed-main wake scan failed; retrying"
-                )
-                try:
-                    await asyncio.wait_for(wakeup.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    pass
-                continue
-            if delay is None:
-                return
-            # When every live slot is occupied, wait for its completion signal
-            # (or lease expiry) rather than spinning on already-due pending rows.
-            timeout = max(float(delay), 0.25 if capacity == 0 else 0.01)
-            try:
-                await asyncio.wait_for(wakeup.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                pass
-
-    async def _process_claimed_review_receipt(
-        self, receipt: Dict[str, Any]
-    ) -> None:
-        """Run the reviewer or enqueue its already-persisted handoff."""
-        receipt_id = str(receipt["receipt_id"])
-        state = str(receipt.get("state") or "")
-        keep_inflight_for_completion = False
-        try:
-            if state == REVIEWING:
-                await self._start_durable_reviewer(receipt)
-                # BasePlatformAdapter owns the actual reviewer task after
-                # handle_message returns. on_processing_complete releases the
-                # receipt's live slot and advances its durable state.
-                keep_inflight_for_completion = True
-                return
-            if state != MAIN_ENQUEUING:
-                raise RuntimeError(f"unexpected durable webhook state: {state}")
-            await self._enqueue_durable_main_handoff(receipt)
-        except asyncio.CancelledError:
-            await self._retry_review_receipt(
-                receipt,
-                "gateway stopped while processing reviewed-main receipt",
-            )
-            raise
-        except Exception as exc:
-            logger.exception(
-                "[webhook] Durable reviewed-main stage failed "
-                "route=%s delivery=%s state=%s",
-                receipt.get("route"),
-                receipt.get("delivery_id"),
-                state,
-            )
-            await self._retry_review_receipt(receipt, str(exc))
-        finally:
-            if not keep_inflight_for_completion:
-                self._review_inflight_receipts.pop(receipt_id, None)
-                self._ensure_review_outbox_worker()
-
-    async def _start_durable_reviewer(self, receipt: Dict[str, Any]) -> None:
-        receipt_id = str(receipt["receipt_id"])
-        route_name = str(receipt["route"])
-        delivery_id = str(receipt["delivery_id"])
-        review_chat_id = (
-            f"{_MAIN_REVIEW_CHAT_PREFIX}{route_name}:{receipt_id}"
-        )
-        review_source = self.build_source(
-            chat_id=review_chat_id,
-            chat_name=f"webhook-review/{route_name}",
-            chat_type="webhook_review",
-            user_id=f"webhook:{route_name}",
-            user_name=route_name,
-            parent_chat_id=self._route_model_parent_id(
-                route_name, self._routes.get(route_name, {})
-            ),
-        )
-        profile = str(receipt.get("profile") or "default")
-        if profile != "default":
-            review_source.profile = profile
-
-        self._main_reviews[review_chat_id] = {
-            "created_at": time.time(),
-            "receipt_id": receipt_id,
-            "delivery_id": delivery_id,
-            "route": route_name,
-            "event_type": str(receipt["event_type"]),
-            "response": "",
-        }
-        review_event = MessageEvent(
-            text=str(receipt["review_prompt"]),
-            message_type=MessageType.TEXT,
-            source=review_source,
-            # The durable prompt is the reviewer's complete input. Keeping the
-            # original provider object off MessageEvent narrows the boundary
-            # available to gateway hooks/plugins and avoids duplicating PII.
-            raw_message=None,
-            message_id=delivery_id,
-            internal=True,
-            allow_gateway_control=False,
-            metadata={
-                "trigger": "webhook_review",
-                "route": route_name,
-                "event_type": str(receipt["event_type"]),
-                "delivery_id": delivery_id,
-                "webhook_receipt_id": receipt_id,
-                "skip_delivery_ledger": True,
-            },
-        )
-        try:
-            await self.handle_message(review_event)
-        except BaseException:
-            self._main_reviews.pop(review_chat_id, None)
-            raise
-
-    async def _enqueue_durable_main_handoff(
-        self, receipt: Dict[str, Any]
-    ) -> None:
-        from gateway.main_session import enqueue_main_session_turn
-        from gateway.session import SessionSource
-
-        receipt_id = str(receipt["receipt_id"])
-        handoff = str(receipt.get("handoff") or "").strip()
-        if not handoff:
-            raise RuntimeError("durable reviewed-main receipt has no handoff")
-        source = SessionSource.from_dict(dict(receipt["main_source"]))
-        main_text = (
-            f"[External event: {receipt['route']} / {receipt['event_type']}]\n\n"
-            f"{handoff}"
-        )
-        main_text = self._inject_route_skill(
-            main_text, {"skills": receipt.get("skills") or []}
-        )
-        async def _main_turn_completed(outcome: ProcessingOutcome) -> None:
-            try:
-                if outcome == ProcessingOutcome.SUCCESS:
-                    completed = await self._run_review_store_call(
-                        self._review_store.mark_completed,
-                        receipt_id,
-                        owner_token=self._review_owner_token,
-                    )
-                    if not completed:
-                        raise RuntimeError(
-                            "durable main handoff lost its receipt claim"
-                        )
-                else:
-                    await self._retry_review_receipt(
-                        receipt,
-                        f"main turn ended with outcome {outcome}",
-                    )
-            finally:
-                self._ensure_review_outbox_worker()
-
-        accepted = await enqueue_main_session_turn(
-            self.gateway_runner,
-            source=source,
-            text=main_text,
-            event_id=str(receipt["event_id"]),
-            # Only the admitted, bounded handoff crosses into main. Route and
-            # delivery identity remain in metadata; the provider payload does
-            # not accompany the synthetic main event.
-            raw_message=None,
-            metadata={
-                "trigger": "webhook",
-                "route": str(receipt["route"]),
-                "event_type": str(receipt["event_type"]),
-                "delivery_id": str(receipt["delivery_id"]),
-                "filtered": True,
-                "webhook_receipt_id": receipt_id,
-            },
-            processing_complete=_main_turn_completed,
-        )
-        logger.info(
-            "[webhook] Durable main handoff enqueued route=%s delivery=%s "
-            "session=%s queued=%s; awaiting turn completion",
-            receipt.get("route"),
-            receipt.get("delivery_id"),
-            accepted.session_key,
-            accepted.queued,
-        )
-
-    async def _retry_review_receipt(
-        self, receipt: Dict[str, Any], error: str
-    ) -> None:
-        receipt_id = str(receipt["receipt_id"])
-        try:
-            delay = await self._run_review_store_call(
-                self._review_store.retry,
-                receipt_id,
-                owner_token=self._review_owner_token,
-                error=error,
-            )
-        except Exception:
-            # The row remains in-flight with a lease. A later sweep (or a new
-            # adapter lifecycle) reclaims it; never pretend the work completed.
-            logger.exception(
-                "[webhook] Failed to persist reviewed-main retry receipt=%s",
-                receipt_id,
-            )
-            return
-        if delay is None:
-            logger.error(
-                "[webhook] Durable reviewed-main receipt abandoned after "
-                "retry exhaustion route=%s delivery=%s",
-                receipt.get("route"),
-                receipt.get("delivery_id"),
-            )
-        else:
-            logger.warning(
-                "[webhook] Durable reviewed-main retry scheduled in %.0fs "
-                "route=%s delivery=%s",
-                delay,
-                receipt.get("route"),
-                receipt.get("delivery_id"),
-            )
 
     def _prune_seen_deliveries(self, now: float) -> None:
         """Occasionally prune expired delivery IDs without scanning every POST."""
@@ -1371,16 +1036,6 @@ class WebhookAdapter(BasePlatformAdapter):
         now = time.time()
         self._prune_main_reviews(now)
         if not self._record_delivery_id(delivery_id, now):
-            try:
-                if (
-                    self._route_session_mode(route_config) == "main"
-                    and self._route_filters_before_main(route_config)
-                ):
-                    # A duplicate is already durably owned. Also use it as a
-                    # nudge in case the local worker exited between retries.
-                    self._ensure_review_outbox_worker()
-            except ValueError:
-                pass
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
@@ -1467,78 +1122,76 @@ class WebhookAdapter(BasePlatformAdapter):
                     resolve_main_session_source,
                 )
 
-                reviewed_main = self._route_filters_before_main(route_config)
-                durable_profile = (
-                    profile if isinstance(profile, str) and profile else "default"
-                )
-                if reviewed_main:
-                    from gateway.webhook_review_store import compute_receipt_id
-
-                    receipt_id = compute_receipt_id(
-                        durable_profile, route_name, delivery_id
-                    )
-                    existing = await self._run_review_store_call(
-                        self._review_store.get, receipt_id
-                    )
-                    if existing is not None:
-                        self._ensure_review_outbox_worker()
-                        terminal = str(existing.get("state") or "") in TERMINAL_STATES
-                        return web.json_response(
-                            {
-                                "status": "duplicate",
-                                "route": route_name,
-                                "event": event_type,
-                                "delivery_id": delivery_id,
-                                "session": "main",
-                                "reviewing": not terminal,
-                                "durable": True,
-                            },
-                            status=200 if terminal else 202,
-                        )
-
-                source = await self._run_review_store_call(
+                source = await asyncio.to_thread(
                     resolve_main_session_source,
                     self.gateway_runner,
                     profile=profile if isinstance(profile, str) else None,
                 )
 
-                if reviewed_main:
-                    configured_skills = route_config.get("skills") or []
-                    if not isinstance(configured_skills, list):
-                        configured_skills = []
-                    accepted_receipt = await self._run_review_store_call(
-                        self._review_store.accept,
-                        profile=durable_profile,
-                        route=route_name,
-                        delivery_id=delivery_id,
-                        event_id=f"webhook:{route_name}:{delivery_id}",
-                        event_type=event_type,
-                        review_prompt=self._build_main_review_prompt(
+                if self._route_filters_before_main(route_config):
+                    review_chat_id = (
+                        f"{_MAIN_REVIEW_CHAT_PREFIX}{route_name}:{delivery_id}"
+                    )
+                    review_source = self.build_source(
+                        chat_id=review_chat_id,
+                        chat_name=f"webhook-review/{route_name}",
+                        chat_type="webhook_review",
+                        user_id=f"webhook:{route_name}",
+                        user_name=route_name,
+                        parent_chat_id=self._route_model_parent_id(
+                            route_name, route_config
+                        ),
+                    )
+                    if profile and isinstance(profile, str):
+                        review_source.profile = profile
+
+                    self._main_reviews[review_chat_id] = {
+                        "created_at": now,
+                        "delivery_id": delivery_id,
+                        "event_id": f"webhook:{route_name}:{delivery_id}",
+                        "route": route_name,
+                        "event_type": event_type,
+                        "skills": list(route_config.get("skills") or []),
+                        "main_source": source,
+                        "response": "",
+                    }
+                    review_event = MessageEvent(
+                        text=self._build_main_review_prompt(
                             route_name=route_name,
                             event_type=event_type,
                             rendered_event=prompt,
                         ),
-                        skills=[str(skill) for skill in configured_skills],
-                        main_source=source.to_dict(),
+                        message_type=MessageType.TEXT,
+                        source=review_source,
+                        raw_message=None,
+                        message_id=delivery_id,
+                        # The host synthesized this turn after HMAC validation.
+                        # It must not resolve slash commands or user auth flows.
+                        internal=True,
+                        allow_gateway_control=False,
+                        metadata={
+                            "trigger": "webhook_review",
+                            "route": route_name,
+                            "event_type": event_type,
+                            "delivery_id": delivery_id,
+                            # This response is captured for classification; it
+                            # is not a platform delivery obligation.
+                            "skip_delivery_ledger": True,
+                        },
                     )
-                    self._ensure_review_outbox_worker()
-                    terminal = (
-                        str(accepted_receipt.receipt.get("state") or "")
-                        in TERMINAL_STATES
-                    )
+                    task = asyncio.create_task(self.handle_message(review_event))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
                     return web.json_response(
                         {
-                            "status": (
-                                "accepted" if accepted_receipt.created else "duplicate"
-                            ),
+                            "status": "accepted",
                             "route": route_name,
                             "event": event_type,
                             "delivery_id": delivery_id,
                             "session": "main",
-                            "reviewing": not terminal,
-                            "durable": True,
+                            "reviewing": True,
                         },
-                        status=202 if not terminal else 200,
+                        status=202,
                     )
 
                 prompt = self._inject_route_skill(prompt, route_config)
@@ -1675,7 +1328,6 @@ class WebhookAdapter(BasePlatformAdapter):
         chat_id = event.source.chat_id
         review = self._main_reviews.pop(chat_id, None)
         if review is not None:
-            receipt_id = str(review.get("receipt_id") or "")
             response = str(review.get("response") or "").strip()
             if len(response) > _MAX_MAIN_HANDOFF_CHARS:
                 logger.warning(
@@ -1686,58 +1338,64 @@ class WebhookAdapter(BasePlatformAdapter):
                     len(response),
                 )
                 response = response[: _MAX_MAIN_HANDOFF_CHARS - 1].rstrip() + "…"
-            try:
-                if outcome != ProcessingOutcome.SUCCESS:
-                    await self._retry_review_receipt(
-                        review,
-                        f"reviewer ended with outcome {outcome}",
+            if outcome != ProcessingOutcome.SUCCESS:
+                # Let an upstream retry with the same delivery id re-run a
+                # reviewer that failed before producing an authoritative result.
+                self._seen_deliveries.pop(str(review.get("delivery_id") or ""), None)
+                logger.warning(
+                    "[webhook] Main-session review failed route=%s delivery=%s",
+                    review.get("route"),
+                    review.get("delivery_id"),
+                )
+            elif not response or is_intentional_silence_response(response):
+                logger.info(
+                    "[webhook] Main-session review filtered route=%s delivery=%s",
+                    review.get("route"),
+                    review.get("delivery_id"),
+                )
+            else:
+                try:
+                    from gateway.main_session import enqueue_main_session_turn
+
+                    main_text = (
+                        f"[External event: {review['route']} / "
+                        f"{review['event_type']}]\n\n{response}"
                     )
-                    logger.warning(
-                        "[webhook] Main-session review failed; durable retry "
-                        "owns route=%s delivery=%s",
-                        review.get("route"),
-                        review.get("delivery_id"),
+                    main_text = self._inject_route_skill(
+                        main_text, {"skills": review.get("skills") or []}
                     )
-                elif not response or is_intentional_silence_response(response):
-                    filtered = await self._run_review_store_call(
-                        self._review_store.mark_filtered,
-                        receipt_id,
-                        owner_token=self._review_owner_token,
+                    accepted = await enqueue_main_session_turn(
+                        self.gateway_runner,
+                        source=review["main_source"],
+                        text=main_text,
+                        event_id=review["event_id"],
+                        raw_message=None,
+                        metadata={
+                            "trigger": "webhook",
+                            "route": review["route"],
+                            "event_type": review["event_type"],
+                            "delivery_id": review["delivery_id"],
+                            "filtered": True,
+                        },
                     )
-                    if not filtered:
-                        raise RuntimeError("reviewer lost its durable receipt claim")
                     logger.info(
-                        "[webhook] Main-session review filtered route=%s delivery=%s",
+                        "[webhook] Main-session review admitted route=%s "
+                        "delivery=%s session=%s queued=%s",
                         review.get("route"),
                         review.get("delivery_id"),
+                        accepted.session_key,
+                        accepted.queued,
                     )
-                else:
-                    admitted = await self._run_review_store_call(
-                        self._review_store.mark_reviewed,
-                        receipt_id,
-                        owner_token=self._review_owner_token,
-                        handoff=response,
+                except Exception:
+                    self._seen_deliveries.pop(
+                        str(review.get("delivery_id") or ""), None
                     )
-                    if not admitted:
-                        raise RuntimeError("reviewer lost its durable receipt claim")
-                    logger.info(
-                        "[webhook] Main-session review handoff persisted "
-                        "route=%s delivery=%s",
-                        review.get("route"),
-                        review.get("delivery_id"),
-                    )
-            except Exception as exc:
-                if outcome == ProcessingOutcome.SUCCESS:
                     logger.exception(
-                        "[webhook] Failed to persist reviewed-main transition "
+                        "[webhook] Reviewed main-session enqueue failed "
                         "route=%s delivery=%s",
                         review.get("route"),
                         review.get("delivery_id"),
                     )
-                    await self._retry_review_receipt(review, str(exc))
-            finally:
-                self._review_inflight_receipts.pop(receipt_id, None)
-                self._ensure_review_outbox_worker()
 
         await self._end_webhook_session(event, chat_id)
 

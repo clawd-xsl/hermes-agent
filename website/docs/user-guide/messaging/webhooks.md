@@ -170,14 +170,7 @@ Once admitted, an in-flight user turn is not interrupted, simultaneous events
 remain separate turns, and the normal IM streaming/delivery path sends the main
 assistant's response with its complete conversation, memory, skills, model, and
 persistent provider session. The POST returns `202 Accepted` when review is
-durably accepted into `state.db`; the JSON response includes
-`"reviewing": true` and `"durable": true`. The reviewer input is committed
-before that response is sent. An admitted handoff is then committed as
-`pending_main` before Hermes attempts the home FIFO, so a gateway restart or a
-temporary main-session outage resumes the unfinished stage with bounded
-backoff instead of losing an event the sender already considers acknowledged.
-The receipt is marked complete only when the real main turn finishes, not when
-an in-memory FIFO merely accepts it.
+scheduled; the JSON response includes `"reviewing": true`.
 
 For a trusted route that intentionally needs the old direct behavior, set
 `filter_before_main: false`. That skips the reviewer and submits the rendered
@@ -185,12 +178,9 @@ prompt directly to the home FIFO.
 
 Main mode requires the gateway and home-channel adapter to be live. If Hermes
 cannot resolve that home before review, it returns `503` and releases the
-delivery ID so the sender can retry. If the durable receipt cannot be committed,
-Hermes also returns `503` rather than making a false acceptance claim. After a
-reviewed event receives `202`, Hermes owns retries locally; a post-review
-enqueue failure returns the persisted handoff to `pending_main`. The route's
-standalone `deliver` target does not apply in main mode—the main conversation
-delivers its own response.
+delivery ID so the sender can retry. A post-review enqueue failure is logged and
+also releases the delivery ID. The route's standalone `deliver` target does not
+apply in main mode—the main conversation delivers its own response.
 
 Dynamic subscriptions expose the same choice:
 
@@ -608,18 +598,7 @@ Requests exceeding the limit receive a `429 Too Many Requests` response.
 
 ### Idempotency
 
-Delivery IDs (from `X-GitHub-Delivery`, `X-Request-ID`, or a timestamp fallback)
-are cached in memory for **1 hour** for ordinary isolated/direct routes.
-Duplicate deliveries during that window are silently skipped with a `200`
-response.
-
-Reviewed `session: main` routes additionally persist a receipt keyed by
-profile, route, and delivery ID. Pending reviewer/main work survives gateway
-restarts, and terminal receipts remain available for bounded deduplication
-(seven-day retention, capped at 5,000 terminal rows). Provider-side durable
-deduplication is still the source-specific first line of defense—especially for
-Pub/Sub consumers that understand `messageId` and history cursors—but Hermes no
-longer relies on a sender retry after returning `202`.
+Delivery IDs (from `X-GitHub-Delivery`, `X-Request-ID`, or a timestamp fallback) are cached for **1 hour**. Duplicate deliveries (e.g. webhook retries) are silently skipped with a `200` response, preventing duplicate agent runs.
 
 ### Body size limits
 

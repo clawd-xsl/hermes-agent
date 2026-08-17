@@ -5371,37 +5371,6 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             logger.warning("[%s] %s hook failed: %s", self.name, hook_name, e)
 
-    async def _run_event_completion_callback(
-        self,
-        event: MessageEvent,
-        outcome: ProcessingOutcome,
-    ) -> None:
-        """Acknowledge one internally-enqueued event after its real turn ends.
-
-        This is intentionally private and per-event: it adds no model or plugin
-        surface. The callback is removed before invocation so every terminal
-        path is at-most-once within this process. Its durable owner remains
-        responsible for recovery if the process exits before this point.
-        """
-        attr = "_gateway_processing_complete_callback"
-        callback = getattr(event, attr, None)
-        if not callable(callback):
-            return
-        try:
-            delattr(event, attr)
-        except AttributeError:
-            pass
-        try:
-            result = callback(outcome)
-            if inspect.isawaitable(result):
-                await result
-        except Exception as exc:
-            logger.warning(
-                "[%s] Internal event completion callback failed: %s",
-                self.name,
-                exc,
-            )
-
     @staticmethod
     def _is_retryable_error(error: Optional[str]) -> bool:
         """Return True if the error string looks like a transient network failure."""
@@ -6775,10 +6744,6 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
-            await self._run_event_completion_callback(
-                event,
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
-            )
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
@@ -6830,13 +6795,9 @@ class BasePlatformAdapter(ABC):
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, outcome)
-            await self._run_event_completion_callback(event, outcome)
             raise
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
-            await self._run_event_completion_callback(
-                event, ProcessingOutcome.FAILURE
-            )
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
