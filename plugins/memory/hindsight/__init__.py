@@ -89,6 +89,9 @@ _HINDSIGHT_GLYPH = "👁️"
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+_REFLECT_NO_NEW_MEMORY = "NO_NEW_MEMORY"
+_REFLECT_RECENT_TURN_LIMIT = 4
+_REFLECT_RECENT_CONTEXT_CHARS = 6000
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -772,6 +775,12 @@ class HindsightMemoryProvider(MemoryProvider):
         # accurate count without re-parsing the formatted text.
         self._prefetch_count = 0
         self._prefetch_lock = threading.Lock()
+        # Reflect prefetches should add context, not restate memory blocks that
+        # are already present in the active model conversation. Hindsight does
+        # not see that conversation automatically, so remember only the blocks
+        # that prefetch() actually handed to the agent in this session and
+        # include them in the next automatic reflect request.
+        self._injected_memory_contexts: list[str] = []
         self._prefetch_thread = None
         # State for the model-independent recall indicator (see recall_status()).
         # _last_recall_returned tracks whether the most recent prefetch() handed
@@ -1615,6 +1624,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._turn_index = 0
         self._session_turns = []
         self._last_retained_turn_count = 0
+        self._injected_memory_contexts = []
         self._mode = self._config.get("mode", "cloud")
         # Read timeout from config or env var, fall back to default
         self._timeout = _parse_int_setting(
@@ -1866,10 +1876,26 @@ class HindsightMemoryProvider(MemoryProvider):
             query = query[:self._recall_max_input_chars]
         try:
             if self._prefetch_method == "reflect":
-                logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                reflect_query = self._build_reflect_prefetch_query(query)
+                logger.debug(
+                    "Recall: calling reflect (bank=%s, query_len=%d, max_tokens=%d)",
+                    self._bank_id,
+                    len(reflect_query),
+                    self._recall_max_tokens,
+                )
+                resp = self._run_hindsight_operation(
+                    lambda client: client.areflect(
+                        bank_id=self._bank_id,
+                        query=reflect_query,
+                        budget=self._budget,
+                        max_tokens=self._recall_max_tokens,
+                    )
+                )
                 # Reflect synthesizes across many memories -> no discrete count.
-                return _RecallResult(resp.text or "", 0)
+                text = (resp.text or "").strip()
+                if text.upper() == _REFLECT_NO_NEW_MEMORY:
+                    text = ""
+                return _RecallResult(text, 0)
             recall_kwargs: dict = {
                 "bank_id": self._bank_id, "query": query,
                 "budget": self._budget, "max_tokens": self._recall_max_tokens,
@@ -1889,6 +1915,62 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
             return _RecallResult("", 0)
+
+    def _build_reflect_prefetch_query(self, query: str) -> str:
+        """Build the additive-only prompt used by automatic reflect prefetch.
+
+        Manual ``hindsight_reflect`` calls intentionally bypass this helper.
+        The full list of memory blocks already injected in this Hermes session
+        is included because Hindsight otherwise cannot see the model's active
+        conversation. Recent clean user/assistant turns provide enough local
+        context to avoid summarizing facts the conversation already contains.
+        """
+        with self._prefetch_lock:
+            injected = list(self._injected_memory_contexts)
+
+        recent_lines: list[str] = []
+        for raw_turn in self._session_turns[-_REFLECT_RECENT_TURN_LIMIT:]:
+            try:
+                messages = json.loads(raw_turn)
+            except (TypeError, ValueError):
+                recent_lines.append(str(raw_turn))
+                continue
+            for message in messages if isinstance(messages, list) else []:
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role") or "message").capitalize()
+                content = str(message.get("content") or "").strip()
+                if content:
+                    recent_lines.append(f"{role}: {content}")
+
+        recent_context = "\n".join(recent_lines)
+        if len(recent_context) > _REFLECT_RECENT_CONTEXT_CHARS:
+            recent_context = recent_context[-_REFLECT_RECENT_CONTEXT_CHARS:]
+
+        injected_context = "\n\n---\n\n".join(injected)
+        return (
+            "Produce a compact additive long-term-memory brief for another assistant.\n\n"
+            f"Current request:\n{query}\n\n"
+            "Long-term memory already injected into the active conversation:\n"
+            f"{injected_context or '(none)'}\n\n"
+            "Recent clean conversation:\n"
+            f"{recent_context or '(none)'}\n\n"
+            "Retrieve only long-term memories directly useful for the current request.\n\n"
+            "Rules:\n"
+            "- Output only information not already stated or clearly implied above.\n"
+            "- Do not repeat or paraphrase existing context.\n"
+            "- Do not summarize the current conversation or restate the request.\n"
+            "- Prefer concrete facts, preferences, commitments, dates, and unresolved states.\n"
+            "- Target 80-100 tokens; never exceed 128 tokens.\n"
+            f"- If no additive memory is useful, output exactly: {_REFLECT_NO_NEW_MEMORY}"
+        )
+
+    def _record_injected_reflect_context(self, result: str) -> None:
+        """Track reflect text only after it has actually entered agent context."""
+        if self._prefetch_method != "reflect" or not result:
+            return
+        with self._prefetch_lock:
+            self._injected_memory_contexts.append(result)
 
     def _format_recall(self, result: str) -> str:
         if not result:
@@ -1921,6 +2003,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 return ""
             recalled = self._do_recall(query)
             self._record_recall_indicator(returned=bool(recalled.text), count=recalled.count)
+            self._record_injected_reflect_context(recalled.text)
             return self._format_recall(recalled.text)
 
         # Default: return the result the background worker prefetched for the
@@ -1934,6 +2017,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_result = ""
             self._prefetch_count = 0
         self._record_recall_indicator(returned=bool(result), count=count)
+        self._record_injected_reflect_context(result)
         return self._format_recall(result)
 
     def recall_status(self) -> Optional[RecallStatus]:
@@ -2358,6 +2442,8 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
+            self._prefetch_count = 0
+            self._injected_memory_contexts = []
 
         # 3. Now rotate to the new session.
         if parent_session_id:

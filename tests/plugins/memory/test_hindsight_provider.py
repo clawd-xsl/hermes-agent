@@ -468,6 +468,9 @@ class TestToolHandlers:
             "hindsight_reflect", {"query": "summarize"}
         ))
         assert result["result"] == "Synthesized answer"
+        provider._client.areflect.assert_awaited_once_with(
+            bank_id="test-bank", query="summarize", budget="mid"
+        )
 
 
     def test_unknown_tool(self, provider):
@@ -546,6 +549,61 @@ class TestPrefetch:
         result = provider.prefetch("a totally different current query")
         assert "buffered from previous turn" in result
         provider._client.arecall.assert_not_called()
+
+    def test_reflect_prefetch_is_additive_and_bounded(self, provider_with_config):
+        p = provider_with_config(
+            recall_prefetch_method="reflect",
+            recall_max_tokens=128,
+            recall_sync=True,
+        )
+        p._injected_memory_contexts = ["User prefers concise memory."]
+        p._session_turns = [
+            json.dumps(
+                [
+                    {"role": "user", "content": "The appointment is confirmed."},
+                    {"role": "assistant", "content": "I added it to the calendar."},
+                ]
+            )
+        ]
+
+        result = p.prefetch("What else should I remember?")
+
+        assert "Synthesized answer" in result
+        kwargs = p._client.areflect.await_args.kwargs
+        assert kwargs["max_tokens"] == 128
+        assert kwargs["budget"] == "mid"
+        assert "User prefers concise memory." in kwargs["query"]
+        assert "The appointment is confirmed." in kwargs["query"]
+        assert "Output only information not already stated" in kwargs["query"]
+        assert "NO_NEW_MEMORY" in kwargs["query"]
+        assert p._injected_memory_contexts[-1] == "Synthesized answer"
+
+    def test_reflect_prefetch_tracks_only_results_actually_injected(self, provider_with_config):
+        p = provider_with_config(recall_prefetch_method="reflect")
+
+        p.queue_prefetch("prepare context")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+
+        assert p._prefetch_result == "Synthesized answer"
+        assert p._injected_memory_contexts == []
+
+        assert "Synthesized answer" in p.prefetch("next request")
+        assert p._injected_memory_contexts == ["Synthesized answer"]
+
+    def test_reflect_no_new_memory_is_not_injected_or_tracked(self, provider_with_config):
+        p = provider_with_config(
+            recall_prefetch_method="reflect",
+            recall_sync=True,
+            recall_max_tokens=128,
+        )
+        p._client.areflect = AsyncMock(
+            return_value=SimpleNamespace(text="  NO_NEW_MEMORY  ")
+        )
+
+        assert p.prefetch("already covered") == ""
+        assert p._injected_memory_contexts == []
+        assert p.recall_status() is None
 
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
@@ -1086,6 +1144,16 @@ class TestSessionSwitchBufferFlush:
 
         assert finished.is_set(), "switch returned before prefetch thread settled"
         assert provider._prefetch_result == ""
+
+    def test_session_switch_clears_injected_reflect_context(self, provider_with_config):
+        p = provider_with_config(recall_prefetch_method="reflect")
+        p._injected_memory_contexts = ["old-session memory"]
+        p._prefetch_count = 3
+
+        p.on_session_switch("new-sid")
+
+        assert p._injected_memory_contexts == []
+        assert p._prefetch_count == 0
 
     def test_flush_serializes_behind_pending_retains_via_writer_queue(
         self, provider_with_config
