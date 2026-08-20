@@ -37,6 +37,10 @@ _STDERR_TAIL_LINES = 80
 _GRACEFUL_CLOSE_SECONDS = 5.0
 _TERMINATE_SECONDS = 3.0
 _BINDING_LOCK = threading.RLock()
+# Per-row digest width for the divergence diagnostic. 16 hex chars is far more
+# than enough to distinguish rows within one transcript while keeping the
+# binding file small (~20 bytes/row).
+_HISTORY_DIGEST_CHARS = 16
 _PROCESS_ENV_CLEAR = {
     "API_TIMEOUT_MS",
     "ANTHROPIC_API_KEY",
@@ -187,17 +191,33 @@ def _load_binding_history_signature(owner_key: str) -> Optional[str]:
         return str(value) if value else None
 
 
+def _load_binding_history_digests(owner_key: str) -> Optional[list[str]]:
+    """Per-row digests saved alongside the signature (diagnostic only)."""
+    path = _binding_path(owner_key)
+    with _BINDING_LOCK:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return None
+        value = data.get("history_row_digests") if isinstance(data, dict) else None
+        if not isinstance(value, list):
+            return None
+        return [str(item) for item in value]
+
+
 def _save_binding(
     owner_key: str,
     native_session_id: str,
     *,
     history_signature: Optional[str] = None,
+    history_row_digests: Optional[list[str]] = None,
 ) -> None:
     from utils import atomic_json_write
 
     path = _binding_path(owner_key)
     with _BINDING_LOCK:
         previous_signature = None
+        previous_digests = None
         if history_signature is None:
             try:
                 previous = json.loads(path.read_text(encoding="utf-8"))
@@ -207,6 +227,9 @@ def _save_binding(
                     == str(native_session_id)
                 ):
                     previous_signature = previous.get("history_signature")
+                    carried = previous.get("history_row_digests")
+                    if isinstance(carried, list):
+                        previous_digests = carried
             except (FileNotFoundError, OSError, ValueError, TypeError):
                 pass
         data = {
@@ -216,6 +239,13 @@ def _save_binding(
         effective_signature = history_signature or previous_signature
         if effective_signature:
             data["history_signature"] = str(effective_signature)
+        # Carried forward with the signature so the two never describe
+        # different transcripts.
+        effective_digests = (
+            history_row_digests if history_signature is not None else previous_digests
+        )
+        if effective_digests:
+            data["history_row_digests"] = list(effective_digests)
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_json_write(path, data, indent=2, mode=0o600)
 
@@ -412,9 +442,17 @@ def serialize_history_for_bootstrap(
     )
 
 
-def _hermes_history_signature(messages: list[dict[str, Any]]) -> str:
-    """Hash exactly the durable/effective transcript represented natively."""
-    rows: list[dict[str, Any]] = []
+def _hermes_history_pairs(
+    messages: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """``(hashed_row, source_message)`` pairs, in mirrored order.
+
+    Row indices skip non-mirrored messages, so a divergence report that wants
+    to inspect the *source* of row N cannot index the caller's list directly —
+    it needs this pairing. Keeping one filter here is what stops the hash and
+    the diagnostic from disagreeing about which rows exist.
+    """
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -429,15 +467,82 @@ def _hermes_history_signature(messages: list[dict[str, Any]]) -> str:
             row["tool_calls"] = message["tool_calls"]
         if message.get("tool_call_id"):
             row["tool_call_id"] = message["tool_call_id"]
-        rows.append(row)
+        pairs.append((row, message))
+    return pairs
+
+
+def _hermes_history_rows(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The durable/effective rows the native binding mirrors, in order."""
+    return [row for row, _ in _hermes_history_pairs(messages)]
+
+
+def _hermes_history_signature(messages: list[dict[str, Any]]) -> str:
+    """Hash exactly the durable/effective transcript represented natively."""
     payload = json.dumps(
-        rows,
+        _hermes_history_rows(messages),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _hermes_history_row_digests(messages: list[dict[str, Any]]) -> list[str]:
+    """Per-row digests over the same rows ``_hermes_history_signature`` hashes.
+
+    Diagnostic only — never consulted for control flow. The aggregate signature
+    answers *whether* the mirrored transcript moved; these answer *which row*
+    moved, which is the part a divergence report actually needs. Kept in the
+    same module as the signature so the two can never drift apart in what they
+    consider durable.
+    """
+    return [
+        hashlib.sha256(
+            json.dumps(
+                row,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:_HISTORY_DIGEST_CHARS]
+        for row in _hermes_history_rows(messages)
+    ]
+
+
+def _describe_history_divergence(
+    stored: Optional[list[str]],
+    messages: list[dict[str, Any]],
+) -> str:
+    """Locate the first mirrored row that moved, as a log-safe description.
+
+    Reports shape only (index, role, byte length, sidecar presence) — never
+    message text, which is user conversation content.
+    """
+    if not stored:
+        return "no per-row digests on the binding (written before this diagnostic existed)"
+    pairs = _hermes_history_pairs(messages)
+    current = _hermes_history_row_digests(messages)
+    if len(current) != len(stored):
+        detail = f"row count changed: stored={len(stored)} incoming={len(current)}"
+    else:
+        detail = "row count unchanged"
+    for index, (was, now) in enumerate(zip(stored, current)):
+        if was == now:
+            continue
+        row, source = pairs[index] if index < len(pairs) else ({}, {})
+        content = row.get("content")
+        length = len(content) if isinstance(content, str) else -1
+        return (
+            f"{detail}; first changed row index={index} "
+            f"role={row.get('role')!r} content_len={length} "
+            f"from_api_content_sidecar={isinstance(source.get('api_content'), str)} "
+            f"digest {was}->{now}"
+        )
+    # Every shared prefix row matched: the change is purely an append/truncate.
+    shared = min(len(stored), len(current))
+    return f"{detail}; all {shared} shared rows identical (append/truncate only)"
 
 
 def _content_blocks(message: Any) -> list[dict[str, Any]]:
@@ -523,6 +628,11 @@ class ClaudeCliSession:
             if persistent_binding and self._resume
             else None
         )
+        self._history_row_digests = (
+            _load_binding_history_digests(owner_key)
+            if persistent_binding and self._resume
+            else None
+        )
         self._process: Optional[subprocess.Popen[str]] = None
         self._events: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._stderr: collections.deque[str] = collections.deque(maxlen=_STDERR_TAIL_LINES)
@@ -559,11 +669,13 @@ class ClaudeCliSession:
     def sync_history_signature(self, messages: list[dict[str, Any]]) -> None:
         """Publish the Hermes transcript mirrored by this native thread."""
         self._history_signature = _hermes_history_signature(messages)
+        self._history_row_digests = _hermes_history_row_digests(messages)
         if self.persistent_binding and self.native_session_id:
             _save_binding(
                 self.owner_key,
                 self.native_session_id,
                 history_signature=self._history_signature,
+                history_row_digests=self._history_row_digests,
             )
 
     def compatible(
@@ -1258,6 +1370,7 @@ class ClaudeCliSession:
         self.native_session_id = str(uuid.uuid4())
         self._resume = False
         self._history_signature = None
+        self._history_row_digests = None
         self._turns_completed = 0
         self._events = queue.Queue()
         with self._stderr_lock:
@@ -1304,6 +1417,24 @@ class ClaudeCliSession:
                     if history_diverged
                     else "legacy binding has no transcript signature",
                 )
+                if history_diverged:
+                    # Name the row that moved. Without this the operator only
+                    # learns *that* the mirror drifted, which is not enough to
+                    # tell an ephemeral injection apart from a real edit.
+                    try:
+                        logger.info(
+                            "Claude native history divergence detail: owner=%s %s",
+                            self.owner_key,
+                            _describe_history_divergence(
+                                self._history_row_digests, messages[:-1]
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "divergence detail unavailable for owner=%s",
+                            self.owner_key,
+                            exc_info=True,
+                        )
                 self._reset_fresh_binding()
             resumed_at_start = self._resume
             result = self._run_turn_once(
