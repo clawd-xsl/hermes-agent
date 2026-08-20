@@ -1,0 +1,5 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+
+: "${TUNNEL_TOKEN:?TUNNEL_TOKEN is required}"
+exec cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN"
