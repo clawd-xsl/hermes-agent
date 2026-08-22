@@ -451,7 +451,15 @@ def _hermes_history_pairs(
     to inspect the *source* of row N cannot index the caller's list directly —
     it needs this pairing. Keeping one filter here is what stops the hash and
     the diagnostic from disagreeing about which rows exist.
+
+    Content is collapsed through ``durable_content_view`` because this list is
+    compared across a session-DB round trip: a live turn holds multipart
+    ``content`` (text + image parts) while the stored row holds the flattened
+    text the DB keeps. Hashing the raw shapes made every screenshot look like
+    an edited transcript and forced a full replay.
     """
+    from agent.tool_dispatch_helpers import durable_content_view
+
     pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for message in messages:
         if not isinstance(message, dict):
@@ -461,7 +469,9 @@ def _hermes_history_pairs(
             continue
         row: dict[str, Any] = {
             "role": role,
-            "content": message.get("api_content", message.get("content")),
+            "content": durable_content_view(
+                message.get("api_content", message.get("content"))
+            ),
         }
         if message.get("tool_calls"):
             row["tool_calls"] = message["tool_calls"]

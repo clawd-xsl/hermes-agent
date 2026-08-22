@@ -384,6 +384,34 @@ def _multimodal_text_summary(value: Any) -> str:
         return str(value)
 
 
+def durable_content_view(content: Any) -> Any:
+    """Collapse a message ``content`` to the form that survives persistence.
+
+    Image bytes are deliberately dropped on the way into the session DB —
+    base64 data URLs would bloat it for no replay value — so an in-memory
+    multipart ``content`` and its stored counterpart are different objects
+    for the same message. Anything that compares a live message against its
+    reloaded self (transcript signatures, replay) must compare *this* view,
+    or a message that merely carried a screenshot reads as an edited one.
+
+    Text-only content is returned unchanged, so callers can apply this
+    unconditionally.
+    """
+    if _is_multimodal_tool_result(content):
+        return _multimodal_text_summary(content)
+    if isinstance(content, list):
+        parts: List[str] = []
+        for entry in content:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") == "text":
+                parts.append(str(entry.get("text", "")))
+            elif entry.get("type") in {"image", "image_url", "input_image"}:
+                parts.append("[screenshot]")
+        return "\n".join(parts) if parts else None
+    return content
+
+
 def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
     """Mutate a multimodal tool-result envelope to append a subdir hint.
 
@@ -723,6 +751,7 @@ __all__ = [
     "_paths_overlap",
     "_is_multimodal_tool_result",
     "_multimodal_text_summary",
+    "durable_content_view",
     "_append_subdir_hint_to_multimodal",
     "_extract_file_mutation_targets",
     "_extract_landed_file_mutation_paths",

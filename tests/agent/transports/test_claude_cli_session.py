@@ -1739,3 +1739,107 @@ for line in sys.stdin:
         assert ("e2e-owner", "native-e2e") in saved_bindings
     finally:
         session.close()
+
+
+class TestMultimodalSignatureStability:
+    """A screenshot must not read as an edited transcript.
+
+    The session DB drops image bytes on write, so a live turn and its reloaded
+    self hold different ``content`` shapes for the same message. The signature
+    compares those two, and before ``durable_content_view`` was shared between
+    the two sides every image message forced a full native-history replay.
+    """
+
+    IMAGE_PATH = "/opt/data/cache/images/img_244b52a31be8.jpg"
+    LIVE_CONTENT = [
+        {"type": "text", "text": f"这个转帖可以吗\n\n[Image attached at: {IMAGE_PATH}]"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,AAAABBBBCCCC"},
+        },
+    ]
+    # Byte-for-byte what run_agent persists for the message above.
+    STORED_CONTENT = (
+        "这个转帖可以吗\n\n"
+        f"[Image attached at: {IMAGE_PATH}]\n"
+        "[screenshot]"
+    )
+
+    def test_live_multipart_collapses_to_the_stored_row(self):
+        from agent.tool_dispatch_helpers import durable_content_view
+
+        assert durable_content_view(self.LIVE_CONTENT) == self.STORED_CONTENT
+
+    def test_signature_survives_the_db_round_trip(self):
+        live = [
+            {"role": "user", "content": "hello"},
+            {"role": "user", "content": self.LIVE_CONTENT},
+        ]
+        reloaded = [
+            {"role": "user", "content": "hello"},
+            {"role": "user", "content": self.STORED_CONTENT},
+        ]
+        assert _hermes_history_signature(live) == _hermes_history_signature(reloaded)
+
+    def test_text_only_signature_is_unchanged(self):
+        """Guards the deploy itself: text-only sessions must not be invalidated."""
+        import hashlib
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi", "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "content": "res", "tool_call_id": "1"},
+            {
+                "role": "user",
+                "content": "clean",
+                "api_content": "clean\n<memory-context>M</memory-context>",
+            },
+        ]
+        rows = []
+        for message in messages:
+            if message.get("role") == "system":
+                continue
+            row = {
+                "role": message.get("role"),
+                "content": message.get("api_content", message.get("content")),
+            }
+            if message.get("tool_calls"):
+                row["tool_calls"] = message["tool_calls"]
+            if message.get("tool_call_id"):
+                row["tool_call_id"] = message["tool_call_id"]
+            rows.append(row)
+        legacy = hashlib.sha256(
+            json.dumps(
+                rows,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        assert _hermes_history_signature(messages) == legacy
+
+    def test_multimodal_tool_result_envelope_collapses(self):
+        from agent.tool_dispatch_helpers import durable_content_view
+
+        envelope = {
+            "_multimodal": True,
+            "content": [{"type": "text", "text": "ok"}, {"type": "image", "data": "x"}],
+            "text_summary": "ok",
+        }
+        assert durable_content_view(envelope) == "ok"
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("plain", "plain"),
+            (None, None),
+            ([], None),
+            ([{"type": "image_url", "image_url": {"url": "x"}}], "[screenshot]"),
+        ],
+    )
+    def test_passthrough_shapes(self, value, expected):
+        from agent.tool_dispatch_helpers import durable_content_view
+
+        assert durable_content_view(value) == expected
