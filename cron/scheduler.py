@@ -4828,6 +4828,27 @@ def run_job(
                 )
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
+            # A cron fire is one-shot: its pooled Claude child will never serve
+            # another turn, but the pool only evicts under LRU pressure, so it
+            # would hold ~265MB for hours. Both ids are released because an
+            # in-flight compression rotates the run onto a continuation — the
+            # pre-rotation child is pooled under the id captured at start.
+            try:
+                from agent.claude_cli_runtime import (
+                    release_claude_cli_sessions_by_owner,
+                )
+
+                closed = release_claude_cli_sessions_by_owner(
+                    _final_cron_session_id, _cron_session_id
+                )
+                if closed:
+                    logger.debug(
+                        "Job '%s': released %d native child(ren)", job_id, closed
+                    )
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug(
+                    "Job '%s': failed to release native child: %s", job_id, e
+                )
             try:
                 _session_db.close()
             except (Exception, KeyboardInterrupt) as e:

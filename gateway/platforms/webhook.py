@@ -1451,6 +1451,30 @@ class WebhookAdapter(BasePlatformAdapter):
             result = _end(session_id, "webhook_complete")
             if asyncio.iscoroutine(result):
                 await result
+            # The delivery is one-shot, so its pooled Claude child is dead
+            # weight the moment the run ends — but nothing else will notice:
+            # the pool only evicts under LRU pressure, so idle children sit on
+            # ~265MB each and a delivery burst can push the live chat session
+            # out of the pool (costing it a full history replay). Closing the
+            # DB row without this leaves the process behind.
+            try:
+                from agent.claude_cli_runtime import (
+                    release_claude_cli_sessions_by_owner,
+                )
+
+                closed = release_claude_cli_sessions_by_owner(session_id)
+                if closed:
+                    logger.debug(
+                        "[webhook] Released %d native child(ren) for %s",
+                        closed,
+                        session_id,
+                    )
+            except Exception:
+                logger.debug(
+                    "[webhook] Native child release failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
             logger.debug(
                 "[webhook] Closed session %s for delivery %s",
                 session_id,

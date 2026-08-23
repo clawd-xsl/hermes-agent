@@ -767,3 +767,68 @@ def test_manual_compaction_reuses_effective_persistent_session_prompt(monkeypatc
     assert result.compacted is True
     assert prompts == ["stable\n\nturn-scoped"]
     assert calls == [(agent, "keep decisions")]
+
+
+class TestReleaseSessionsByOwner:
+    """One-shot runs must hand their pooled child back when they finish.
+
+    Webhook deliveries and cron fires end in the gateway/scheduler, which hold
+    a session id but no AIAgent. Before this path existed their child stayed
+    pooled until LRU pressure evicted it — hours of ~265MB apiece, and a
+    delivery burst could push a live chat session out of the pool.
+    """
+
+    class _FakeSession:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    def _pool(self, monkeypatch, **entries):
+        from agent import claude_cli_runtime as rt
+
+        monkeypatch.setattr(rt, "_SESSIONS", dict(entries), raising=False)
+        return rt
+
+    def test_closes_and_unpools_the_named_owner(self, monkeypatch):
+        victim, keep = self._FakeSession(), self._FakeSession()
+        rt = self._pool(monkeypatch, webhook_1=victim, signal_main=keep)
+
+        assert rt.release_claude_cli_sessions_by_owner("webhook_1") == 1
+        assert victim.closed is True
+        assert keep.closed is False
+        assert "webhook_1" not in rt._SESSIONS
+        assert "signal_main" in rt._SESSIONS
+
+    def test_releases_both_sides_of_a_compression_rotation(self, monkeypatch):
+        before, after = self._FakeSession(), self._FakeSession()
+        rt = self._pool(monkeypatch, cron_orig=before, cron_tip=after)
+
+        assert rt.release_claude_cli_sessions_by_owner("cron_tip", "cron_orig") == 2
+        assert before.closed is True
+        assert after.closed is True
+        assert rt._SESSIONS == {}
+
+    def test_unknown_blank_and_duplicate_keys_are_harmless(self, monkeypatch):
+        only = self._FakeSession()
+        rt = self._pool(monkeypatch, real=only)
+
+        assert rt.release_claude_cli_sessions_by_owner("missing", "", None) == 0
+        assert only.closed is False
+        # A rotation that never happened passes the same id twice.
+        assert rt.release_claude_cli_sessions_by_owner("real", "real") == 1
+        assert only.closed is True
+
+    def test_a_failing_close_does_not_strand_the_other_victim(self, monkeypatch):
+        class _Angry(self._FakeSession):
+            def close(self):
+                raise RuntimeError("child already gone")
+
+        angry, ok = _Angry(), self._FakeSession()
+        rt = self._pool(monkeypatch, a=angry, b=ok)
+
+        # Both leave the pool even though one child refuses to die.
+        assert rt.release_claude_cli_sessions_by_owner("a", "b") == 2
+        assert ok.closed is True
+        assert rt._SESSIONS == {}

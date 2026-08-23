@@ -686,6 +686,41 @@ def release_claude_cli_session(agent: Any) -> None:
     _retire_session(agent, session)
 
 
+def release_claude_cli_sessions_by_owner(*owner_keys: str) -> int:
+    """Close pooled native children by owner key, returning how many closed.
+
+    One-shot runs (webhook deliveries, cron fires) finish inside the gateway
+    and the scheduler, which hold the session id but no ``AIAgent`` — so the
+    agent-scoped :func:`release_claude_cli_session` cannot reach them. Without
+    this their child stays pooled until LRU pressure happens to evict it,
+    which on a quiet box is hours: each idle child holds ~265MB, and a burst
+    of deliveries can fill the pool and push a live chat session out, costing
+    a full history replay on its next turn.
+
+    Several keys are accepted because a compression mid-run rotates the work
+    onto a continuation session: the pre-rotation child is pooled under the
+    original id, the post-rotation one under the tip, and both are dead once
+    the run ends.
+    """
+    victims: list[ClaudeCliSession] = []
+    with _POOL_LOCK:
+        for owner_key in owner_keys:
+            key = str(owner_key or "").strip()
+            if not key:
+                continue
+            session = _SESSIONS.pop(key, None)
+            if session is not None:
+                victims.append(session)
+    for session in victims:
+        try:
+            session.close()
+        except Exception:
+            logger.debug(
+                "Claude CLI one-shot session cleanup failed", exc_info=True
+            )
+    return len(victims)
+
+
 def detach_claude_cli_session(agent: Any) -> None:
     """Leave a pooled native thread alive while cleaning up a helper agent.
 
@@ -4025,6 +4060,7 @@ __all__ = [
     "run_claude_cli_turn",
     "compact_claude_cli_history",
     "release_claude_cli_session",
+    "release_claude_cli_sessions_by_owner",
     "detach_claude_cli_session",
     "close_all_claude_cli_sessions",
 ]
