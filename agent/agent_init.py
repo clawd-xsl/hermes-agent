@@ -2191,12 +2191,8 @@ def init_agent(
     # (bool("false") is True — #82777).
     from utils import is_truthy_value as _is_truthy
 
-    codex_responses_native_only = _is_truthy(
-        _compression_cfg.get("codex_responses_native_only", False)
-    )
-    codex_responses_native_compaction = (
-        _is_truthy(_compression_cfg.get("codex_responses_native", False))
-        or codex_responses_native_only
+    codex_responses_native_compaction = _is_truthy(
+        _compression_cfg.get("codex_responses_native", False)
     )
     _native_threshold_raw = _compression_cfg.get(
         "codex_responses_compact_threshold", 200_000
@@ -2662,10 +2658,7 @@ def init_agent(
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
         except Exception:
             pass
-    # Native-only mode deliberately disables every Hermes-owned compression
-    # path (including auxiliary text summaries and manual /compress) while the
-    # Responses transport remains allowed to request server-side compaction.
-    agent.compression_enabled = compression_enabled and not codex_responses_native_only
+    agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     # Apply micro-compaction settings to the compressor (feature is opt-in)
     _cc = getattr(agent, "context_compressor", None)
@@ -2679,7 +2672,6 @@ def init_agent(
         )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction
-    agent.codex_responses_native_only = codex_responses_native_only
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (

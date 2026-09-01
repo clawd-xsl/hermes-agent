@@ -25,7 +25,6 @@ def _agent(
     base_url="https://api.openai.com/v1",
     enabled=True,
     compression_enabled=True,
-    native_only=False,
     threshold=DEFAULT_COMPACT_THRESHOLD,
     compressor=None,
 ):
@@ -34,7 +33,6 @@ def _agent(
         base_url=base_url,
         codex_responses_native_compaction=enabled,
         compression_enabled=compression_enabled,
-        codex_responses_native_only=native_only,
         codex_responses_compact_threshold=threshold,
         context_compressor=compressor,
     )
@@ -107,27 +105,6 @@ class TestRequestGate:
             )
             is None
         )
-
-    def test_native_only_bypasses_local_compression_gate(self):
-        payload = native_compaction_context_management(
-            _agent(compression_enabled=False, native_only=True),
-            is_codex_backend=False,
-        )
-        assert payload == [
-            {"type": "compaction", "compact_threshold": DEFAULT_COMPACT_THRESHOLD}
-        ]
-
-    def test_native_only_does_not_clamp_to_dormant_local_trigger(self):
-        payload = native_compaction_context_management(
-            _agent(
-                compression_enabled=False,
-                native_only=True,
-                threshold=200_000,
-                compressor=SimpleNamespace(threshold_tokens=100_000),
-            ),
-            is_codex_backend=False,
-        )
-        assert payload == [{"type": "compaction", "compact_threshold": 200_000}]
 
     def test_wrong_model_never_sends(self):
         assert (
