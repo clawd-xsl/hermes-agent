@@ -774,6 +774,13 @@ DEFAULT_CONFIG = {
                                       # the ChatGPT Codex backend; every other
                                       # route/model is unaffected. Hermes' local
                                       # compression stays armed as the fallback.
+        "codex_responses_native_only": False,  # Disable Hermes' local/auxiliary
+                                      # summarizer while keeping native Responses
+                                      # compaction enabled. Implies
+                                      # codex_responses_native=true. On an ineligible
+                                      # model/route there is intentionally no local
+                                      # fallback, so provider context-limit errors are
+                                      # surfaced instead of calling an auxiliary model.
         "codex_responses_compact_threshold": 200000,  # Server-side compaction trigger
                                       # (input tokens). Clamped below the local
                                       # compression threshold at request time so

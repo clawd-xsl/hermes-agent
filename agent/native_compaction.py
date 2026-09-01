@@ -23,14 +23,15 @@ Hermes' support is deliberately narrow (live verification, Aug 2026):
   most would 400 on the unknown parameter, and none can mint or decrypt
   the compaction blob.
 
-Ownership model: Hermes' local compression stays fully armed as the
-fallback owner. The native threshold is clamped safely below the local
-compressor's trigger so the server compacts first; if it doesn't (native
-disabled mid-session, provider hiccup, non-eligible route), the local
-summarizer fires exactly as before. There is no new custody state — the
-captured compaction items ride the existing ``codex_reasoning_items``
-sidecar, which already handles persistence (state.db), gateway session
-replay, cross-issuer stamping, and the encrypted-replay kill switch.
+Ownership model: Hermes' local compression stays fully armed as the fallback
+owner by default. ``compression.codex_responses_native_only=true`` opts out of
+that fallback: local/auxiliary compression is disabled and provider context
+errors surface if native compaction is unavailable. The native threshold is
+clamped safely below the local compressor's trigger when the fallback remains
+enabled. There is no new custody state — the captured compaction items ride the
+existing ``codex_reasoning_items`` sidecar, which already handles persistence
+(state.db), gateway session replay, cross-issuer stamping, and the
+encrypted-replay kill switch.
 
 This module is dependency-free on purpose so the transport, adapter, and
 conversation loop can share the gate without import cycles.
@@ -123,9 +124,11 @@ def native_compaction_context_management(
     """
     if not bool(getattr(agent, "codex_responses_native_compaction", False)):
         return None
-    # compression.enabled: false disables ALL automatic compaction, native
-    # included — mirrors the codex_app_server_auto contract.
-    if not bool(getattr(agent, "compression_enabled", True)):
+    # Native-only mode intentionally turns off agent.compression_enabled so
+    # every Hermes-owned summarizer path stays dormant. It is the sole case in
+    # which native compaction remains armed while that shared local gate is off.
+    native_only = bool(getattr(agent, "codex_responses_native_only", False))
+    if not bool(getattr(agent, "compression_enabled", True)) and not native_only:
         return None
     if is_xai_responses or is_github_responses:
         return None
@@ -139,7 +142,11 @@ def native_compaction_context_management(
     compressor = getattr(agent, "context_compressor", None)
     threshold = resolve_compact_threshold(
         getattr(agent, "codex_responses_compact_threshold", DEFAULT_COMPACT_THRESHOLD),
-        getattr(compressor, "threshold_tokens", None) if compressor is not None else None,
+        (
+            getattr(compressor, "threshold_tokens", None)
+            if compressor is not None and not native_only
+            else None
+        ),
     )
     return [{"type": "compaction", "compact_threshold": threshold}]
 
