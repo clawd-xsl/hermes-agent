@@ -1410,6 +1410,7 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # DEFAULT_CONTEXT_LENGTHS or the agent compresses context prematurely.
     # Keys are matched by longest-substring, so the versioned 4-6/4-7/4-8
     # entries win over the generic "anthropic.claude-opus-4" fallback.
+    "anthropic.claude-fable-5-1":    1_000_000,
     "anthropic.claude-fable-5":      1_000_000,
     "anthropic.claude-fable":        1_000_000,
     "anthropic.claude-sonnet-5":     1_000_000,

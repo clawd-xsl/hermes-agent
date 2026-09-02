@@ -328,6 +328,21 @@ def _supports_fast_mode(model: str) -> bool:
     return any(v in model for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
 
 
+def _rejects_forced_tool_choice(model: str) -> bool:
+    """Whether the model rejects Anthropic ``tool_choice`` any/tool forms.
+
+    Fable/Mythos 5.1 only accept ``auto`` and ``none``.  Hermes cannot safely
+    synthesize a new mid-conversation instruction here without changing the
+    cached prompt prefix, so degrade forced choices to ``auto`` instead of
+    sending a request that the API deterministically rejects with HTTP 400.
+    """
+    normalized = (model or "").lower().replace(".", "-")
+    return any(
+        family in normalized
+        for family in ("claude-fable-5-1", "claude-mythos-5-1")
+    )
+
+
 # Beta headers for enhanced features that are safe on ordinary/native Anthropic
 # requests. As of Opus 4.7 (2026-04-16), these are GA on Claude 4.6+ — the
 # beta headers are still accepted (harmless no-op) but not required. Kept
@@ -3003,13 +3018,21 @@ def build_anthropic_kwargs(
         if tool_choice == "auto" or tool_choice is None:
             kwargs["tool_choice"] = {"type": "auto"}
         elif tool_choice == "required":
-            kwargs["tool_choice"] = {"type": "any"}
+            kwargs["tool_choice"] = (
+                {"type": "auto"}
+                if _rejects_forced_tool_choice(model)
+                else {"type": "any"}
+            )
         elif tool_choice == "none":
             # Anthropic has no tool_choice "none" — omit tools entirely to prevent use
             kwargs.pop("tools", None)
         elif isinstance(tool_choice, str):
             # Specific tool name
-            kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
+            kwargs["tool_choice"] = (
+                {"type": "auto"}
+                if _rejects_forced_tool_choice(model)
+                else {"type": "tool", "name": tool_choice}
+            )
 
     # Map reasoning_config to Anthropic's thinking parameter.
     # Claude 4.6+ models use adaptive thinking + output_config.effort.

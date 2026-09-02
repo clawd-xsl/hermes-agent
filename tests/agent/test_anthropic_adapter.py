@@ -1016,6 +1016,8 @@ class TestBuildAnthropicKwargs:
         )
         # New / unknown Claude models → modern contract by default.
         for m in (
+            "claude-fable-5-1",
+            "anthropic/claude-fable-5-1",
             "claude-fable-5",
             "anthropic/claude-fable-5",
             "claude-saga-2",            # hypothetical future named model
@@ -1025,6 +1027,7 @@ class TestBuildAnthropicKwargs:
             assert _supports_xhigh_effort(m) is True, m
             assert _forbids_sampling_params(m) is True, m
         # 1M-context reasoning model → highest output ceiling.
+        assert _get_anthropic_max_output("anthropic/claude-fable-5-1") == 128_000
         assert _get_anthropic_max_output("anthropic/claude-fable-5") == 128_000
 
 
@@ -1388,6 +1391,27 @@ class TestToolChoice:
             tool_choice="search",
         )
         assert kwargs["tool_choice"] == {"type": "tool", "name": "search"}
+
+    def test_fable_5_1_downgrades_forced_tool_choice_to_auto(self):
+        """Fable 5.1 rejects Anthropic tool_choice any/tool with HTTP 400."""
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+        for forced in ("required", "search"):
+            kwargs = build_anthropic_kwargs(
+                model="claude-fable-5-1",
+                messages=[{"role": "user", "content": "find it"}],
+                tools=tools,
+                max_tokens=4096,
+                reasoning_config={"enabled": True, "effort": "high"},
+                tool_choice=forced,
+            )
+            assert kwargs["tool_choice"] == {"type": "auto"}
 
 
 

@@ -48,6 +48,7 @@ def _urlopen_model_catalog_request(req: urllib.request.Request, *, timeout: floa
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     # Anthropic
+    ("anthropic/claude-fable-5.1",             ""),
     ("anthropic/claude-fable-5",               ""),
     ("anthropic/claude-opus-5",                ""),
     ("anthropic/claude-opus-5-fast",           "2x price, higher output speed"),
@@ -406,6 +407,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2",
     ],
     "anthropic": [
+        "claude-fable-5-1",
         "claude-fable-5",
         "claude-sonnet-5",
         "claude-opus-4-8",

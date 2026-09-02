@@ -205,7 +205,7 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && 
 # CLI. Pin the executable in the production image so Railway and other
 # immutable deployments do not depend on a first-boot npm install or whatever
 # happens to be present on the host PATH.
-ARG CLAUDE_CODE_VERSION=2.1.229
+ARG CLAUDE_CODE_VERSION=2.1.257
 RUN npm install --global --omit=dev --no-audit --no-fund \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && \
     claude --version && \
