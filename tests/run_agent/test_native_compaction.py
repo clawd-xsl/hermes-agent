@@ -1,4 +1,4 @@
-"""Tests for native OpenAI Responses server-side compaction (gpt-5.6 only).
+"""Tests for native OpenAI Responses server-side compaction.
 
 Live behavior verified 2026-08-08 against api.openai.com: gpt-5.6 and
 gpt-5.3-codex accept ``context_management`` and emit compaction items;
@@ -44,10 +44,25 @@ class TestModelGate:
         assert is_native_compaction_model("gpt-5.6-mini")
         assert is_native_compaction_model("GPT-5.6-2026-07-15")
 
+    def test_gpt6_family_eligible(self):
+        assert is_native_compaction_model("gpt-6")
+        assert is_native_compaction_model("gpt-6-astra")
+        assert is_native_compaction_model("GPT-6.1-SOL")
+        assert is_native_compaction_model("openai/gpt-6-luna")
+
     def test_other_models_ineligible(self):
         # gpt-5.1/5.2 fail server-side on context_management (live-verified);
         # gpt-5.3-codex works upstream but is outside the supported set.
-        for model in ("gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-4o", "o3", ""):
+        for model in (
+            "gpt-5.1",
+            "gpt-5.2",
+            "gpt-5.3-codex",
+            "gpt-60",
+            "not-gpt-6-astra",
+            "gpt-4o",
+            "o3",
+            "",
+        ):
             assert not is_native_compaction_model(model)
         assert not is_native_compaction_model(None)
 

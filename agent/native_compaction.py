@@ -1,4 +1,4 @@
-"""Native OpenAI Responses server-side compaction — gpt-5.6 on direct OpenAI routes only.
+"""Native OpenAI Responses server-side compaction for supported GPT families.
 
 OpenAI's Responses API supports server-side compaction: include
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` in a
@@ -11,7 +11,8 @@ Docs: https://developers.openai.com/api/docs/guides/compaction
 
 Hermes' support is deliberately narrow (live verification, Aug 2026):
 
-* **gpt-5.6 family only.** gpt-5.6 and its variants compact correctly.
+* **gpt-5.6 and gpt-6 families.** gpt-5.6 and gpt-6 variants compact
+  correctly.
   Sending the field to gpt-5.1 / gpt-5.2 reliably fails server-side —
   HTTP 500 on the blocking path and a permanent stall on the streaming
   path (90s watchdog x 3 retries = a dead turn). There is no structured
@@ -47,14 +48,21 @@ LOCAL_TRIGGER_SAFETY_MARGIN = 8_192
 
 DEFAULT_COMPACT_THRESHOLD = 200_000
 
-# Model-family gate. Substring match on the lowercased model id so dated
-# snapshots (gpt-5.6-2026-07-xx) and variants (gpt-5.6-mini) stay eligible.
-_ELIGIBLE_MODEL_MARKER = "gpt-5.6"
+# Model-family gate. Prefix matching after an optional provider namespace keeps
+# dated snapshots and variants eligible without accidentally accepting names
+# such as ``gpt-60``. gpt-6 exposes the same Responses compaction contract.
+_ELIGIBLE_MODEL_PREFIXES = ("gpt-5.6", "gpt-6")
 
 
 def is_native_compaction_model(model: Optional[str]) -> bool:
-    """True when the model is in the gpt-5.6 family."""
-    return _ELIGIBLE_MODEL_MARKER in (model or "").lower()
+    """True when the model is in a native-compaction GPT family."""
+    name = (model or "").lower().rsplit("/", 1)[-1]
+    return any(
+        name == prefix
+        or name.startswith(prefix + "-")
+        or name.startswith(prefix + ".")
+        for prefix in _ELIGIBLE_MODEL_PREFIXES
+    )
 
 
 def is_direct_openai_route(
