@@ -559,6 +559,35 @@ def test_live_semantic_v2_content_refs_are_the_action_capabilities():
     assert refs == {"p7:3": {"click", "pointer"}}
 
 
+def test_live_semantic_v2_merges_content_and_action_refs():
+    from tools.computer_use.browser_route import _ref_map
+
+    refs = _ref_map({
+        "status": "ok",
+        "content_refs": [
+            {"ref": "p2:2", "role": "heading", "actions": []},
+        ],
+        "refs": [
+            {
+                "ref": "p2:0",
+                "role": "textbox",
+                "actions": ["type", "pointer"],
+            },
+            {
+                "ref": "p2:1",
+                "role": "button",
+                "actions": ["click", "pointer"],
+            },
+        ],
+    })
+
+    assert refs == {
+        "p2:0": {"type", "pointer"},
+        "p2:1": {"click", "pointer"},
+        "p2:2": set(),
+    }
+
+
 def test_dom_event_is_forwarded_only_when_explicitly_requested():
     driver = _BrowserDriver()
     route = _browser_route(driver)

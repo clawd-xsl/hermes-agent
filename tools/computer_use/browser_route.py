@@ -63,33 +63,35 @@ def _ref_map(payload: Dict[str, Any]) -> Dict[str, Set[str]]:
     """
     normalized: Dict[str, Set[str]] = {}
     snapshot = payload.get("snapshot")
-    # semantic_v2 carries the authoritative action-bearing entries in
-    # ``content_refs``; some transitional builds also emitted a ``refs`` list
-    # or map. Prefer the richer live shape, then accept both older forms.
-    raw = payload.get("content_refs")
-    if not raw:
-        raw = payload.get("refs")
-    if raw is None and isinstance(snapshot, dict):
-        raw = snapshot.get("refs")
-    if isinstance(raw, dict):
-        entries: Iterable[tuple[Optional[str], Any]] = raw.items()
-    elif isinstance(raw, list):
-        entries = ((None, item) for item in raw)
-    else:
-        entries = ()
+    # Current semantic_v2 responses separate readable ``content_refs`` from
+    # actionable ``refs``. Older releases used either field for both roles,
+    # and some transitional builds nested refs under ``snapshot``. Merge every
+    # advertised source so action capabilities are not dropped merely because
+    # content refs are also present.
+    sources = [payload.get("content_refs"), payload.get("refs")]
+    if isinstance(snapshot, dict):
+        sources.append(snapshot.get("refs"))
 
-    for key, value in entries:
-        if isinstance(value, dict):
-            ref = value.get("ref") or key
-            actions = value.get("actions")
+    for raw in sources:
+        if isinstance(raw, dict):
+            entries: Iterable[tuple[Optional[str], Any]] = raw.items()
+        elif isinstance(raw, list):
+            entries = ((None, item) for item in raw)
         else:
-            ref = key
-            actions = None
-        if not isinstance(ref, str) or not ref:
-            continue
-        normalized[ref] = {
-            action for action in (actions or []) if isinstance(action, str)
-        }
+            entries = ()
+
+        for key, value in entries:
+            if isinstance(value, dict):
+                ref = value.get("ref") or key
+                actions = value.get("actions")
+            else:
+                ref = key
+                actions = None
+            if not isinstance(ref, str) or not ref:
+                continue
+            normalized.setdefault(ref, set()).update(
+                action for action in (actions or []) if isinstance(action, str)
+            )
     return normalized
 
 
