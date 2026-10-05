@@ -620,6 +620,10 @@ class ClaudeCliSession:
         )
         self.persistent_binding = persistent_binding
         self.auto_compaction_enabled = bool(auto_compaction_enabled)
+        # Hermes owns user-facing slash-command routing. Keep Claude Code's
+        # command layer disabled for ordinary turns, and lift this guard only
+        # for the internal /compact bridge in compact().
+        self._slash_commands_enabled = False
         self.json_schema = dict(json_schema) if isinstance(json_schema, dict) else None
         self.loopback = (
             ClaudeToolLoopback(agent, owner_key=owner_key)
@@ -849,7 +853,6 @@ class ClaudeCliSession:
             # too, otherwise Claude can spend another model step searching an
             # intentionally empty catalog instead of returning the summary.
             "--tools", "ToolSearch" if has_hermes_tools else "",
-            "--disable-slash-commands",
             "--prompt-suggestions", "false",
             "--no-chrome",
             "--setting-sources", "",
@@ -859,6 +862,8 @@ class ClaudeCliSession:
             "--mcp-config", str(mcp_path),
             "--strict-mcp-config",
         ]
+        if not self._slash_commands_enabled:
+            args.append("--disable-slash-commands")
         if has_hermes_tools:
             args.extend(["--allowedTools", "mcp__hermes__*"])
         # Claude's native transcript does not persist a replacement system
@@ -1524,6 +1529,13 @@ class ClaudeCliSession:
             focus = str(focus_topic or "").strip()
             command = "/compact" + (f" {focus}" if focus else "")
             restore_auto_compaction_disabled = not self.auto_compaction_enabled
+            # Ordinary turns run with --disable-slash-commands because Hermes
+            # owns that user-facing namespace. /compact is the one intentional
+            # Claude built-in command, so restart the same native binding with
+            # slash commands enabled for this operation, then stop it again so
+            # the next ordinary turn cannot inherit the relaxed command layer.
+            self._stop_process()
+            self._slash_commands_enabled = True
             if restore_auto_compaction_disabled:
                 # DISABLE_COMPACT gates both automatic and explicit native
                 # compaction. Preserve Hermes' long-standing contract that the
@@ -1531,7 +1543,6 @@ class ClaudeCliSession:
                 # same bound native thread with the flag lifted for this one
                 # command, then restore the disabled policy before the next
                 # ordinary user turn.
-                self._stop_process()
                 self.auto_compaction_enabled = True
             try:
                 result = self._run_turn_once(
@@ -1547,9 +1558,15 @@ class ClaudeCliSession:
                     operation="compact",
                 )
             finally:
-                if restore_auto_compaction_disabled:
+                try:
                     self._stop_process()
-                    self.auto_compaction_enabled = False
+                finally:
+                    # Restore both guards even if child shutdown itself fails;
+                    # a later retry must never inherit the relaxed command
+                    # surface or automatic-compaction policy.
+                    self._slash_commands_enabled = False
+                    if restore_auto_compaction_disabled:
+                        self.auto_compaction_enabled = False
             if result.error is None and not result.interrupted and not result.compacted:
                 result.error = (
                     "Claude CLI completed /compact without emitting a "

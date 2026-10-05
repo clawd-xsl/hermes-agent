@@ -399,6 +399,7 @@ def test_live_args_never_use_print_mode_and_resume_reapplies_system_prompt(
         assert "-p" not in fresh_args and "--print" not in fresh_args
         assert "--input-format" in fresh_args and "stream-json" in fresh_args
         assert "--replay-user-messages" in fresh_args
+        assert "--disable-slash-commands" in fresh_args
         assert fresh_args[fresh_args.index("--prompt-suggestions") + 1] == "false"
         assert "--no-chrome" in fresh_args
         assert "--session-id" in fresh_args
@@ -1430,6 +1431,7 @@ def test_manual_compact_temporarily_lifts_disabled_automatic_policy(
     session.auto_compaction_enabled = False
     stopped = []
     observed_envs = []
+    observed_args = []
 
     monkeypatch.setattr(
         session, "_stop_process", lambda **_kwargs: stopped.append(True)
@@ -1437,6 +1439,7 @@ def test_manual_compact_temporarily_lifts_disabled_automatic_policy(
 
     def run_once(**_kwargs):
         observed_envs.append(session._build_env())
+        observed_args.append(session._build_args())
         return ClaudeCliTurnResult(compacted=True)
 
     monkeypatch.setattr(session, "_run_turn_once", run_once)
@@ -1444,8 +1447,10 @@ def test_manual_compact_temporarily_lifts_disabled_automatic_policy(
         result = session.compact(agent=_Agent())
         assert result.compacted is True
         assert "DISABLE_COMPACT" not in observed_envs[0]
+        assert "--disable-slash-commands" not in observed_args[0]
         assert len(stopped) == 2
         assert session.auto_compaction_enabled is False
+        assert "--disable-slash-commands" in session._build_args()
         assert session._build_env()["DISABLE_COMPACT"] == "1"
     finally:
         session.close()
