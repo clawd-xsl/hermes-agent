@@ -656,6 +656,7 @@ class ClaudeCliSession:
         self._stderr_lock = threading.Lock()
         self._turn_lock = threading.Lock()
         self._interrupt_requested = threading.Event()
+        self._interrupt_preserve_session = False
         self._runtime_dir: Optional[Path] = None
         self._closed = False
         self._created_at = time.monotonic()
@@ -1694,6 +1695,7 @@ class ClaudeCliSession:
         # the child is launching: interrupt() sets the flag, then startup used
         # to erase it immediately before the request was written.
         self._interrupt_requested.clear()
+        self._interrupt_preserve_session = False
         launch_started = time.monotonic()
         was_alive = self.is_alive
         self.ensure_started()
@@ -2244,6 +2246,13 @@ class ClaudeCliSession:
 
                 if event_type == "result":
                     result.terminal_result_received = True
+                    if self._interrupt_requested.is_set():
+                        # The stream-json control protocol interrupts one turn
+                        # without destroying the long-lived native session.
+                        # Redirects reuse that thread for the correction;
+                        # hard stops still retire it after this terminal row.
+                        result.interrupted = True
+                        result.should_retire = not self._interrupt_preserve_session
                     terminal_stop_reason = str(
                         event.get("stop_reason") or event.get("stopReason") or ""
                     ).strip()
@@ -2347,11 +2356,29 @@ class ClaudeCliSession:
         finally:
             self.loopback.end_turn()
 
-    def interrupt(self) -> None:
+    def interrupt(self, *, preserve_session: bool = False) -> None:
         self._interrupt_requested.set()
+        self._interrupt_preserve_session = bool(preserve_session)
         process = self._process
         if process is not None and process.poll() is None:
-            self._signal_process(process, signal.SIGTERM)
+            # Keep the native thread alive. Killing the child here forced the
+            # redirect retry to bootstrap the complete Hermes transcript as a
+            # single user message, which cannot be compacted when it is large.
+            try:
+                self._write_json(
+                    {
+                        "type": "control_request",
+                        "request_id": f"hermes_interrupt_{uuid.uuid4().hex}",
+                        "request": {"subtype": "interrupt"},
+                    }
+                )
+            except Exception:
+                logger.warning(
+                    "Claude native interrupt control request failed; "
+                    "falling back to process signal",
+                    exc_info=True,
+                )
+                self._signal_process(process, signal.SIGTERM)
 
     def close(self) -> None:
         if self._closed:

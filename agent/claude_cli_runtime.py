@@ -2821,7 +2821,18 @@ def run_claude_cli_turn(
         model_request_active = getattr(agent, "_model_request_active", None)
         redirect_lock = getattr(agent, "_pending_redirect_lock", None)
         previous_abort = getattr(agent, "_active_request_abort", None)
-        agent._active_request_abort = lambda _reason="": session.interrupt()
+
+        def _abort_native_request(reason: str = "") -> None:
+            try:
+                session.interrupt(
+                    preserve_session=(reason == "redirect_abort")
+                )
+            except TypeError:
+                # Compatibility for third-party/test session adapters that
+                # still implement the original zero-argument contract.
+                session.interrupt()
+
+        agent._active_request_abort = _abort_native_request
         if redirect_lock is not None:
             with redirect_lock:
                 if model_request_active is not None:
@@ -3165,7 +3176,16 @@ def run_claude_cli_turn(
             _image_shrink_retries=_image_shrink_retries + 1,
         )
 
-    if turn.should_retire and not transient_session:
+    defer_native_retirement_for_redirect = bool(
+        turn.should_retire
+        and redirect_crossed_response
+        and getattr(agent, "_has_pending_redirect", lambda: False)()
+    )
+    if (
+        turn.should_retire
+        and not transient_session
+        and not defer_native_retirement_for_redirect
+    ):
         _invalidate_persistent_native_history(agent, session)
         session = None
 
@@ -3452,8 +3472,6 @@ def run_claude_cli_turn(
                 agent._persist_session(messages, conversation_history)
             except Exception:
                 logger.warning("Claude redirected turn checkpoint persist failed", exc_info=True)
-            if not transient_session and session is not None:
-                _invalidate_persistent_native_history(agent, session)
             return run_claude_cli_turn(
                 agent,
                 user_message=user_message,
@@ -3480,6 +3498,17 @@ def run_claude_cli_turn(
                 _truncated_parts_previewed=_truncated_parts_previewed,
                 _image_shrink_retries=_image_shrink_retries,
             )
+
+    # Redirect handling above deliberately appends the correction to the same
+    # Claude thread. Other terminal transport failures still retire the native
+    # binding exactly as before.
+    if (
+        turn.should_retire
+        and not transient_session
+        and defer_native_retirement_for_redirect
+    ):
+        _invalidate_persistent_native_history(agent, session)
+        session = None
 
     guardrail = getattr(agent, "_tool_guardrail_halt_decision", None)
     if guardrail is not None:

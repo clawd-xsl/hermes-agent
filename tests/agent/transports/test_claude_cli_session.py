@@ -837,6 +837,35 @@ def test_graceful_stop_closes_stdin_before_signalling_child(tmp_path, monkeypatc
     assert session._process is None
 
 
+def test_interrupt_uses_native_control_protocol_without_killing_child(
+    tmp_path, monkeypatch
+):
+    session = _session(tmp_path, monkeypatch)
+
+    class Process:
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    process = Process()
+    session._process = process
+    signalled = []
+    monkeypatch.setattr(session, "_signal_process", lambda *_args: signalled.append(True))
+
+    session.interrupt(preserve_session=True)
+
+    payload = json.loads(process.stdin.getvalue())
+    assert payload["type"] == "control_request"
+    assert payload["request"]["subtype"] == "interrupt"
+    assert payload["request_id"].startswith("hermes_interrupt_")
+    assert session._interrupt_requested.is_set()
+    assert session._interrupt_preserve_session is True
+    assert signalled == []
+
+
 def test_stream_protocol_projects_tools_and_keeps_only_final_assistant_text(
     tmp_path, monkeypatch
 ):

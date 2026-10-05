@@ -2342,33 +2342,33 @@ def test_native_active_redirect_restarts_same_logical_turn_with_correction(monke
     agent = _make_agent()
 
     class _RedirectingSession(_FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.responses = 0
+
         def run_turn(self, **kwargs):
             self.calls.append(kwargs)
+            self.responses += 1
+            if self.responses > 1:
+                return ClaudeCliTurnResult(
+                    final_text="corrected answer",
+                    projected_messages=[
+                        {"role": "assistant", "content": "corrected answer"}
+                    ],
+                    native_session_id="native-interrupted",
+                    session_reuse="warm_hit",
+                )
             assert kwargs["agent"].redirect("use the corrected requirement") is True
             return ClaudeCliTurnResult(
                 interrupted=True,
-                should_retire=True,
                 native_session_id="native-interrupted",
             )
 
     first = _RedirectingSession()
-    second = _SequenceSession(
-        [
-            ClaudeCliTurnResult(
-                final_text="corrected answer",
-                projected_messages=[
-                    {"role": "assistant", "content": "corrected answer"}
-                ],
-                native_session_id="native-corrected",
-            )
-        ]
-    )
-    sessions = iter([first, second])
 
     def get_session(bound_agent, **_kwargs):
-        session = next(sessions)
-        bound_agent._claude_cli_session = session
-        return session
+        bound_agent._claude_cli_session = first
+        return first
 
     monkeypatch.setattr("agent.claude_cli_runtime._get_session", get_session)
     with patch.object(agent, "_sync_external_memory_for_turn", return_value=None):
@@ -2376,9 +2376,10 @@ def test_native_active_redirect_restarts_same_logical_turn_with_correction(monke
 
     try:
         assert result["final_response"] == "corrected answer"
-        assert first.closed is True
+        assert first.closed is False
         assert getattr(first, "interrupted", False) is True
-        redirected_input = second.calls[0]["user_input"]
+        assert len(first.calls) == 2
+        redirected_input = first.calls[1]["user_input"]
         assert "[Context from the interrupted assistant response]" in redirected_input
         assert redirected_input.endswith("use the corrected requirement")
         assert result["interrupted"] is False
