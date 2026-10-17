@@ -347,6 +347,7 @@ USER root
 # Python/frontend layers so a gog-only revision bump preserves those caches.
 COPY --chmod=0755 --from=gog_build /out/gog /opt/hermes/bin/gog
 RUN mkdir -p /opt/hermes/bin && \
+    ln -s /opt/hermes/bin/gog /usr/local/bin/gog && \
     cp /opt/hermes/docker/hermes-exec-shim.sh /opt/hermes/bin/hermes && \
     chmod 0755 /opt/hermes/bin/hermes && \
     printf 'docker\n' > /opt/hermes/.install_method
