@@ -13,6 +13,8 @@ import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+import { installAuthenticatedPreKeys } from "./signal_ts_prekeys.mjs";
 
 const MAX_ATTACHMENTS = 1024;
 const SEND_RETRY_DELAYS_MS = [750, 2000];
@@ -190,6 +192,13 @@ const client = new sdk.SignalTsClient({
   receiveStories: accountState.receiveStories ?? false,
   logger,
 });
+// signal-ts's anonymous key lookup fails for recipients who restrict sealed
+// sender access. Ordinary authenticated sends must fetch keys with our login.
+if (typeof client.fetchPreKeyBundles === "function") {
+  const sdkRequire = createRequire(sdkEntry);
+  const libsignal = await import(pathToFileURL(sdkRequire.resolve("@signalapp/libsignal-client")).href);
+  installAuthenticatedPreKeys(client, libsignal);
+}
 const stores = sdk.createLibsignalStores(repository);
 const localAddress = sdk.createSignalLocalAddress(account);
 const attachments = new Map();
