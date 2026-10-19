@@ -1379,19 +1379,6 @@ class ClaudeCliSession:
             self._process_started_at = None
             self._process_group_id = None
 
-    def _reset_fresh_binding(self) -> None:
-        self._stop_process()
-        if self.persistent_binding:
-            _forget_binding(self.owner_key)
-        self.native_session_id = str(uuid.uuid4())
-        self._resume = False
-        self._history_signature = None
-        self._history_row_digests = None
-        self._turns_completed = 0
-        self._events = queue.Queue()
-        with self._stderr_lock:
-            self._stderr.clear()
-
     def run_turn(
         self,
         *,
@@ -1426,7 +1413,7 @@ class ClaudeCliSession:
             legacy_unverifiable_resume = self._resume and self._history_signature is None
             if history_diverged or legacy_unverifiable_resume:
                 logger.info(
-                    "Claude native history invalidated before turn: owner=%s "
+                    "Claude native history preserved despite mirror drift: owner=%s "
                     "reason=%s",
                     self.owner_key,
                     "Hermes transcript diverged"
@@ -1451,7 +1438,6 @@ class ClaudeCliSession:
                             self.owner_key,
                             exc_info=True,
                         )
-                self._reset_fresh_binding()
             resumed_at_start = self._resume
             result = self._run_turn_once(
                 user_input=user_input,
@@ -1467,23 +1453,15 @@ class ClaudeCliSession:
             )
             if resumed_at_start and self._resume_binding_missing(result.error):
                 logger.warning(
-                    "Claude native session %s is unavailable; retrying this turn with a fresh binding",
+                    "Claude native session %s is unavailable; preserving its binding without history replay",
                     self.native_session_id,
                 )
-                self._reset_fresh_binding()
-                result = self._run_turn_once(
-                    user_input=user_input,
-                    messages=messages,
-                    task_id=task_id,
-                    stream_callback=stream_callback,
-                    projection_callback=projection_callback,
-                    bootstrap_messages=bootstrap_messages,
-                    before_next_model_callback=before_next_model_callback,
-                    iteration_post_callback=iteration_post_callback,
-                    api_retry_callback=api_retry_callback,
-                    operation="turn",
+                result.error = (
+                    f"Claude native session {self.native_session_id} could not be resumed: "
+                    f"{result.error}. Its binding was preserved; restore the native "
+                    "session file or explicitly start a new session. Hermes did not "
+                    "replay the conversation into a new thread."
                 )
-                result.session_reuse = "resume_recovery"
             self._last_used_at = time.monotonic()
             if (
                 result.error is None
@@ -1887,6 +1865,10 @@ class ClaudeCliSession:
                 if event_session_id:
                     self.native_session_id = str(event_session_id)
                     result.native_session_id = self.native_session_id
+                    # The native thread exists even if this first turn is
+                    # interrupted or fails later. Subsequent calls append;
+                    # they must not bootstrap the Hermes mirror again.
+                    self._resume = True
                     if self.persistent_binding:
                         _save_binding(self.owner_key, self.native_session_id)
                 inner = event.get("event")
@@ -2356,7 +2338,7 @@ class ClaudeCliSession:
         finally:
             self.loopback.end_turn()
 
-    def interrupt(self, *, preserve_session: bool = False) -> None:
+    def interrupt(self, *, preserve_session: bool = True) -> None:
         self._interrupt_requested.set()
         self._interrupt_preserve_session = bool(preserve_session)
         process = self._process

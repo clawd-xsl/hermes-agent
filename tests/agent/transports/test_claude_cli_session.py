@@ -654,7 +654,7 @@ def test_nonpersistent_session_never_reads_or_writes_binding(tmp_path, monkeypat
         session.close()
 
 
-def test_resume_discards_native_binding_when_hermes_history_was_rewritten(
+def test_resume_preserves_native_binding_when_hermes_history_was_rewritten(
     tmp_path, monkeypatch
 ):
     session = _session(tmp_path, monkeypatch, resume=True)
@@ -693,8 +693,9 @@ def test_resume_discards_native_binding_when_hermes_history_was_rewritten(
             task_id="rewrite",
         )
         assert result.final_text == "replacement answer"
-        assert forgot == ["owner"]
-        assert seen_resume == [False]
+        assert forgot == []
+        assert seen_resume == [True]
+        assert session.native_session_id == "native-existing"
         assert session._history_signature == _hermes_history_signature(
             [
                 *rewritten,
@@ -714,8 +715,6 @@ def test_resume_keeps_native_binding_when_hermes_prefix_matches(
         {"role": "assistant", "content": "answer"},
     ]
     session._history_signature = _hermes_history_signature(prefix)
-    resets = []
-    monkeypatch.setattr(session, "_reset_fresh_binding", lambda: resets.append(True))
     monkeypatch.setattr(
         session,
         "_run_turn_once",
@@ -734,7 +733,7 @@ def test_resume_keeps_native_binding_when_hermes_prefix_matches(
             task_id="next",
         )
         assert result.session_reuse == "warm_hit"
-        assert resets == []
+        assert session.native_session_id == "native-existing"
     finally:
         session.close()
 
@@ -1130,7 +1129,7 @@ def test_tool_proposal_stops_on_first_structured_call_without_executing(
         session.close()
 
 
-def test_missing_native_resume_retries_same_turn_fresh(tmp_path, monkeypatch):
+def test_missing_native_resume_preserves_binding_without_replaying(tmp_path, monkeypatch):
     session = _session(tmp_path, monkeypatch, resume=True)
     results = iter(
         [
@@ -1138,9 +1137,7 @@ def test_missing_native_resume_retries_same_turn_fresh(tmp_path, monkeypatch):
             ClaudeCliTurnResult(final_text="recovered", native_session_id="new-native"),
         ]
     )
-    resets = []
     monkeypatch.setattr(session, "_run_turn_once", lambda **_kwargs: next(results))
-    monkeypatch.setattr(session, "_reset_fresh_binding", lambda: resets.append(True))
     try:
         result = session.run_turn(
             agent=_Agent(),
@@ -1148,9 +1145,11 @@ def test_missing_native_resume_retries_same_turn_fresh(tmp_path, monkeypatch):
             messages=[{"role": "user", "content": "hello"}],
             task_id="task",
         )
-        assert result.final_text == "recovered"
-        assert result.session_reuse == "resume_recovery"
-        assert resets == [True]
+        assert "could not be resumed" in result.error
+        assert "did not replay" in result.error
+        assert result.should_retire is True
+        assert session.native_session_id == "native-existing"
+        assert next(results).final_text == "recovered"  # No second provider call.
     finally:
         session.close()
 

@@ -354,6 +354,55 @@ def test_native_turn_honors_interrupt_that_precedes_child_dispatch(monkeypatch):
         agent.close()
 
 
+def test_tool_interrupt_finalizer_keeps_native_session_for_next_user_turn(monkeypatch):
+    agent = _make_agent()
+
+    class InterruptThenContinue(_FakeSession):
+        def run_turn(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) > 1:
+                return ClaudeCliTurnResult(
+                    final_text="continued on the same native thread",
+                    projected_messages=[{"role": "assistant", "content": "continued on the same native thread"}],
+                    native_session_id="native-preserved",
+                )
+            rows = [
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": "tool-interrupted", "type": "function",
+                    "function": {"name": "computer_use", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": "tool-interrupted", "content": "desktop state"},
+            ]
+            kwargs["projection_callback"](rows)
+            kwargs["agent"].interrupt("incoming image", hard_cancel=True)
+            return ClaudeCliTurnResult(
+                interrupted=True, projected_messages=rows,
+                native_session_id="native-preserved",
+            )
+
+    native = InterruptThenContinue()
+
+    def get_session(bound_agent, **_kwargs):
+        bound_agent._claude_cli_session = native
+        return native
+
+    monkeypatch.setattr("agent.claude_cli_runtime._get_session", get_session)
+    with patch.object(agent, "_sync_external_memory_for_turn", return_value=None):
+        first = agent.run_conversation("inspect the browser")
+        assert first["interrupted"] is True
+        assert first["messages"][-1]["content"] == "Operation interrupted."
+        assert native.closed is False
+        assert agent._claude_cli_session is native
+        second = agent.run_conversation("look at the new image", conversation_history=first["messages"])
+    try:
+        assert second["final_response"] == "continued on the same native thread"
+        assert second["native_history_preserved"] is True
+        assert len(native.calls) == 2
+        assert native.closed is False
+    finally:
+        agent.close()
+
+
 def test_native_skill_review_cadence_preserves_mid_loop_skill_reset(monkeypatch):
     """A skill_manage call resets earlier private-loop iterations exactly once."""
     agent = _make_agent()
@@ -1464,11 +1513,9 @@ def test_native_final_answer_gates_continue_on_same_warm_session(monkeypatch):
             not row.get("_verification_stop_synthetic")
             for row in result["messages"]
         )
-        # The native thread still contains the private verification nudge that
-        # the shared finalizer removed from Hermes history.  It must not be
-        # warm-resumed under a signature for the cleaned transcript.
-        assert native.closed is True
-        assert agent._claude_cli_session is None
+        # Mirror-only cleanup must not replace Claude's native conversation.
+        assert native.closed is False
+        assert agent._claude_cli_session is native
     finally:
         agent.close()
 
@@ -1655,7 +1702,8 @@ def test_native_thinking_budget_exhaustion_does_not_retry_continuation(
         )
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "reasoning" in result["error"].lower()
-        assert native.closed is True
+        assert native.closed is False
+        assert result["native_history_preserved"] is True
     finally:
         agent.close()
 

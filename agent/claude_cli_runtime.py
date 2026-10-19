@@ -669,11 +669,14 @@ def _retire_session(agent: Any, session: ClaudeCliSession) -> None:
 def _invalidate_persistent_native_history(
     agent: Any, previous_session: Optional[ClaudeCliSession]
 ) -> None:
-    """Drop a warm thread that missed an isolated selected-context turn."""
-    owner_key = _owner_key(agent)
+    """Recycle a child without deleting its durable Claude conversation.
+
+    Kept as the compatibility boundary for existing callers. Transport errors,
+    isolated helper turns and mirror cleanup may require a new process, never
+    a new native thread. The replacement child resumes the saved binding.
+    """
     if previous_session is not None:
         _retire_session(agent, previous_session)
-    forget_claude_cli_binding(owner_key)
     if getattr(agent, "_claude_cli_session", None) is previous_session:
         agent._claude_cli_session = None
 
@@ -2824,9 +2827,7 @@ def run_claude_cli_turn(
 
         def _abort_native_request(reason: str = "") -> None:
             try:
-                session.interrupt(
-                    preserve_session=(reason == "redirect_abort")
-                )
+                session.interrupt(preserve_session=True)
             except TypeError:
                 # Compatibility for third-party/test session adapters that
                 # still implement the original zero-argument contract.
@@ -4037,6 +4038,7 @@ def run_claude_cli_turn(
             else None
         ),
         "agent_persisted": True,
+        "native_history_preserved": True,
         "claude_session_id": turn.native_session_id,
         "claude_session_reuse": turn.session_reuse,
         "claude_latency_ms": turn.latency_ms,
@@ -4068,9 +4070,8 @@ def run_claude_cli_turn(
                 if not bool(getattr(agent, "compression_enabled", True)):
                     result["compaction_disabled"] = True
                 else:
-                    # A terminal overflow means Claude's enabled native
-                    # autocompactor already failed to recover. Preserve the
-                    # gateway's standard clean-session recovery signal.
+                    # Surface the limit without authorizing a gateway reset:
+                    # native_history_preserved keeps this conversation bound.
                     result["compression_exhausted"] = True
         except Exception:
             logger.debug(

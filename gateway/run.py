@@ -3702,6 +3702,15 @@ def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     return not final_response or final_response == error_text
 
 
+def _should_reset_exhausted_session(agent_result: dict) -> bool:
+    """Native conversation owners retain their routing even at a context limit."""
+    return bool(
+        agent_result.get("compression_exhausted")
+        and not agent_result.get("compression_deferred")
+        and not agent_result.get("native_history_preserved")
+    )
+
+
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     """Return True only when a gateway turn really completed successfully.
 
@@ -19457,7 +19466,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "session intact; the next message retries normally.",
                     session_entry.session_id if session_entry else "?",
                 )
-            elif agent_result.get("compression_exhausted") and session_entry and session_key:
+            elif agent_result.get("compression_exhausted") and agent_result.get("native_history_preserved"):
+                logger.warning(
+                    "Claude context limit reached for session %s; preserving native session and routing.",
+                    session_entry.session_id if session_entry else "?",
+                )
+                response = (response or "") + (
+                    "\n\nClaude native session preserved. Use /compress to run "
+                    "native compaction, or explicitly /reset to start a new session."
+                )
+            elif _should_reset_exhausted_session(agent_result) and session_entry and session_key:
                 logger.info(
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,

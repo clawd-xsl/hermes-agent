@@ -17,6 +17,14 @@ The process stays alive across turns. This avoids repeated Node startup,
 credential loading, MCP discovery, and system-prompt ingestion, which is most
 noticeable for an always-on single-user assistant.
 
+Claude's native transcript remains authoritative across interruptions, Hermes
+transcript cleanup, configuration changes and child-process restarts. Hermes
+resumes the same saved native session ID rather than rebuilding it from its
+local message mirror. If the native file cannot be resumed, Hermes reports the
+error and preserves the binding. A context-limit error also preserves the
+gateway session; use `/compress` for Claude's native compaction or explicitly
+start a new conversation with `/reset`.
+
 ## Enable it
 
 Install and log in to Claude Code, and make sure Hermes includes its MCP extra:

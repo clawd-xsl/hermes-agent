@@ -47,6 +47,21 @@ class _SessionDB:
         self.calls.append((args, kwargs))
 
 
+def test_native_process_recycle_keeps_durable_binding(tmp_path, monkeypatch):
+    import agent.claude_cli_runtime as runtime
+    from agent.transports.claude_cli_session import _load_binding, _save_binding
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _save_binding("chat-owner", "native-thread-to-preserve")
+    child = SimpleNamespace(close=lambda: None)
+    agent = SimpleNamespace(session_id="chat-owner", _claude_cli_session=child)
+    monkeypatch.setattr(runtime, "_SESSIONS", {"chat-owner": child})
+    runtime._invalidate_persistent_native_history(agent, child)
+    assert _load_binding("chat-owner") == "native-thread-to-preserve"
+    assert agent._claude_cli_session is None
+    assert "chat-owner" not in runtime._SESSIONS
+
+
 def test_usage_accounts_aggregate_turn_but_compressor_tracks_last_native_call():
     db = _SessionDB()
     agent = SimpleNamespace(
