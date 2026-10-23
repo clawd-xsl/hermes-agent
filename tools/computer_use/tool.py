@@ -665,10 +665,10 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         call_args: Dict[str, Any] = {}
         allowed_fields = {
             "browser_navigate": ("url",),
-            "browser_click": ("ref", "input_route", "x", "y"),
+            "browser_click": ("ref", "input_route", "delivery_mode", "x", "y"),
             "browser_type": ("ref", "text"),
             "browser_pointer": (
-                "ref", "destination_ref", "input_route", "x", "y",
+                "ref", "destination_ref", "input_route", "delivery_mode", "x", "y",
                 "to_x", "to_y", "delta_x", "delta_y",
             ),
             "browser_dialog": (

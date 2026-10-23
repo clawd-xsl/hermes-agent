@@ -809,11 +809,20 @@ def test_public_schema_exposes_only_namespaced_typed_browser_actions():
     [
         ("cua_browser_navigate", "browser_navigate", {"url": "about:blank"}),
         ("cua_browser_click", "browser_click", {"ref": "p1:1"}),
+        (
+            "cua_browser_click", "browser_click",
+            {"ref": "p1:1", "input_route": "trusted", "delivery_mode": "foreground"},
+        ),
         ("cua_browser_type", "browser_type", {"ref": "p1:1", "text": "hello"}),
         (
             "cua_browser_pointer",
             "browser_pointer",
             {"action": "hover", "ref": "p1:1"},
+        ),
+        (
+            "cua_browser_pointer", "browser_pointer",
+            {"action": "scroll", "ref": "p1:1", "delta_y": 400,
+             "input_route": "trusted", "delivery_mode": "foreground"},
         ),
     ],
 )
