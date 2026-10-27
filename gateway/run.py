@@ -56,7 +56,6 @@ from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
-    claude_cli_owns_context_compaction,
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
@@ -18109,6 +18108,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_configured_model = None
             _hyg_configured_provider = None
             _hyg_configured_base_url = None
+            _hyg_runtime = {}
             _hyg_data = {}
             try:
                 _hyg_data = _load_gateway_config()
@@ -18236,6 +18236,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
+            # Claude CLI owns its authoritative context and automatic compaction.
+            # The retained Hermes recovery transcript does not shrink at a native
+            # compact boundary, so count-based hygiene would compact every turn.
+            # Use the resolved session route (not the global model default).
+            if str(_hyg_runtime.get("api_mode") or "").strip().lower() == "claude_cli":
+                _hyg_compression_enabled = False
+                logger.debug("Skipping gateway hygiene for Claude CLI session %s", session_entry.session_id)
+
             if _hyg_compression_enabled:
                 _hyg_context_length = await get_model_context_length_async(
                     _hyg_model,
@@ -18335,7 +18343,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             str(_hyg_runtime.get("api_mode") or "").strip().lower()
                             == "claude_cli"
                         )
-                        if _hyg_runtime.get("api_key") or _hyg_is_claude_cli:
+                        # Recheck after resolving again: a route change must not
+                        # let gateway hygiene take over Claude's native context.
+                        if _hyg_runtime.get("api_key") and not _hyg_is_claude_cli:
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
                             # compressor: tool results are usually the bulk of
@@ -18420,19 +18430,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
                                             commit_fence=_hyg_commit_fence,
-                                            # Claude owns the authoritative
-                                            # history.  A named native trigger
-                                            # bridges this pre-turn safety net
-                                            # to /compact; an ordinary auto
-                                            # call intentionally remains a
-                                            # no-op in the shared compressor.
-                                            native_trigger_source=(
-                                                "gateway_hygiene"
-                                                if claude_cli_owns_context_compaction(
-                                                    _hyg_agent
-                                                )
-                                                else None
-                                            ),
                                         ),
                                     )
                                     try:

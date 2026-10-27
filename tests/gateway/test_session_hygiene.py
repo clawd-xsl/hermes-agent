@@ -1059,19 +1059,16 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_uses_native_compaction_for_keychain_claude_cli(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("message_count,prompt_tokens", [(8, 99), (5002, 1), (5002, 1_000_000)])
+@pytest.mark.parametrize("api_key", [None, "fake-key"])
+async def test_session_hygiene_leaves_claude_cli_compaction_to_native_runtime(
+    monkeypatch, tmp_path, message_count, prompt_tokens, api_key
 ):
-    """Keychain-only Claude sessions must not skip gateway hygiene.
-
-    The native thread is compacted while Hermes' full transcript is retained;
-    the provider-reported post-boundary prompt size becomes the temporary
-    pressure baseline until the immediately following real turn reports usage.
-    """
+    """Neither mirrored-message count nor token pressure may auto-compact Claude."""
     async def _inline_to_thread(func, /, *args, **kwargs):
         return func(*args, **kwargs)
 
-    # This test targets the native compression branch, not Python's executor
+    # This test targets the gateway/native ownership boundary, not the executor
     # scheduling; keep the large GatewayRunner fixture deterministic.
     monkeypatch.setattr(asyncio, "to_thread", _inline_to_thread)
     loop = asyncio.get_running_loop()
@@ -1094,28 +1091,8 @@ async def test_session_hygiene_uses_native_compaction_for_keychain_claude_cli(
         last_instance = None
 
         def __init__(self, **kwargs):
-            self.model = kwargs.get("model")
-            self.api_mode = kwargs.get("api_mode")
-            self.session_id = kwargs.get("session_id", "sess-native")
-            self._last_compaction_in_place = False
-            self._last_native_compaction = False
-            self._last_native_compaction_prompt_tokens = None
-            self._claude_cli_session = object()
-            self.context_compressor = SimpleNamespace(
-                bind_session_state=MagicMock(),
-                _last_compress_aborted=False,
-                _last_aux_model_failure_model=None,
-            )
-            self.shutdown_memory_provider = MagicMock()
-            self.close = MagicMock()
             type(self).last_instance = self
-
-        def _compress_context(self, messages, *_args, **kwargs):
-            assert self.api_mode == "claude_cli"
-            assert kwargs["native_trigger_source"] == "gateway_hygiene"
-            self._last_native_compaction = True
-            self._last_native_compaction_prompt_tokens = 23
-            return (messages, "stable prompt")
+            raise AssertionError("Gateway must not construct a Claude compression agent")
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = FakeNativeCompressAgent
@@ -1131,9 +1108,9 @@ async def test_session_hygiene_uses_native_compaction_for_keychain_claude_cli(
         updated_at=datetime.now(),
         platform=Platform.TELEGRAM,
         chat_type="dm",
-        last_prompt_tokens=99,
+        last_prompt_tokens=prompt_tokens,
     )
-    original_history = _make_history(8, content_size=400)
+    original_history = _make_history(message_count, content_size=400)
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
@@ -1174,7 +1151,7 @@ async def test_session_hygiene_uses_native_compaction_for_keychain_claude_cli(
         {
             "provider": "anthropic",
             "api_mode": "claude_cli",
-            "api_key": None,
+            "api_key": api_key,
             "base_url": None,
         },
     )
@@ -1188,11 +1165,14 @@ async def test_session_hygiene_uses_native_compaction_for_keychain_claude_cli(
         }
     )
 
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
+    # Session routing wins even when the global default is a non-native model.
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  provider: openai\n  default: gpt-6.1-sol\n",
+        encoding="utf-8",
     )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    context_lookup = AsyncMock(return_value=100)
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length_async", context_lookup)
 
     event = MessageEvent(
         text="hello",
@@ -1205,15 +1185,17 @@ async def test_session_hygiene_uses_native_compaction_for_keychain_claude_cli(
         message_id="1",
     )
 
+    # Repeat to cover the bug: native compaction leaves the mirror above the
+    # hard message limit, so the old gateway ran /compact on EVERY new turn.
     assert await runner._handle_message(event) == "ok"
-    assert FakeNativeCompressAgent.last_instance is not None
-    assert FakeNativeCompressAgent.last_instance._claude_cli_session is None
-    # Native compaction never rewrites the complete Hermes recovery mirror.
+    event.message_id = "2"
+    assert await runner._handle_message(event) == "ok"
+    assert FakeNativeCompressAgent.last_instance is None
+    context_lookup.assert_not_awaited()
     runner.session_store.rewrite_transcript.assert_not_called()
-    async_store.update_session.assert_any_await(
-        entry.session_key, last_prompt_tokens=23
-    )
-    runner._run_agent.assert_awaited_once()
+    async_store.rewrite_transcript.assert_not_awaited()
+    assert entry.session_id == "sess-native"
+    assert runner._run_agent.await_count == 2
 
 
 # ---------------------------------------------------------------------------
