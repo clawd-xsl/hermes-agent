@@ -753,7 +753,17 @@ class WebhookAdapter(BasePlatformAdapter):
             f"Event type: {event_type}\n\n"
             "<external_event>\n"
             f"{rendered_event}\n"
-            "</external_event>"
+            "</external_event>\n\n"
+            "Output format (your reply is parsed by code, not read by a person):\n"
+            "- Skip: the entire reply is the single token NO_REPLY. Do not explain "
+            "or justify the decision; no words before or after it, not even on "
+            "the same line.\n"
+            "- Interrupt: the entire reply is the handoff, and it never contains "
+            "NO_REPLY.\n"
+            '- Correct skip reply: "NO_REPLY"\n'
+            '- Wrong skip replies, which are treated as handoffs and wrongly '
+            'interrupt the user: "This is routine, no action needed. NO_REPLY" '
+            'and "Shanli sent this himself.\\n\\nNO_REPLY".'
         )
 
     @staticmethod
