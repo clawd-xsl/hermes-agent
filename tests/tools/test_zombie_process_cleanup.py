@@ -238,6 +238,52 @@ class TestAgentCloseMethod:
 
             agent._session_db.end_session.assert_not_called()
 
+    def test_close_leaves_shared_session_resources_to_the_parent(self):
+        """A helper sharing a live parent's session_id keeps the parent's
+        computer-use backend and background processes alive on close()."""
+        from unittest.mock import Mock, patch
+
+        from tools.computer_use import tool as computer_use
+
+        sid = "test-close-shared-session"
+        parent_backend = Mock()
+        computer_use._backends[sid] = parent_backend
+        computer_use._backend_call_locks[sid] = threading.RLock()
+        computer_use._backend_permission_modes[sid] = "standard"
+        try:
+            with patch("run_agent.AIAgent.__init__", return_value=None):
+                from run_agent import AIAgent
+
+                def _agent(owns_resources):
+                    agent = AIAgent.__new__(AIAgent)
+                    agent.session_id = sid
+                    agent._active_children = []
+                    agent._active_children_lock = threading.Lock()
+                    agent.client = None
+                    agent._end_session_on_close = False
+                    agent._release_task_resources_on_close = owns_resources
+                    return agent
+
+                with patch("tools.process_registry.process_registry") as registry, \
+                     patch("run_agent.cleanup_vm") as cleanup_vm, \
+                     patch("run_agent.cleanup_browser") as cleanup_browser:
+                    _agent(owns_resources=False).close()
+
+                    registry.kill_all.assert_not_called()
+                    cleanup_vm.assert_not_called()
+                    cleanup_browser.assert_not_called()
+                    assert computer_use._backends.get(sid) is parent_backend
+                    parent_backend.stop.assert_not_called()
+
+                    # The real owner still releases everything on close().
+                    _agent(owns_resources=True).close()
+
+                    registry.kill_all.assert_called_once_with(task_id=sid)
+                    assert sid not in computer_use._backends
+                    parent_backend.stop.assert_called_once_with()
+        finally:
+            computer_use.release_computer_use_session(sid)
+
     def test_close_session_end_noops_without_session_db(self):
         """close() is a no-op for session finalization when no DB is wired in."""
         from unittest.mock import patch

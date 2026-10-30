@@ -4325,37 +4325,44 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
+        # Helpers that share a live parent's session_id (background-review
+        # forks, session-hygiene agents) must not tear down the parent's
+        # task-scoped resources below; the parent releases them itself.
+        owns_task_resources = getattr(
+            self, "_release_task_resources_on_close", True
+        )
 
-        # 1. Kill background processes for this task
-        try:
-            from tools.process_registry import process_registry
-            process_registry.kill_all(task_id=task_id)
-        except Exception:
-            pass
+        if owns_task_resources:
+            # 1. Kill background processes for this task
+            try:
+                from tools.process_registry import process_registry
+                process_registry.kill_all(task_id=task_id)
+            except Exception:
+                pass
 
-        # 2. Clean terminal sandbox environments
-        try:
-            cleanup_vm(task_id)
-        except Exception:
-            pass
+            # 2. Clean terminal sandbox environments
+            try:
+                cleanup_vm(task_id)
+            except Exception:
+                pass
 
-        # 3. Clean browser daemon sessions
-        try:
-            cleanup_browser(task_id)
-        except Exception:
-            pass
+            # 3. Clean browser daemon sessions
+            try:
+                cleanup_browser(task_id)
+            except Exception:
+                pass
 
-        # 4. Release the session-owned computer-use backend.  This ends the
-        # exact cua-driver session, drops typed-browser refs/grants, and stops
-        # a private embedded daemon when Hermes YOLO selected unrestricted
-        # mode.  The import is lazy so sessions without computer_use retain
-        # the narrow core footprint.
-        try:
-            from tools.computer_use import release_computer_use_session
+            # 4. Release the session-owned computer-use backend.  This ends the
+            # exact cua-driver session, drops typed-browser refs/grants, and stops
+            # a private embedded daemon when Hermes YOLO selected unrestricted
+            # mode.  The import is lazy so sessions without computer_use retain
+            # the narrow core footprint.
+            try:
+                from tools.computer_use import release_computer_use_session
 
-            release_computer_use_session(task_id)
-        except Exception:
-            pass
+                release_computer_use_session(task_id)
+            except Exception:
+                pass
 
         # 5. Close active child agents
         try:

@@ -1690,6 +1690,13 @@ def init_agent(
     # continuation row that must remain open after the helper is torn down;
     # those callers explicitly set this flag to False.
     agent._end_session_on_close = True
+    # Most agents also own the session_id-scoped tool resources (background
+    # processes, terminal sandboxes, browser daemons, the computer-use
+    # backend) and release them on close(). Temporary helpers that share a
+    # live parent's session_id (background-review forks, session-hygiene
+    # compression agents) set this to False so their close() leaves the
+    # parent's resources to the parent.
+    agent._release_task_resources_on_close = True
     # When True, this agent NEVER persists to the canonical session store
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into

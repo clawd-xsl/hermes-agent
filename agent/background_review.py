@@ -1035,6 +1035,10 @@ def _run_review_in_thread(
             # conversation (the review fires every ~10 turns). Leave session
             # finalization to the real owner (CLI close / gateway reset / cron).
             review_agent._end_session_on_close = False
+            # Same ownership rule for session_id-scoped tool resources: the
+            # fork must not kill the parent's background processes or release
+            # its computer-use backend (browser binding, tab ids) on close().
+            review_agent._release_task_resources_on_close = False
             # Never let the review fork compress. It shares the parent's
             # session_id, so if it won a compression race it would rotate the
             # parent into a NEW child that the gateway never adopts (the fork

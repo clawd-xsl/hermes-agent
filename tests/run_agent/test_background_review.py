@@ -125,6 +125,43 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
     assert seen.get("at_run_time") is False
 
 
+def test_background_review_fork_leaves_parent_task_resources_on_close(monkeypatch):
+    """The review fork's close() must not release the parent's session_id-scoped
+    tool resources: a review firing between turns used to drop the live
+    computer-use binding (tab ids, browser attach) and kill the parent's
+    background processes."""
+    seen = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+            self._end_session_on_close = True
+            self._release_task_resources_on_close = True
+
+        def run_conversation(self, **kwargs):
+            seen["at_run_time"] = self._release_task_resources_on_close
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            seen["at_close"] = self._release_task_resources_on_close
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert seen.get("at_run_time") is False
+    assert seen.get("at_close") is False
+
+
 def test_background_review_registers_on_active_children_for_interrupt(monkeypatch):
     """The review fork must be added to the parent's ``_active_children`` so
     ``AIAgent.interrupt()`` (which fans out to that list) can reach it, and

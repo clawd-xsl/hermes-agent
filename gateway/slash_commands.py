@@ -4184,6 +4184,9 @@ class GatewaySlashCommandsMixin:
                 # the gateway session entry now points at the new id and
                 # must remain open for the next user turn.
                 tmp_agent._end_session_on_close = False
+                # Nor release the live session's tool resources
+                # (background processes, computer-use backend).
+                tmp_agent._release_task_resources_on_close = False
 
                 # Estimate with system prompt + tool schemas included so the
                 # figure reflects real request pressure, not a transcript-only
