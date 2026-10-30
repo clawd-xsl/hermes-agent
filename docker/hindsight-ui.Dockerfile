@@ -1,5 +1,5 @@
-# Build against vectorize-io/hindsight v0.9.0, commit
-# b12646f49ec512136b9f709e608524ffed969668, as the build context.
+# Build against vectorize-io/hindsight v1.1.0, commit
+# a5a619b5ca59c5c39e0f96be6f7a31fabd136bd5, as the build context.
 # Only the control plane is rebuilt; the existing API and database stay put.
 FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS build
 WORKDIR /src
