@@ -145,6 +145,7 @@ export function useVirtualHistory(
     generation = 0,
     initialHeights,
     liveTailActive = false,
+    mountAll = false,
     onHeightsChange,
     overscan = OVERSCAN,
     maxMounted = MAX_MOUNTED,
@@ -470,6 +471,17 @@ export function useVirtualHistory(
     }
   }
 
+  // Inline (primary-buffer) rendering has no bounded viewport to window
+  // against: the ScrollBox grows to its content height, so `vp` equals the
+  // whole virtual height and every spacer row is printed as real blank
+  // lines that scroll into the host terminal's native scrollback, where
+  // they can never be repainted. Mount every row so scrollback receives
+  // the actual transcript (history length is already capped by MAX_HISTORY).
+  if (mountAll) {
+    effStart = 0
+    effEnd = n
+  }
+
   const measureRef = useCallback(
     (key: string) => {
       let fn = refs.current.get(key)
@@ -684,6 +696,9 @@ interface VirtualHistoryOptions {
   initialHeights?: ReadonlyMap<string, number>
   liveTailActive?: boolean
   maxMounted?: number
+  // Disable windowing: mount every item and emit no spacers. Required when the
+  // host terminal's scrollback (not a bounded ScrollBox) is the viewport.
+  mountAll?: boolean
   onHeightsChange?: (heights: ReadonlyMap<string, number>) => void
   overscan?: number
 }
