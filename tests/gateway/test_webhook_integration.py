@@ -366,8 +366,9 @@ class TestMainSessionWebhook:
         assert "Build notification:" not in queued["text"]
         assert queued["metadata"]["filtered"] is True
         assert queued["raw_message"] is None
+        # Default routes retain the reviewer session (closed, not deleted).
         adapter._end_webhook_session.assert_awaited_once_with(
-            review_event, review_event.source.chat_id
+            review_event, review_event.source.chat_id, delete=False
         )
 
     @pytest.mark.asyncio

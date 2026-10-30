@@ -16,6 +16,10 @@ Each route defines:
   - session: isolated (default) or main (the real gateway home conversation)
   - filter_before_main: for main routes, run a one-shot isolated reviewer first
     (default true); only a concise non-NO_REPLY handoff enters the main session
+  - retain_sessions: keep the per-delivery webhook session (isolated run or
+    main-route reviewer) in state.db after a successful run (default true;
+    platform-wide default under platforms.webhook.extra). Failed runs are
+    always kept. The main session itself is never affected.
   - deliver: where to send the response (github_comment, telegram, etc.)
   - deliver_extra: additional delivery config (repo, pr_number, chat_id)
   - deliver_only: if true, skip the agent — the rendered prompt IS the
@@ -205,6 +209,10 @@ class WebhookAdapter(BasePlatformAdapter):
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
         self._global_secret: str = config.extra.get("secret", "")
         self._default_session: Any = config.extra.get("session", "isolated")
+        # Whether per-delivery webhook sessions (isolated runs and main-review
+        # classifier runs) are kept in state.db after a successful run.
+        # Overridable per route with ``retain_sessions``.
+        self._default_retain_sessions: Any = config.extra.get("retain_sessions", True)
         self._default_filter_before_main: Any = config.extra.get(
             "filter_before_main", True
         )
@@ -729,6 +737,12 @@ class WebhookAdapter(BasePlatformAdapter):
             return None
         return self._model_override_channel_id(route_name)
 
+    def _route_retains_sessions(self, route: Dict[str, Any]) -> bool:
+        configured = route.get("retain_sessions")
+        if configured is None:
+            configured = self._default_retain_sessions
+        return self._coerce_bool(configured, default=True)
+
     def _route_filters_before_main(self, route: Dict[str, Any]) -> bool:
         configured = route.get("filter_before_main")
         if configured is None:
@@ -1164,6 +1178,9 @@ class WebhookAdapter(BasePlatformAdapter):
                         "skills": list(route_config.get("skills") or []),
                         "main_source": source,
                         "response": "",
+                        "retain_session": self._route_retains_sessions(
+                            route_config
+                        ),
                     }
                     review_event = MessageEvent(
                         text=self._build_main_review_prompt(
@@ -1258,6 +1275,7 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+            "retain_session": self._route_retains_sessions(route_config),
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
@@ -1407,10 +1425,17 @@ class WebhookAdapter(BasePlatformAdapter):
                         review.get("delivery_id"),
                     )
 
-        await self._end_webhook_session(event, chat_id)
+        if review is not None:
+            retain = review.get("retain_session", True)
+        else:
+            retain = self._delivery_info.get(chat_id, {}).get("retain_session", True)
+        # Failed runs are kept for debugging even when the route discards
+        # sessions; a review's handoff was already copied into the main turn.
+        delete = not retain and outcome == ProcessingOutcome.SUCCESS
+        await self._end_webhook_session(event, chat_id, delete=delete)
 
     async def _end_webhook_session(
-        self, event: "MessageEvent", session_chat_id: str
+        self, event: "MessageEvent", session_chat_id: str, *, delete: bool = False
     ) -> None:
         """Mark the per-delivery webhook session ended in state.db.
 
@@ -1485,6 +1510,20 @@ class WebhookAdapter(BasePlatformAdapter):
                     session_id,
                     exc_info=True,
                 )
+            if delete:
+                config = getattr(runner, "config", None)
+                result = session_db.delete_session(
+                    session_id,
+                    sessions_dir=getattr(config, "sessions_dir", None),
+                )
+                if asyncio.iscoroutine(result):
+                    result = await result
+                logger.info(
+                    "[webhook] Deleted session %s for delivery %s (retain_sessions=false)",
+                    session_id,
+                    session_chat_id,
+                )
+                return
             logger.debug(
                 "[webhook] Closed session %s for delivery %s",
                 session_id,
