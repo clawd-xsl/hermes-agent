@@ -83,6 +83,21 @@ export default defineConfig({
       "gsap",
     ],
   },
+  // Behind a path-prefix proxy the server rewrites index.html's absolute
+  // `/assets/` URLs, but JS-emitted URLs (lazy route chunks and their
+  // preload deps, e.g. the Chat tab's xterm) are baked into the bundle.
+  // Resolve those at runtime against the injected base path so lazy pages
+  // load under `/hermes/...` too; at the root the prefix is "".
+  experimental: {
+    renderBuiltUrl(filename, { hostType }) {
+      if (hostType === "js") {
+        return {
+          runtime: `(window.__HERMES_BASE_PATH__||"")+${JSON.stringify(`/${filename}`)}`,
+        };
+      }
+      return { relative: hostType === "css" };
+    },
+  },
   build: {
     outDir: "../hermes_cli/web_dist",
     emptyOutDir: true,
