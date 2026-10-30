@@ -1250,14 +1250,17 @@ export default class Ink {
    * The traditional readline ctrl+l — clears the visible screen and
    * redraws the current content. Also the recovery path when the terminal
    * was cleared externally (macOS Cmd+K) and Ink's diff engine thinks
-   * unchanged cells don't need repainting. Scrollback is preserved.
+   * unchanged cells don't need repainting. Scrollback is preserved unless
+   * `clearScrollback` is set: in main-screen (inline) mode a frame taller
+   * than the terminal has already pushed its top rows into scrollback, and
+   * repainting it without ED3 would append a second copy below the stale one.
    */
-  forceRedraw(): void {
+  forceRedraw({ clearScrollback = false }: { clearScrollback?: boolean } = {}): void {
     if (!this.options.stdout.isTTY || this.isUnmounted || this.isPaused) {
       return
     }
 
-    this.options.stdout.write(ERASE_SCREEN + CURSOR_HOME)
+    this.options.stdout.write(ERASE_SCREEN + (clearScrollback ? ERASE_SCROLLBACK : '') + CURSOR_HOME)
 
     if (this.altScreenActive) {
       this.resetFramesForAltScreen()

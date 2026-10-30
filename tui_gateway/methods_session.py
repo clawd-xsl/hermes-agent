@@ -2465,6 +2465,83 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("session.history.reload")
+def _(rid, params: dict) -> dict:
+    """Pick up turns persisted by another writer (e.g. the messaging gateway).
+
+    A resumed session's history is read once at resume time. When the same
+    conversation keeps receiving turns from another platform (Signal,
+    Telegram, …), a long-lived TUI — notably the dashboard's keep-alive PTY,
+    which is reattached on reopen instead of respawned — would show and feed
+    the model a stale snapshot forever. Clients poll this while idle.
+
+    The first call records a baseline (lineage tip + persisted row count). A
+    later call reloads only when the persisted transcript moved without this
+    process causing it: our own turns bump ``history_version`` and simply
+    re-baseline. Never touches a running session.
+    """
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if session.get("running"):
+        return _ok(rid, {"reloaded": False, "reason": "busy"})
+    key = str(session.get("session_key") or "")
+    if not key:
+        return _ok(rid, {"reloaded": False, "reason": "no_session_key"})
+
+    with _session_db(session) as db:
+        if db is None:
+            return _ok(rid, {"reloaded": False, "reason": "db_unavailable"})
+        try:
+            tip = db.resolve_resume_session_id(key) or key
+            marker = [tip, int(db.message_count(tip))]
+        except Exception as exc:
+            logger.debug("session.history.reload: marker read failed", exc_info=True)
+            return _ok(rid, {"reloaded": False, "reason": f"db_error: {exc}"})
+
+        with session["history_lock"]:
+            version = int(session.get("history_version", 0))
+            baseline = session.get("_persisted_sync")
+            if (
+                not isinstance(baseline, dict)
+                or baseline.get("history_version") != version
+            ):
+                session["_persisted_sync"] = {"marker": marker, "history_version": version}
+                return _ok(rid, {"reloaded": False, "reason": "baseline"})
+            if baseline.get("marker") == marker:
+                return _ok(rid, {"reloaded": False, "reason": "unchanged"})
+
+        if tip != key:
+            # The conversation was compressed elsewhere and continues under a
+            # new session id. Rebinding a live session's key is the resume
+            # path's job; tell the client to resume the tip.
+            return _ok(rid, {"reloaded": False, "reason": "rotated", "rotated_to": tip})
+
+        try:
+            raw_history = db.get_messages_as_conversation(key, repair_alternation=True)
+        except Exception as exc:
+            logger.debug("session.history.reload: history read failed", exc_info=True)
+            return _ok(rid, {"reloaded": False, "reason": f"db_error: {exc}"})
+
+    with session["history_lock"]:
+        if session.get("running") or int(session.get("history_version", 0)) != version:
+            # A turn started (or history mutated) while we read; let the next
+            # poll re-evaluate instead of clobbering it.
+            return _ok(rid, {"reloaded": False, "reason": "busy"})
+        session["history"] = sanitize_replay_history(raw_history)
+        session["history_version"] = version + 1
+        session["_persisted_sync"] = {"marker": marker, "history_version": version + 1}
+
+    cols = params.get("cols")
+    payload = _live_session_payload(
+        params.get("session_id", ""),
+        session,
+        cols=int(cols) if isinstance(cols, int) else None,
+    )
+    payload["reloaded"] = True
+    return _ok(rid, payload)
+
+
 @method("session.undo")
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)

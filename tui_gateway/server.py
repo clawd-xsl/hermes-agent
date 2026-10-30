@@ -226,6 +226,10 @@ _LONG_HANDLERS = frozenset(
         # prompt.submit / session.interrupt sit unread (same class as #21123),
         # and the Desktop model pill / picker block on it every open.
         "model.options",
+        # Idle history sync polls a SQLite count every few seconds and, when
+        # another writer advanced the transcript, re-reads the whole lineage —
+        # keep that read off the reader thread.
+        "session.history.reload",
         # Pet RPCs hit the network (manifest fetch / spritesheet download) or do
         # per-frame PNG decode/encode (pet.cells): inline they serialize on the
         # reader thread, so picker previews trickle in one at a time and the

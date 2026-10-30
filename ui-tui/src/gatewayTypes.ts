@@ -184,6 +184,11 @@ export interface SessionResumeResponse {
   status?: LiveSessionStatus
 }
 
+// session.history.reload: `reloaded` carries a full SessionResumeResponse-shaped
+// payload; otherwise `rotated_to` names a compression continuation to resume.
+export type SessionHistoryReloadResponse =
+  ({ reloaded: true } & SessionResumeResponse) | { reason?: string; reloaded: false; rotated_to?: string }
+
 export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working'
 
 export interface SessionActiveItem {

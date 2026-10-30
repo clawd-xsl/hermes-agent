@@ -54,6 +54,7 @@ import { $uiState, getUiState, patchUiState } from './uiStore.js'
 import { useBatteryPoll } from './useBatteryPoll.js'
 import { useComposerState } from './useComposerState.js'
 import { useConfigSync } from './useConfigSync.js'
+import { useHistorySync } from './useHistorySync.js'
 import { useInputHandlers } from './useInputHandlers.js'
 import { useLongRunToolCharms } from './useLongRunToolCharms.js'
 import { useSessionLifecycle } from './useSessionLifecycle.js'
@@ -556,6 +557,16 @@ export function useMainApp(gw: GatewayClient) {
       forceRedraw(stdout ?? process.stdout)
     }
   }, [dashboardFreshSessionId, stdout])
+
+  useHistorySync({
+    busy: ui.busy,
+    gw,
+    onRotated: session.resumeById,
+    scrollRef,
+    setHistoryItems,
+    sid: ui.sid,
+    stdout
+  })
 
   useEffect(() => {
     if (ui.busy) {

@@ -18,3 +18,8 @@ export const RESIZE_COALESCE_MS = 32
 // enough that two unrelated Escs — dismissing a completion, then a
 // selection — don't silently clear the composer.
 export const DOUBLE_ESC_MS = 500
+
+// Idle poll for turns persisted by another writer (messaging gateway, another
+// client) into the resumed session. Each tick is one SQLite COUNT on the
+// gateway; the transcript is only re-read when that count moves.
+export const HISTORY_SYNC_INTERVAL_MS = 4000

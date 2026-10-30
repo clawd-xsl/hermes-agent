@@ -89,14 +89,17 @@ export type Root = {
   waitUntilExit: () => Promise<void>
 }
 
-export const forceRedraw = (stdout: NodeJS.WriteStream = process.stdout): boolean => {
+export const forceRedraw = (
+  stdout: NodeJS.WriteStream = process.stdout,
+  options: { clearScrollback?: boolean } = {}
+): boolean => {
   const instance = instances.get(stdout)
 
   if (!instance) {
     return false
   }
 
-  instance.forceRedraw()
+  instance.forceRedraw(options)
 
   return true
 }
