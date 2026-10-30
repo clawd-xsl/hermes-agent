@@ -1,0 +1,7 @@
+#!/command/with-contenv sh
+set -eu
+export HOME="${HERMES_HOME:-/opt/data}"
+export HERMES_HOME="$HOME"
+cd "$HERMES_HOME/skills/personal/plaid-finance/scripts/plaid/dashboard_v2"
+exec /command/s6-setuidgid hermes "$HERMES_HOME/venvs/plaid-finance/bin/python3" \
+    /opt/hermes/docker/finance-dashboard-launch.py

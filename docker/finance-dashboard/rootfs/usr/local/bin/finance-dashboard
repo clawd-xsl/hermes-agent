@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+service=/run/service/finance-dashboard
+case "${1:-status}" in
+    status) exec /command/s6-svstat "$service" ;;
+    start) exec /command/s6-svc -u -wu -T 15000 "$service" ;;
+    stop) exec /command/s6-svc -d -wD -T 15000 "$service" ;;
+    restart)
+        /command/s6-svc -d -wD -T 15000 "$service"
+        exec /command/s6-svc -u -wu -T 15000 "$service"
+        ;;
+    health) exec "${HERMES_HOME:-/opt/data}/venvs/plaid-finance/bin/python3" -c \
+        'import urllib.request; r=urllib.request.urlopen("http://127.0.0.1:8766/healthz",timeout=10); print("HTTP",r.status)' ;;
+    logs) exec tail -n 80 "${HERMES_HOME:-/opt/data}/logs/finance-dashboard.log" ;;
+    *) echo 'Usage: finance-dashboard {status|start|stop|restart|health|logs}' >&2; exit 2 ;;
+esac
