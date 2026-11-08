@@ -1904,6 +1904,25 @@ def clear_thread_tool_whitelist() -> None:
     _thread_tool_whitelist.allowed = None
 
 
+def get_thread_tool_whitelist_state() -> Optional[tuple[set[str], str]]:
+    """This thread's ``(allowed, deny_msg_fmt)`` whitelist, or None when unrestricted. Read by
+    ``tools.thread_context.propagate_context_to_thread`` so a worker dispatching tools for a
+    restricted turn (a parallel tool batch, a turn runtime's tool loopback) keeps the restriction."""
+    allowed = getattr(_thread_tool_whitelist, "allowed", None)
+    if allowed is None:
+        return None
+    return set(allowed), getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
+
+
+def set_thread_tool_whitelist_state(state: Optional[tuple[set[str], str]]) -> None:
+    """Install a :func:`get_thread_tool_whitelist_state` snapshot on this thread (None clears it)."""
+    if state is None:
+        clear_thread_tool_whitelist()
+        return
+    allowed, fmt = state
+    set_thread_tool_whitelist(set(allowed), deny_msg_fmt=fmt)
+
+
 def _get_pre_tool_call_directive_details(
     tool_name: str, args: Optional[dict[str, Any]], task_id: str = "", session_id: str = "",
     tool_call_id: str = "", turn_id: str = "", api_request_id: str = "",
