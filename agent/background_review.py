@@ -362,6 +362,62 @@ def _digest_history(messages_snapshot: list[dict], tail: int = 24) -> list[dict]
     return [{"role": "user", "content": digest}] + keep
 
 
+_DIGEST_PREFIX = "[Earlier conversation digest"
+
+
+def _bounded_text(text: str, limit: int) -> str:
+    """Keep both ends of an oversized historical field within ``limit`` characters."""
+    if len(text) <= limit:
+        return text
+    marker = "\n[... oversized historical content omitted ...]\n"
+    head = ((limit - len(marker)) * 2) // 3
+    return text[:head] + marker + text[-(limit - len(marker) - head):]
+
+
+def _bounded_review_row(message: dict, max_chars: int = 4_000) -> dict:
+    """A provider-valid, payload-bounded copy of one replayed row: the review needs the semantic
+    transcript, not historical binary payloads or exact large tool arguments."""
+    row: dict = {"role": str(message.get("role") or ""), "content": _bounded_text(_msg_text(message), max_chars)}
+    calls = []
+    for call in (message.get("tool_calls") or [])[:8]:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict):
+            continue
+        arguments = function.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False, default=str)
+        if len(arguments) > 512:
+            arguments = json.dumps({"_hermes_review_summary": _bounded_text(arguments, 384)}, ensure_ascii=False)
+        calls.append({"id": str(call.get("id") or ""), "type": "function",
+                      "function": {"name": str(function.get("name") or "?")[:128], "arguments": arguments}})
+    if calls:
+        row["tool_calls"] = calls
+    for key in ("tool_call_id", "name"):
+        if message.get(key):
+            row[key] = str(message[key])
+    return row
+
+
+def _review_replay_history(review_agent: Any, messages_snapshot: list[dict], routed: bool) -> list[dict]:
+    """What the review fork replays. Same model over HTTP: the full snapshot (warm prefix cache).
+    Routed: a digest (cache cold anyway). On a turn runtime the fork cannot share the parent's
+    private native thread and cold-boots from Hermes' lossless mirror, which outgrows the model's
+    context once the native thread has compacted: a digest with a payload-bounded recent tail."""
+    from agent.turn_runtime_registry import agent_turn_runtime
+    if agent_turn_runtime(review_agent) is None:
+        return _digest_history(messages_snapshot) if routed else messages_snapshot
+    replay = []
+    for row in _digest_history(messages_snapshot):
+        if not isinstance(row, dict):
+            continue
+        content = row.get("content")
+        if row.get("role") == "user" and isinstance(content, str) and content.startswith(_DIGEST_PREFIX):
+            replay.append({"role": "user", "content": _bounded_text(content, 24_000)})
+        else:
+            replay.append(_bounded_review_row(row))
+    return replay
+
+
 # Review prompts. AIAgent exposes them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) so
 # per-agent overrides work; the text lives here.
 # Shared by the memory-only and combined review prompts: the memory tool has two targets and the
@@ -1229,7 +1285,7 @@ def _run_review_fork(
                     "management tools. Other tools will be denied "
                     "at runtime — do not attempt them." + prompt_extra
                 ),
-                conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
+                conversation_history=_review_replay_history(st.review_agent, messages_snapshot, _routed),
             )
     finally:
         clear_thread_tool_whitelist()
