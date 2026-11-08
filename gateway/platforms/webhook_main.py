@@ -151,7 +151,8 @@ async def handoff_to_main(adapter, chat_id: str, content: str, delivery: dict, m
     silence first). A failed handoff fails the send and keeps the reviewer's session."""
     from gateway.platforms.base import SendResult
     if not (metadata or {}).get("notify"):
-        logger.debug("[webhook] Reviewer %s: non-final send not handed to main", chat_id)
+        # Interim status sends, and a delivery-ledger redelivery (which carries no final marker).
+        logger.info("[webhook] Reviewer %s: a non-final send is not handed to main", chat_id)
         return SendResult(success=True)
     route = str(delivery.get("route") or "")
     event_type = str((delivery.get("deliver_extra") or {}).get("event_type") or "unknown")
