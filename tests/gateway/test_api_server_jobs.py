@@ -557,3 +557,33 @@ class TestCronPromptScanParity:
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
 
+
+
+class TestMainSessionField:
+    """``session: main|isolated`` passes through create and the PATCH whitelist; cron.jobs validates it."""
+
+    @pytest.mark.asyncio
+    async def test_create_and_update_forward_session(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_create", mock_create), \
+                    patch(f"{_MOD}._cron_update", mock_update):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "ctx", "schedule": "every 1h", "prompt": "x", "session": "main"})
+                assert resp.status == 200
+                assert mock_create.call_args.kwargs["session"] == "main"
+                resp = await cli.patch(f"/api/jobs/{VALID_JOB_ID}", json={"session": "isolated"})
+                assert resp.status == 200
+                assert mock_update.call_args[0][1] == {"session": "isolated"}
+
+    @pytest.mark.asyncio
+    async def test_invalid_session_is_a_client_error(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+                    patch(f"{_MOD}._cron_create", MagicMock(side_effect=ValueError("Invalid session mode 'fork'"))):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "ctx", "schedule": "every 1h", "prompt": "x", "session": "fork"})
+                assert resp.status == 400

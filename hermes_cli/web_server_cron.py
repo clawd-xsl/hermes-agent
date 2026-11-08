@@ -280,7 +280,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
             timezone=_cron_optional_text(body.timezone),
-            grace_minutes=body.grace_minutes,
+            grace_minutes=body.grace_minutes, session=_cron_optional_text(body.session),
             **{key: getattr(body, key) for key in ("paused", "paused_reason", "catch_up")
                if key in body.model_fields_set})
     except HTTPException:

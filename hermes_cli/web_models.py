@@ -348,6 +348,8 @@ class CronJobCreate(BaseModel):
     grace_minutes: Optional[int | str] = None
     # Missed-run policy: true runs one catch-up, false skips; omitted follows the default.
     catch_up: Optional[StrictBool] = None
+    # Conversation a fire runs in: "isolated" | "main"; omitted follows cron.session.
+    session: Optional[str] = None
 
 class CronJobUpdate(BaseModel):
     updates: dict

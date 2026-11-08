@@ -247,6 +247,7 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
         ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
          if job.get("no_agent") else ""),
         ("Timezone", job.get("timezone")),
+        ("Session", job.get("session")),
         ("Grace", f"{job['grace_minutes']} min" if job.get("grace_minutes") is not None else ""),
         ("Workdir", job.get("workdir")),
         ("Python", job.get("interpreter")),
@@ -779,12 +780,15 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
                    ("interpreter", "interpreter"), ("timezone", "timezone"),
-                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"))
+                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"), ("session", "session"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
     """Collect the create/update kwargs shared by ``cron create`` and ``cron edit``."""
-    return {api_key: getattr(args, attr, None) for api_key, attr in _JOB_ARG_FIELDS}
+    kwargs = {api_key: getattr(args, attr, None) for api_key, attr in _JOB_ARG_FIELDS}
+    if kwargs["session"] == "default":  # `cron edit --session default`: follow cron.session again
+        kwargs["session"] = ""
+    return kwargs
 
 
 _JOB_DETAIL_LINES = (
@@ -794,6 +798,7 @@ _JOB_DETAIL_LINES = (
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
     ("timezone", "  Timezone: {} (schedule runs on this zone's wall clock)"),
+    ("session", "  Session: {}"),
     ("workdir", "  Workdir: {}"),
     ("interpreter", "  Python: {}"))
 
