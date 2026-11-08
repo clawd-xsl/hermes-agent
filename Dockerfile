@@ -5,6 +5,41 @@
 # Pinned by the multi-arch index digest: uv and node already come from pm's
 # sha-verified lock, and a tag alone would let the base drift under them.
 
+# Build the pinned personal Google Workspace CLI separately from the Hermes
+# runtime.  Only the static binary crosses the stage boundary: OAuth client
+# configuration and encrypted refresh tokens remain on the /opt/data volume.
+# Pin both the toolchain and source revision so a rebuild cannot silently pick
+# up a different gog release or a moving custom branch.
+ARG GOG_GO_VERSION=1.26.5
+FROM golang:${GOG_GO_VERSION}-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS gog_build
+ARG GOGCLI_REPOSITORY=https://github.com/clawd-xsl/gogcli.git
+ARG GOGCLI_COMMIT=4fe0390bcafdecf46e144924eb151a265886e3da
+ARG GOGCLI_VERSION=v0.35.0-4-g4fe0390b
+RUN apk add --no-cache ca-certificates git
+WORKDIR /src
+RUN git init . && \
+    git remote add origin "${GOGCLI_REPOSITORY}" && \
+    for attempt in 1 2 3; do \
+        git fetch --depth=1 origin "${GOGCLI_COMMIT}" && break; \
+        [ "${attempt}" -eq 3 ] && exit 1; \
+        sleep 5; \
+    done && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${GOGCLI_COMMIT}"
+RUN go mod download && \
+    commit="$(git rev-parse --short=12 HEAD)" && \
+    date="$(git show -s --format=%cI HEAD)" && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath \
+        -ldflags="-s -w \
+          -X github.com/openclaw/gogcli/internal/cmd.version=${GOGCLI_VERSION} \
+          -X github.com/openclaw/gogcli/internal/cmd.commit=${commit} \
+          -X github.com/openclaw/gogcli/internal/cmd.date=${date}" \
+        -o /out/gog ./cmd/gog && \
+    /out/gog --version
+
+# Cloudflare Tunnel connector, supervised by s6 (docker/s6-rc.d/cloudflared).
+FROM cloudflare/cloudflared:2026.8.2 AS cloudflared_source
+
 FROM debian:trixie-20261020@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308 AS sqlite_build
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
@@ -78,7 +113,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools
 # user cannot apt-get it later (no root, and the root fs resets on restart).
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils tmux \
+    ca-certificates curl iputils-ping python3 python-is-python3 gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git gh openssh-client docker-cli xz-utils tmux \
     libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 && \
     rm -rf /var/lib/apt/lists/*
 
@@ -402,9 +437,15 @@ RUN /opt/hermes/.venv/bin/python -m docker.build_agent
 # read-only for the hermes user (go-w from the --chmod above).
 
 USER root
+# Personal Google Workspace automation uses the user's forked gog CLI.  Keep
+# the executable in the immutable image while GOG_HOME points at encrypted,
+# persistent state under /opt/data at runtime.
+COPY --chmod=0755 --from=gog_build /out/gog /opt/hermes/bin/gog
+COPY --from=cloudflared_source /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 RUN mkdir -p /opt/hermes/bin && \
     cp /opt/hermes/docker/hermes-exec-shim.sh /opt/hermes/bin/hermes && \
     chmod 0755 /opt/hermes /opt/hermes/bin/hermes && \
+    ln -s /opt/hermes/bin/gog /usr/local/bin/gog && \
     printf 'docker\n' > /opt/hermes/.install_method
 # The ``.install_method`` stamp is baked next to the running code (the install
 # tree), NOT into $HERMES_HOME. $HERMES_HOME (/opt/data) is a shared data
