@@ -873,7 +873,8 @@ class GatewaySlashCommandsMixin(
             model, rt = self._resolve_session_agent_runtime(source=source)
         except Exception:
             model, rt = None, {}
-        if not rt.get("api_key"):
+        from agent.turn_runtime_registry import route_authenticates_itself
+        if not rt.get("api_key") and not route_authenticates_itself(rt):
             return t("gateway.btw.no_provider")
         main_runtime = {
             "model": model,

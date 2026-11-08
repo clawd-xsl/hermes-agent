@@ -444,7 +444,8 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         ) from exc
 
     api_key = runtime.get("api_key", "")
-    if not api_key:
+    from agent.turn_runtime_registry import route_authenticates_itself
+    if not api_key and not route_authenticates_itself(runtime):
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
             f"Set the appropriate environment variable or run 'hermes auth'."

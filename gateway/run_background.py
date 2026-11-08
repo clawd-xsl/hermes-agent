@@ -53,7 +53,8 @@ class GatewayBackgroundMixin:
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
-            if not runtime_kwargs.get("api_key"):
+            from agent.turn_runtime_registry import route_authenticates_itself
+            if not runtime_kwargs.get("api_key") and not route_authenticates_itself(runtime_kwargs):
                 await adapter.send(source.chat_id, t("gateway.background.no_credentials"), metadata=_thread_metadata)
                 return
 

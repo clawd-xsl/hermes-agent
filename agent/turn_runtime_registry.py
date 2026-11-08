@@ -140,6 +140,12 @@ def configured_runtime_mode(provider: Any) -> Optional[str]:
     return overlay["api_mode"] if overlay else None
 
 
+def route_authenticates_itself(runtime: Any) -> bool:
+    """True for a resolved runtime dict routed to a turn runtime: it carries no API key by design, so
+    "no api_key" gates (``/btw``, ``/background``, delegation) must not treat it as unconfigured."""
+    return isinstance(runtime, dict) and is_turn_runtime_mode(runtime.get("api_mode"))
+
+
 def call_runtime_hook(agent: Any, hook: str, *args: Any, default: Any = None, **kwargs: Any) -> Any:
     """Call ``hook`` on ``agent``'s runtime, logging (not raising) a failure; ``default`` when the
     agent has no runtime or the hook raised."""
