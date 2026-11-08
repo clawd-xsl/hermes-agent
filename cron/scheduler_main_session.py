@@ -22,6 +22,8 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _ACCEPT_TIMEOUT_SECONDS = 30
+#: Run-side job flag: this fire was committed to the main conversation.
+MAIN_FIRE_FLAG = "_main_session_fire"
 
 
 def _user_config() -> dict:
@@ -66,6 +68,10 @@ def prepare_fire(job: dict, job_id: str, job_name: str, extra_prompt, cancel_eve
     early, prompt = prepare(job, job_id, job_name, extra_prompt, cancel_event, main)
     if early is None and main:
         early = run_main_session_fire(job, job_id, job_name, prompt)
+        if early[0]:
+            # Rides back to the firing scheduler (gateway.session_cron.RUN_JOB_FLAGS): the fire's own
+            # cron session never held its turn, so bookkeeping drops it (scheduler_authority).
+            job[MAIN_FIRE_FLAG] = True
     return early, prompt
 
 

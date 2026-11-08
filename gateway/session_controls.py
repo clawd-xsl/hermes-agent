@@ -229,6 +229,7 @@ class AuthorityConnection:
                     'kanban.run': self.kanban_run,
                     'cron.submit': self.cron_submit, 'cron.status': self.cron_status,
                     'cron.cancel': self.cron_cancel, 'cron.recover': self.cron_recover,
+                    'cron.forget': self.cron_forget,
                     'worker.register': self.worker_register, 'worker.adopt': self.worker_adopt,
                     'worker.persist': self.worker_persist,
                     'setup.status': self.setup_status, 'setup.runtime_check': self.setup_runtime_check,
@@ -401,6 +402,10 @@ class AuthorityConnection:
     async def cron_cancel(self, ref, params):
         from gateway.session_cron import rpc
         return await rpc(self, 'cancel', params)
+
+    async def cron_forget(self, ref, params):
+        from gateway.session_cron import rpc
+        return await rpc(self, 'forget', params)
 
     async def bot_roster(self, ref, params):
         from gateway.session_bot import relay_operation

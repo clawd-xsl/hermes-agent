@@ -155,7 +155,9 @@ CRON_SESSION_READ_ONLY_SURFACE = {'layer': 'gateway', 'code': 'cron_session_read
 # Run-side verdicts run_job stamps on the job dict for the firing scheduler's bookkeeping tail
 # (cron/quota_hold.py parks past a closed usage window; cron/unreachable_retry.py re-runs a
 # never-reached model). They cross the authority boundary inside the cron result.
-RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds')
+# ``_main_session_fire`` (cron/scheduler_main_session.py) marks a fire committed to the main
+# conversation, whose own cron session stays empty and is dropped once the run is booked.
+RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_main_session_fire')
 
 
 async def operation(authority, name, params, actor=None):
@@ -212,7 +214,7 @@ async def operation(authority, name, params, actor=None):
             _authorize_write=authority._admission_gate()), then=partial(authority._admitted, ref, None), ordered=True,
             after=partial(authority._schedule_admitted, ref))
         return {'session_id': ref.session_id, 'admission_id': receipt.admission_id}
-    if set(params) != {'session_id', 'admission_id'} or name not in {'status', 'cancel'}:
+    if set(params) != {'session_id', 'admission_id'} or name not in {'status', 'cancel', 'forget'}:
         raise RuntimeStoreError('invalid_params')
     ref = SessionRef(authority.profile_id, params['session_id'])
     authority.authorize(actor, ref, 'session:submit')
@@ -220,6 +222,8 @@ async def operation(authority, name, params, actor=None):
     from gateway.owner_identity import same_owner
     if row is None or row['target_session_id'] != ref.session_id or not same_owner(row['principal_id'], actor.subject):
         raise RuntimeStoreError('permission_denied')
+    if name == 'forget':
+        return {'deleted': await _forget_main_fire_session(authority, ref, row)}
     if name == 'cancel':
         if row['status'] == 'queued':
             row = await authority.cancel_or_claimed(actor, ref, row['admission_id']) or {'status': 'terminal'}
@@ -239,6 +243,23 @@ async def operation(authority, name, params, actor=None):
     from cron.scheduler_liveness import owner_progress
     return {'status': row['status'], 'result': result, 'job_flags': flags,
             'progress_at': owner_progress.get(row['request_id'].rsplit(':', 1)[-1])}
+
+
+async def _forget_main_fire_session(authority, ref, row) -> bool:
+    """Drop a settled ``session: main`` fire's own cron session: its turn ran in the main conversation,
+    so this row holds nothing. Only a terminal, successful main fire qualifies, and the delete is the
+    store's emptiness-checked one: a row that gained any message, title or child is kept."""
+    if row['status'] != 'terminal':
+        return False
+    from gateway.session_results import admission_result
+    saved = admission_result(authority.db, row['admission_id'])
+    result = (saved or {}).get('result') or {}
+    flags = result.get('cron_job_flags') or {}
+    cron_result = result.get('cron_result') or [False]
+    if not flags.get('_main_session_fire') or not cron_result[0]:
+        return False
+    sessions_dir = getattr(getattr(authority.runner, 'config', None), 'sessions_dir', None)
+    return bool(await asyncio.to_thread(authority.db.delete_session_if_empty, ref.session_id, sessions_dir))
 
 
 def _cancellations(authority):

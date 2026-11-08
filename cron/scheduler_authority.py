@@ -146,6 +146,40 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         error = f'{type(exc).__name__}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
 
+def forget_main_fire_session(receipt):
+    """Best effort, after the run is booked and its journal is gone: ask the owner to drop a
+    ``session: main`` fire's own (empty) cron session. A failure only leaves the row behind."""
+    from gateway.session_cron import owner_for_home, operation
+    from hermes_constants import get_hermes_home
+    if not isinstance(receipt, dict) or not receipt.get('session_id') or not receipt.get('admission_id'):
+        return False
+    params = {'session_id': receipt['session_id'], 'admission_id': receipt['admission_id']}
+    try:
+        owner = owner_for_home(get_hermes_home())
+        if owner is not None:
+            authority, loop = owner
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                return False  # never block the owner loop on itself; the row is harmless
+            reply = asyncio.run_coroutine_threadsafe(operation(authority, 'forget', params), loop).result(timeout=30)
+        else:
+            from hermes_cli.gateway_client import connect_gateway
+
+            async def remote():
+                async with connect_gateway() as client:
+                    return await client.rpc('cron.forget', **params)
+            reply = asyncio.run(remote())
+        return bool((reply or {}).get('deleted'))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).debug("cron: could not drop main fire session %s", params['session_id'],
+                                          exc_info=True)
+        return False
+
+
 def reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
 

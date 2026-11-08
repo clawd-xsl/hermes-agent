@@ -184,3 +184,96 @@ def test_admit_resolves_the_owning_profiles_home_and_commits_as_cron_main(monkey
     assert seen["resolve"] == ({"platform": "signal", "chat_id": "+1", "session_key": "k"}, "work")
     assert seen["enqueue"] == ("home-source", "[Scheduled task: x]\n\ny", gms.CRON_PRODUCER,
                                {"trigger": "cron", "job_id": "j1"})
+
+
+# ── The main fire's own cron session is dropped once the run is booked ───────────────────────────
+
+def test_a_committed_main_fire_marks_the_job_copy(cron_owner, monkeypatch, owner_loop):
+    async def admit(authority, job, text):
+        return SimpleNamespace(session_key="k", platform="signal", chat_id="+1", queued=False, durable=True)
+    job = {"id": "mainjob00009", "name": "inbox", "prompt": "p", "session": "main"}
+    assert _fire(cron_owner, monkeypatch, owner_loop, job, admit)[0] is True
+    assert job["_main_session_fire"] is True
+
+    async def refuse(authority, job, text):
+        raise RuntimeError("no home")
+    refused = {"id": "mainjob00010", "name": "inbox", "prompt": "p", "session": "main"}
+    assert _fire(cron_owner, monkeypatch, owner_loop, refused, refuse)[0] is False
+    assert "_main_session_fire" not in refused
+
+
+def test_the_flag_rides_back_with_the_run_result():
+    from gateway.session_cron import RUN_JOB_FLAGS
+    assert "_main_session_fire" in RUN_JOB_FLAGS
+
+
+def _submitted(tmp_path, monkeypatch, *, with_message=False):
+    from cron.jobs import create_job
+    from tests.fakes.cron_owner import cron_owner as make_owner
+    from gateway import session_cron
+    from cron import executions
+    authority = make_owner(tmp_path / "home", monkeypatch)
+    job = create_job(prompt="p", schedule="every 1h", session="main")
+    execution_id = executions.create_execution(job["id"], source="test")["id"]
+    receipt = asyncio.run(session_cron.operation(
+        authority, "submit", {"job_id": job["id"], "request_id": execution_id, "extra_prompt": None}))
+    if with_message:
+        authority.db.append_message(receipt["session_id"], role="user", content="kept")
+    return authority, receipt
+
+
+def _settle(authority, receipt):
+    """Bring the fire's admission to a terminal row, as a finished run leaves it."""
+    from gateway import session_cron
+    from hermes_state_runtime import get_session_admission
+    asyncio.run(session_cron.operation(authority, "cancel", dict(receipt)))
+    assert get_session_admission(authority.db, admission_id=receipt["admission_id"])["status"] == "terminal"
+
+
+@pytest.mark.parametrize("flags,ok,with_message,deleted", [
+    ({"_main_session_fire": True}, True, False, True),
+    ({}, True, False, False),                               # an isolated fire keeps its session
+    ({"_main_session_fire": True}, False, False, False),    # a failed fire is kept for debugging
+    ({"_main_session_fire": True}, True, True, False),      # a row that gained a message is never dropped
+])
+def test_forget_drops_only_an_empty_successful_main_fire_session(tmp_path, monkeypatch, flags, ok, with_message,
+                                                                  deleted):
+    from gateway import session_cron
+    from gateway.session_cron import SessionRef
+    authority, receipt = _submitted(tmp_path, monkeypatch, with_message=with_message)
+    try:
+        sid = receipt["session_id"]
+        _settle(authority, receipt)
+        monkeypatch.setattr("gateway.session_results.admission_result", lambda db, admission_id: {
+            "result": {"cron_result": [ok, "doc", "[SILENT]", None], "cron_job_flags": flags}})
+        row = {"status": "terminal", "admission_id": receipt["admission_id"]}
+        ref = SessionRef(authority.profile_id, sid)
+        assert asyncio.run(session_cron._forget_main_fire_session(authority, ref, row)) is deleted
+        assert (authority.db.get_session(sid) is None) is deleted
+    finally:
+        authority.db.close()
+
+
+def test_forget_refuses_an_unsettled_admission(tmp_path, monkeypatch):
+    from gateway import session_cron
+    from gateway.session_cron import SessionRef
+    authority, receipt = _submitted(tmp_path, monkeypatch)
+    try:
+        row = {"status": "queued", "admission_id": receipt["admission_id"]}
+        ref = SessionRef(authority.profile_id, receipt["session_id"])
+        assert asyncio.run(session_cron._forget_main_fire_session(authority, ref, row)) is False
+        assert authority.db.get_session(receipt["session_id"]) is not None
+    finally:
+        authority.db.close()
+
+
+def test_bookkeeping_forgets_after_the_journal_is_gone(tmp_path, monkeypatch):
+    import json
+    from cron import scheduler_bookkeeping as bookkeeping
+    journal = tmp_path / "journal.json"
+    journal.write_text(json.dumps({"receipt": {"session_id": "s", "admission_id": "a"}}))
+    job = {"_main_session_fire": True}
+    receipt = bookkeeping._main_fire_receipt(job, journal)
+    assert receipt == {"session_id": "s", "admission_id": "a"}
+    assert "_main_session_fire" not in job
+    assert bookkeeping._main_fire_receipt({}, journal) is None

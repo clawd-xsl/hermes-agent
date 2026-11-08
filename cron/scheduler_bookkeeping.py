@@ -125,5 +125,22 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     if job.get("last_delivery_queued"):
         # A drain that settled before this run's own bookkeeping landed found nothing to fence on.
         settle_quietly(job["id"], execution_id)
+    main_fire_receipt = _main_fire_receipt(job, journal) if d.success else None
     journal.unlink(missing_ok=True)
+    if main_fire_receipt is not None:
+        # After the journal is gone, so a crash in between leaves at worst an empty row, never a
+        # receipt whose session recovery would read as a lost fire.
+        from cron.scheduler_authority import forget_main_fire_session
+        forget_main_fire_session(main_fire_receipt)
     return True
+
+
+def _main_fire_receipt(job: dict, journal) -> Optional[dict]:
+    """The admission receipt of a successful ``session: main`` fire (its cron session stayed empty)."""
+    if not job.pop("_main_session_fire", False):
+        return None
+    try:
+        import json
+        return json.loads(journal.read_text(encoding="utf-8-sig")).get("receipt")
+    except Exception:
+        return None

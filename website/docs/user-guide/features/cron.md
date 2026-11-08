@@ -681,6 +681,8 @@ create the job from the intended home chat so Hermes can pick it (the job's orig
 DM home that never received a message is rebuilt from its chat id; a group or thread home must have
 seen one message first, so its exact session can be recovered. A fire main cannot accept is recorded
 as a failed run. `no_agent: true` stays script-only and cannot be combined with `session: main`.
+A successful main fire leaves no per-run cron session behind: its turn lives in the main
+conversation, so the empty run session is dropped once the run is recorded (a failed fire keeps it).
 
 Because a main fire reuses the existing agent, standalone-job settings — a per-job model/provider,
 `enabled_toolsets`, `workdir`, `deliver`, `attach_to_session` / `cron.mirror_delivery` — do not
