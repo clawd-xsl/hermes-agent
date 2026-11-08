@@ -68,7 +68,7 @@ token). Other sessions do not see it.
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `cronjob_manage` | Unified scheduled-task manager. Use `action="create"`, `"list"`, `"update"`, `"pause"`, `"resume"`, `"run"`, or `"remove"` to manage jobs. Supports skill-backed jobs with one or more attached skills, and `skills=[]` on update clears attached skills. Cron runs happen in fresh sessions with no current-chat context. | — |
+| `cronjob_manage` | Unified scheduled-task manager. Use `action="create"`, `"list"`, `"update"`, `"pause"`, `"resume"`, `"run"`, or `"remove"` to manage jobs. Supports skill-backed jobs with one or more attached skills, and `skills=[]` on update clears attached skills. Cron runs happen in fresh sessions with no current-chat context unless `session="main"` queues them as turns in the gateway home conversation. | — |
 
 ## `delegation` toolset
 

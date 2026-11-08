@@ -84,8 +84,12 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. Payload fields are untrusted — see [Authenticated does not mean trusted](#authenticated-does-not-mean-trusted). |
 | `filters` | No | Declarative payload filters evaluated after auth/body/event filtering and before agent or direct delivery work. Non-matches return `{"status":"ignored","reason":"filter"}` with HTTP 200. |
 | `script` | No | Filter/transform script under `~/.hermes/scripts/`. The webhook payload is passed as JSON on stdin. JSON object stdout replaces the payload before templating; text stdout is exposed as `script_output`; empty stdout, `[SILENT]`, or a nonzero exit code ignores the webhook. |
-| `skills` | No | List of skill names to load for the agent run. |
+| `skills` | No | List of skill names to load for the agent run. On a reviewed `session: main` route the reviewer stays minimal; the skill applies to the handoff that enters main. |
 | `toolsets` | No | List of toolset keys (e.g. `["terminal", "file", "web"]`) that **replaces** the platform-level webhook toolset for runs triggered by this route only. Manual config edit only — not settable via `hermes webhook subscribe`, so agent-created subscriptions cannot self-grant elevated tools. Names are validated the same way as `platform_toolsets` entries (unknown or platform-restricted names are dropped). See [Per-route toolsets](#per-route-toolsets). |
+| `session` | No | `isolated` (default) runs each event in its own one-shot session. `main` sends it into the gateway home conversation — by default through a one-shot reviewer (`filter_before_main`). Platform-wide default: `platforms.webhook.extra.session`. See [Route into the main conversation](#route-into-the-main-conversation). |
+| `filter_before_main` | No | `session: main` only. Default `true`: a zero-tool, read-only-memory reviewer runs first; a bare `NO_REPLY` drops the event, any other reply is the handoff that wakes main. `false` (trusted senders only) commits the rendered prompt straight into main. Platform default under `platforms.webhook.extra`. |
+| `model` / `provider` | No | Model for the route's isolated run or main-session reviewer. Falls back to `platforms.webhook.extra.model` / `.provider`, then normal resolution. Never changes the main conversation's model. |
+| `retain_sessions` | No | Default `true`. `false` deletes each delivery's one-shot session (isolated run or reviewer) from `state.db` once it completed; failed runs, and reviewers whose handoff could not enter main, are kept. Platform default under `platforms.webhook.extra`. |
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant` (plugin), `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
@@ -102,6 +106,10 @@ platforms:
     extra:
       port: 8644
       secret: "global-fallback-secret"
+      session: "isolated"        # platform-wide default; may be "main"
+      model: "sonnet"            # default model for isolated webhook runs
+      provider: "anthropic"
+      retain_sessions: true      # false: drop each completed one-shot session
       routes:
         github-pr:
           events: ["pull_request"]
@@ -122,11 +130,60 @@ platforms:
         deploy-notify:
           events: ["push"]
           secret: "deploy-secret"
+          model: "anthropic/claude-sonnet-4.6"  # optional per-route override
+          provider: "openrouter"
           prompt: "New push to {repository.full_name} branch {ref}: {head_commit.message}"
           filters:
             - field: "ref"
               equals: "refs/heads/main"
           deliver: "telegram"
+```
+
+### Route into the main conversation {#route-into-the-main-conversation}
+
+For a personal assistant, external events often need the context of the ongoing chat. Set
+`session: main` on a route, or once under `platforms.webhook.extra` for every agent-backed route:
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      session: main
+      filter_before_main: true   # the default
+      model: haiku               # the reviewer's model; main keeps its own
+      routes:
+        personal-events:
+          secret: "route-secret"
+          prompt: "New mail from {from}: {subject}\n\n{snippet}"
+```
+
+Each authenticated event first runs a **reviewer**: an ordinary durable webhook delivery (committed
+before the `202`, deduplicated on provider retries, resumed after a restart) with the normal system
+prompt and memory recall, but **no tools**, no memory/context write-back and no background review.
+It answers `NO_REPLY` (the event ends there) or a concise, self-contained handoff, which is capped at
+2,000 characters, gets the route's `skills`, and enters the home conversation as
+`[External event: <route> / <event>]` followed by the handoff. The raw payload and the reviewer's
+transcript never enter main; the reviewer's own session follows `retain_sessions`.
+
+Main then runs it like any other turn: an in-flight turn is not interrupted, simultaneous events stay
+separate turns in arrival order, and the answer goes out through the home chat with the main
+conversation's history, memory, skills, model and persistent provider session. The `202` body says
+`"session": "main"` and `"reviewing": true`.
+
+For a trusted sender that should reach main verbatim, set `filter_before_main: false`: the rendered
+prompt (with `skills`) is committed to main directly. If main cannot accept it (no running gateway,
+no connected `home_channel`, a draining gateway) the POST answers `503` and releases the delivery id
+so the sender's retry is processed; a reviewer whose handoff main refuses fails its send and keeps its
+session. The route's `deliver` target does not apply in main mode — main delivers its own answer.
+
+Dynamic subscriptions take the same choice:
+
+```bash
+hermes webhook subscribe personal-events --session main \
+  --prompt "New mail from {from}: {subject}"
+# trusted source, no review:
+hermes webhook subscribe ci-alerts --session main --no-filter-before-main
 ```
 
 ### Payload Filters
@@ -439,6 +496,7 @@ hermes webhook subscribe antenna-matches \
 
 - `deliver_only: true` requires `deliver` to be a real target. `deliver: log` (or omitting `deliver`) is rejected at startup — the adapter refuses to start if it finds a misconfigured route.
 - The `skills` field is ignored in direct delivery mode (no agent runs, so there's nothing to inject skills into).
+- `session` is ignored in direct delivery mode (and on `cron_job` routes): no conversation turn exists.
 - Template rendering uses the same `{dot.notation}` syntax as agent mode, including the `{__raw__}` token.
 - Idempotency uses the same `X-GitHub-Delivery` / `X-Request-ID` header — retries with the same ID return `status=duplicate` and do NOT re-deliver.
 
@@ -579,6 +637,7 @@ Behavior and safety properties:
 
 - The route list **replaces** the platform-level webhook toolset resolution for that route's runs (it is not merged).
 - Names are validated through the same path as `platform_toolsets` config — unknown names and platform-restricted toolsets are dropped.
+- A `session: main` reviewer always runs with **no** tools, whatever the route's `toolsets` grant.
 - `hermes webhook subscribe` deliberately does **not** accept a toolsets flag. Granting elevated tools is a manual config-file edit, so an agent creating its own subscription at runtime cannot self-grant `terminal`.
 - Only grant elevated toolsets to routes whose senders you fully control, with a real HMAC secret. Anyone who can POST a validly-signed payload to that route is effectively running an agent with those tools.
 

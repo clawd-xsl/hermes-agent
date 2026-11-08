@@ -105,6 +105,10 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   post-restore re-exec must replay the whole worker, never land after the ack with the payload
   gone and no dependency boot.
 - Cron sessions pass `skip_memory=True`; memory providers intentionally do not run during cron.
+- `session: main` (per job, default `cron.session`) is the one exception to the next rule: the fire
+  keeps every pre-agent gate, then commits its prompt to the gateway home conversation's FIFO
+  (`scheduler_main_session.py` → `gateway/main_session.py`) and builds no agent; it answers
+  `[SILENT]` so the scheduler delivers nothing itself.
 - Cron execution has its own session. Eligible continuable deliveries may mirror or seed the
   reply-facing conversation: origin, origin-less home fallback, user-written bare-platform home,
   or opted-in explicit targets. `all` expansions do not gain home mirror eligibility. Mirrored

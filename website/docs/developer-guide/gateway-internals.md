@@ -716,6 +716,17 @@ every producer identity, a "N background process results" header), cancelling th
 the same transaction. Only the tail folds, so a prompt queued after a completion keeps its place
 between them; a waiting row claimed first leaves the new completion to queue alone.
 
+Main-session automation (`gateway/main_session.py`) is how a cron fire or a webhook event with
+`session: main` reaches the gateway home conversation. It resolves the home source exactly (the job's
+captured session key, then the newest live source, then the persisted routing index; a never-seen DM
+home is rebuilt from its chat id, a never-seen group/thread home is refused) and commits the text as
+a producer wake (`admit_route_wake`, producers `cron-main` / `webhook-main`, which follow the route
+across /new like `kanban-wake`). Without a committed route envelope it falls back to
+`admit_internal_event`, still its own FIFO turn. The receipt is FIFO admission only. A reviewed
+webhook route runs a one-shot reviewer first (`gateway/platforms/webhook_main.py`): a durable
+webhook delivery with `chat_type="webhook_review"`, zero tools, `skip_memory_sync` and no background
+review, whose only destination is main.
+
 Cron execution has its own session. Eligible continuable deliveries may mirror or seed the
 reply-facing conversation: origin, origin-less home fallback, user-written bare-platform home,
 or opted-in explicit targets. `all` expansions do not gain home mirror eligibility. Mirrored

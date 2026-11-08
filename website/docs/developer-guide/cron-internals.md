@@ -433,7 +433,7 @@ The `[SILENT]` prefix in a cron response suppresses delivery entirely — useful
 
 ### Session Isolation
 
-Cron deliveries are NOT mirrored into gateway session conversation history. They exist only in the cron job's own session. This prevents message alternation violations in the target chat's conversation.
+Cron deliveries are NOT mirrored into gateway session conversation history. They exist only in the cron job's own session. This prevents message alternation violations in the target chat's conversation. A `session: main` job is the exception by construction: `cron/scheduler_main_session.py` commits the prepared prompt to the home conversation's FIFO (`gateway/main_session.py`, a producer wake like Kanban's) instead of building an agent, and that conversation's own turn delivers the answer.
 
 ## Recursion Guard
 
