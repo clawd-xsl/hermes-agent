@@ -1,0 +1,5 @@
+name: claude_cli
+version: 1.0.0
+description: "Persistent Claude Code runtime: Hermes turns on one long-lived claude process per session (native history, prompt cache and compaction; Hermes tools over a private MCP loopback). Selected by model.anthropic_runtime: claude_cli."
+author: clawd-xsl
+kind: backend
