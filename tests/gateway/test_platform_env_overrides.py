@@ -7,6 +7,8 @@ from gateway.platform_registry import platform_registry
 
 # Core-only platforms keep their env rows in gateway/config_env.py.
 _CORE_ONLY = {"local", "api_server", "webhook", "msgraph_webhook", "relay"}
+# Configured in config.yaml only: signal-ts has no env credential to enable it from.
+_CONFIG_ONLY = {"signal"}
 
 
 def _entries():
@@ -21,12 +23,19 @@ def test_every_static_plugin_platform_declares_its_env_bridge():
     _entries()
     missing = []
     for member in Platform:
-        if member.value in _CORE_ONLY:
+        if member.value in _CORE_ONLY | _CONFIG_ONLY:
             continue
         entry = platform_registry.get(member.value)
         if entry is None or not entry.env_overrides or not entry.env_enable_credentials:
             missing.append(member.value)
     assert missing == []
+
+
+def test_signal_only_bridges_the_home_channel_mirror():
+    _entries()
+    entry = platform_registry.get("signal")
+    assert entry.env_enable_credentials == ()
+    assert [step.keywords["env_base"] for step in entry.env_overrides] == ["SIGNAL_HOME_CHANNEL"]
 
 
 def test_env_override_secrets_stay_in_terminal_secret_blocklist():
