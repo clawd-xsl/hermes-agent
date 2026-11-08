@@ -442,6 +442,17 @@ USER root
 # persistent state under /opt/data at runtime.
 COPY --chmod=0755 --from=gog_build /out/gog /opt/hermes/bin/gog
 COPY --from=cloudflared_source /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+# The persistent Anthropic runtime (plugins/claude_cli) talks directly to
+# Claude Code's stream-JSON CLI. Pin the executable in the image so the
+# deployment does not depend on a first-boot npm install or the host PATH.
+ARG CLAUDE_CODE_VERSION=2.1.280
+# npm 12 skips the package's platform-native optional dependency, so run its
+# installer explicitly to fetch the native binary.
+RUN npm install --global --prefix /usr/local --omit=dev --no-audit --no-fund \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && \
+    node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs && \
+    claude --version && \
+    npm cache clean --force
 RUN mkdir -p /opt/hermes/bin && \
     cp /opt/hermes/docker/hermes-exec-shim.sh /opt/hermes/bin/hermes && \
     chmod 0755 /opt/hermes /opt/hermes/bin/hermes && \
