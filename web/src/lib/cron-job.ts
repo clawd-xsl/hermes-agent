@@ -1,4 +1,4 @@
-import type { CronJob, CronJobMutation } from "./api";
+import type { CronJob, CronJobMutation, CronSessionMode } from "./api";
 
 export interface CronJobFormState {
   name: string;
@@ -15,6 +15,8 @@ export interface CronJobFormState {
   continuity: boolean;
   enabled_toolsets: string[];
   workdir: string;
+  /** "" follows config `cron.session`; "main" runs each fire in the gateway home conversation. */
+  session: "" | CronSessionMode;
 }
 
 /** Split a comma/newline list (or array) into trimmed, non-empty items. */
@@ -64,6 +66,7 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     context_from: contextFrom.length > 0 ? contextFrom : null,
     enabled_toolsets: enabledToolsets.length > 0 ? enabledToolsets : null,
     workdir: optionalText(form.workdir),
+    session: form.session || null,
   };
 }
 
@@ -110,6 +113,7 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     continuity,
     enabled_toolsets: splitCronList(job.enabled_toolsets),
     workdir: asString(job.workdir),
+    session: job.session === "main" || job.session === "isolated" ? job.session : "",
   };
 }
 

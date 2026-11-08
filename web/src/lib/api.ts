@@ -1759,6 +1759,10 @@ export interface WebhookRoute {
   url: string;
   secret_set: boolean;
   enabled: boolean;
+  /** null follows `platforms.webhook.extra.session` (isolated by default). */
+  session: CronSessionMode | null;
+  /** Main routes: review the event in isolation before waking main (default true). */
+  filter_before_main: boolean;
 }
 
 export interface WebhooksResponse {
@@ -1787,6 +1791,8 @@ export interface WebhookCreate {
   deliver?: string;
   deliver_only?: boolean;
   deliver_chat_id?: string;
+  session?: CronSessionMode;
+  filter_before_main?: boolean;
 }
 
 export interface CredentialPoolEntry {
@@ -2375,7 +2381,11 @@ export interface CronJobMutation {
   context_from?: string[] | null;
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
+  session?: CronSessionMode | null;
 }
+
+/** Conversation a cron fire or webhook event runs in (`session` on a job / route). */
+export type CronSessionMode = "isolated" | "main";
 
 export interface CronJob {
   id: string;
@@ -2400,6 +2410,7 @@ export interface CronJob {
   context_from?: string[] | string | null;
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
+  session?: CronSessionMode | null;
   last_run_at?: string | null;
   next_run_at?: string | null;
   /** Seconds since the job's profile ticker last iterated; null when it cannot be dated. */

@@ -29,6 +29,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     continuity: false,
     enabled_toolsets: [],
     workdir: "",
+    session: "",
     ...overrides,
   };
 }
@@ -89,6 +90,7 @@ describe("buildCronJobPayload", () => {
       context_from: null,
       enabled_toolsets: null,
       workdir: null,
+      session: null,
     });
   });
 });
@@ -139,6 +141,15 @@ describe("cronJobFormFromJob", () => {
       context_from: "upstream-a",
       continuity: true,
     });
+  });
+
+  it("round-trips an explicit main conversation and treats junk as the default", () => {
+    const main: CronJob = { id: "main-job", enabled: true, session: "main" };
+    const jobForm = cronJobFormFromJob(main);
+    expect(jobForm.session).toBe("main");
+    expect(buildCronJobPayload(jobForm).session).toBe("main");
+    const odd = { id: "odd", enabled: true, session: "fork" } as unknown as CronJob;
+    expect(cronJobFormFromJob(odd).session).toBe("");
   });
 
   it("prefers one-shot run_at over the human display string", () => {

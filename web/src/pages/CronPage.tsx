@@ -156,6 +156,7 @@ function emptyCronJobForm(): CronJobEditorState {
     continuity: false,
     enabled_toolsets: [],
     workdir: "",
+    session: "",
     scheduleState: { ...DEFAULT_SCHEDULE_STATE },
   };
 }
@@ -288,6 +289,19 @@ function CronAdvancedFields({
               placeholder="relative/path/in/scripts"
             />
           </div>
+        </div>
+
+        <div className="grid gap-1">
+          <Label htmlFor={`${idPrefix}-session`}>Conversation</Label>
+          <Select
+            id={`${idPrefix}-session`}
+            value={form.session}
+            onValueChange={(v) => update("session", v as CronJobEditorState["session"])}
+          >
+            <SelectOption value="">Default (cron.session)</SelectOption>
+            <SelectOption value="isolated">Isolated: a fresh session per run</SelectOption>
+            <SelectOption value="main">Main: a turn in the gateway home conversation</SelectOption>
+          </Select>
         </div>
 
         <div className="grid gap-1">
@@ -1177,6 +1191,11 @@ export default function CronPage() {
                     )}
                     {mode !== "agent" && (
                       <Badge tone="outline">{mode}</Badge>
+                    )}
+                    {job.session && (
+                      <Badge tone="outline" title="Conversation each run uses">
+                        {job.session}
+                      </Badge>
                     )}
                     {modelDisplay && (
                       <Badge tone="outline" title={modelDisplay}>

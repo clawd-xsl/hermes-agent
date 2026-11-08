@@ -15,7 +15,7 @@ import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { H2 } from "@nous-research/ui/ui/components/typography/h2";
 import { api } from "@/lib/api";
-import type { WebhookRoute, WebhooksResponse } from "@/lib/api";
+import type { CronSessionMode, WebhookRoute, WebhooksResponse } from "@/lib/api";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
@@ -75,6 +75,8 @@ export default function WebhooksPage() {
   const [events, setEvents] = useState("");
   const [deliver, setDeliver] = useState("log");
   const [deliverOnly, setDeliverOnly] = useState(false);
+  const [session, setSession] = useState<"" | CronSessionMode>("");
+  const [filterBeforeMain, setFilterBeforeMain] = useState(true);
   const [prompt, setPrompt] = useState("");
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<CreatedWebhook | null>(null);
@@ -181,6 +183,8 @@ export default function WebhooksPage() {
     setEvents("");
     setDeliver("log");
     setDeliverOnly(false);
+    setSession("");
+    setFilterBeforeMain(true);
     setPrompt("");
   }, []);
 
@@ -201,6 +205,8 @@ export default function WebhooksPage() {
         events: eventsList.length ? eventsList : undefined,
         deliver,
         deliver_only: deliverOnly,
+        session: session || undefined,
+        filter_before_main: session === "main" ? filterBeforeMain : undefined,
         prompt: prompt.trim() || undefined,
       });
       showToast("Created ✓", "success");
@@ -432,6 +438,36 @@ export default function WebhooksPage() {
                   </div>
                 </div>
 
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="grid gap-2">
+                    <Label htmlFor="webhook-session">Conversation</Label>
+                    <Select
+                      id="webhook-session"
+                      value={session}
+                      onValueChange={(v) => setSession(v as "" | CronSessionMode)}
+                    >
+                      <SelectOption value="">Default</SelectOption>
+                      <SelectOption value="isolated">Isolated run per event</SelectOption>
+                      <SelectOption value="main">Main home conversation</SelectOption>
+                    </Select>
+                  </div>
+
+                  {session === "main" && (
+                    <div className="grid gap-2">
+                      <Label htmlFor="webhook-filter-before-main">Review first</Label>
+                      <label className="flex items-center gap-2 text-sm text-muted-foreground h-9">
+                        <input
+                          id="webhook-filter-before-main"
+                          type="checkbox"
+                          checked={filterBeforeMain}
+                          onChange={(e) => setFilterBeforeMain(e.target.checked)}
+                        />
+                        Wake main only when a one-shot review says it matters
+                      </label>
+                    </div>
+                  )}
+                </div>
+
                 <div className="grid gap-2">
                   <Label htmlFor="webhook-prompt">Prompt</Label>
                   <textarea
@@ -553,6 +589,11 @@ export default function WebhooksPage() {
                   <Badge tone="outline">{sub.deliver}</Badge>
                   {sub.deliver_only && (
                     <Badge tone="secondary">deliver only</Badge>
+                  )}
+                  {sub.session === "main" && (
+                    <Badge tone="secondary">
+                      {sub.filter_before_main ? "main · reviewed" : "main · direct"}
+                    </Badge>
                   )}
                   {!sub.enabled && <Badge tone="warning">disabled</Badge>}
                 </div>
