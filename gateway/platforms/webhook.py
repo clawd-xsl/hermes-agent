@@ -6,7 +6,7 @@ deliver/deliver_extra, deliver_only (rendered prompt IS the message), cron_job (
 job per event; the rendered prompt is transient per-run context; exclusive with deliver_only), mirror_to_session
 (opt-in: a delivered response is also written into the target chat's transcript so follow-ups there have
 context), session (isolated | main: the event enters the gateway home conversation, by default through
-a one-shot reviewer — filter_before_main), model/provider (webhook_main.py). Per-route rate
+a one-shot reviewer — filter_before_main), model/provider and retain_sessions (webhook_main.py). Per-route rate
 limiting, idempotency cache, body-size caps checked before reading. Generic HMAC V2 binds a timestamp for
 replay protection; body-only V1 is deprecated but accepted with a warning."""
 
@@ -244,6 +244,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(script_timeout_seconds=self._script_timeout_seconds)
         # Opt-in per-route debounce of rapid same-entity events (route ``coalesce`` block). #92066
         self._coalescer = WebhookCoalescer(dispatch=self._spawn_agent_run, render=self._render_prompt)
+        self._failed_main_handoffs: set[str] = set()  # reviewer chat ids whose handoff failed: kept
         webhook_main.sync_model_channel_overrides(self)
 
     @property
@@ -915,8 +916,9 @@ class WebhookAdapter(BasePlatformAdapter):
             finalize_webhook(authority, receipt)
             try:
                 webhook_main.release_one_shot_session(authority, receipt)
+                await webhook_main.drop_unretained_session(self, authority, receipt, session_chat_id)
             except Exception:
-                logger.exception("[webhook] Could not release the one-shot session of %s", session_chat_id)
+                logger.exception("[webhook] Could not settle the one-shot session of %s", session_chat_id)
 
     # --- Signature validation ---
 

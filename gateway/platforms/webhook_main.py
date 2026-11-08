@@ -12,6 +12,9 @@ Route keys (each overridable per route, platform-wide default under ``platforms.
 - ``model`` / ``provider``: the isolated run's (or reviewer's) model. Delivery chat ids are one-shot,
   so each delivery inherits a stable route-scoped parent channel whose synthesized
   ``ChannelOverride`` reuses the gateway's normal channel model/credential resolution.
+- ``retain_sessions`` (default true): false deletes a successful delivery's one-shot session
+  (isolated run or reviewer) from state.db once it settled; failed runs and reviewers whose handoff
+  failed are always kept, and the main conversation is never touched.
 """
 
 from __future__ import annotations
@@ -60,6 +63,10 @@ def route_session_mode(adapter, route: dict) -> str:
 
 def route_reviews_before_main(adapter, route: dict) -> bool:
     return coerce_bool(_route_or_default(adapter, route, "filter_before_main", True), default=True)
+
+
+def route_retains_sessions(adapter, route: dict) -> bool:
+    return coerce_bool(_route_or_default(adapter, route, "retain_sessions", True), default=True)
 
 
 def route_model_override(adapter, route: dict) -> tuple[Optional[str], Optional[str]]:
@@ -141,7 +148,7 @@ async def enqueue_main(adapter, *, profile: Optional[str], text: str):
 async def handoff_to_main(adapter, chat_id: str, content: str, delivery: dict, metadata: Optional[dict]):
     """``send()`` for a reviewer delivery: only its final (notify-marked) reply is a handoff; interim
     status sends are acknowledged and dropped. A ``NO_REPLY`` never gets here (``send`` filters
-    silence first). A failed handoff fails the send."""
+    silence first). A failed handoff fails the send and keeps the reviewer's session."""
     from gateway.platforms.base import SendResult
     if not (metadata or {}).get("notify"):
         logger.debug("[webhook] Reviewer %s: non-final send not handed to main", chat_id)
@@ -159,6 +166,7 @@ async def handoff_to_main(adapter, chat_id: str, content: str, delivery: dict, m
     try:
         accepted = await enqueue_main(adapter, profile=delivery.get("profile"), text=text)
     except Exception as exc:
+        adapter._failed_main_handoffs.add(chat_id)
         logger.exception("[webhook] Reviewed main-session handoff failed route=%s chat=%s", route, chat_id)
         return SendResult(success=False, error=f"Main conversation unavailable: {exc}")
     logger.info("[webhook] Main-session review admitted route=%s session=%s queued=%s", route,
@@ -177,3 +185,21 @@ def release_one_shot_session(authority, receipt) -> None:
     except Exception:
         logger.debug("[webhook] Compression tip lookup failed for %s", sid, exc_info=True)
     release_runtime_sessions(tip, sid)
+
+
+async def drop_unretained_session(adapter, authority, receipt, chat_id: str) -> None:
+    """``retain_sessions: false``: delete a settled, successful delivery's one-shot session (with its
+    compression chain). A failed run, or a reviewer whose handoff failed, is kept for debugging."""
+    failed_handoff = chat_id in adapter._failed_main_handoffs
+    adapter._failed_main_handoffs.discard(chat_id)
+    from gateway.platforms.webhook import _WebhookDeliveryIdentity
+    route = adapter._routes.get(_WebhookDeliveryIdentity.route_from_chat_id(chat_id))
+    if (not isinstance(route, dict) or route_retains_sessions(adapter, route) or failed_handoff
+            or receipt.status != "terminal" or receipt.outcome != "completed"):
+        return
+    import asyncio
+    sid = receipt.ref.session_id
+    sessions_dir = getattr(getattr(adapter.gateway_runner, "config", None), "sessions_dir", None)
+    await asyncio.to_thread(authority.db.delete_session, sid, sessions_dir=sessions_dir,
+                            include_compression_chain=True)
+    logger.info("[webhook] Deleted one-shot session %s (retain_sessions=false)", sid)
