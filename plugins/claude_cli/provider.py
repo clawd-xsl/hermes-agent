@@ -29,7 +29,9 @@ def claude_cli_process_config(model_cfg: Optional[Mapping[str, Any]]) -> dict[st
     """``model.claude_cli.command`` / ``args`` as the runtime keys AIAgent construction reads."""
     raw = (model_cfg or {}).get("claude_cli")
     cfg = raw if isinstance(raw, Mapping) else {}
-    command = str(cfg.get("command") or "").strip()
+    # Default to the plain executable: core treats a route with a ``command`` as an external-process
+    # route that needs no API key (``hermes doctor``, the TUI model gate, delegation).
+    command = str(cfg.get("command") or "").strip() or "claude"
     raw_args = cfg.get("args")
     args = [str(arg) for arg in raw_args] if isinstance(raw_args, (list, tuple)) else []
     return {"command": command, "args": args}
@@ -49,7 +51,7 @@ def wants_persistent_binding(agent: Any) -> bool:
         return False
     if int(getattr(agent, "_delegate_depth", 0) or 0) > 0:
         return False
-    if str(getattr(agent, "platform", "") or "").strip().lower() == "cron":
+    if str(getattr(agent, "platform", "") or "").strip().lower() in {"cron", "subagent"}:
         return False
     try:
         from agent.oneshot_footprint import agent_is_oneshot
