@@ -898,7 +898,7 @@ class AIAgent(
         is almost certainly a retry of the same intent, and a prefetch keyed on the interrupted turn would
         fire against stale context. See #15218.
         """
-        if interrupted or getattr(self, "skip_memory_sync", False):
+        if interrupted or getattr(self, "skip_memory_sync", False) is True:
             return  # skip_memory_sync: a read-only turn (recall yes, write-back no)
         if not (self._memory_manager and final_response and original_user_message):
             return
