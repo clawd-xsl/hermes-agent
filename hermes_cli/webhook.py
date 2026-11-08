@@ -237,10 +237,7 @@ def _cmd_subscribe(args):
         route["deliver_only"] = True
     if getattr(args, "mirror_to_session", False):
         route["mirror_to_session"] = True
-    if getattr(args, "session", None):
-        route["session"] = args.session
-    if getattr(args, "filter_before_main", None) is not None:
-        route["filter_before_main"] = bool(args.filter_before_main)
+    route.update(_session_args(args))
     cron_job = (getattr(args, "cron_job", "") or "").strip()
     if cron_job:
         # Validate the reference up-front so a typo surfaces here, not on the first inbound event.
@@ -286,6 +283,13 @@ def _cmd_subscribe(args):
     print("\n  Configure your service to POST to the URL above.")
     print("  Use the secret for HMAC-SHA256 signature validation.")
     print("  The gateway must be running to receive events (hermes gateway run).\n")
+
+
+def _session_args(args) -> dict:
+    """``--session`` / ``--[no-]filter-before-main`` as route keys (absent flags add nothing)."""
+    fields = {"session": getattr(args, "session", None),
+              "filter_before_main": getattr(args, "filter_before_main", None)}
+    return {key: value for key, value in fields.items() if value is not None and value != ""}
 
 
 def _print_session_line(route: dict, indent: str) -> None:

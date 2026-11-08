@@ -716,11 +716,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if not self._route_processor.route_filters_match(route_config, payload, event_type, request.headers):
             logger.info("[webhook] filtered event=%s route=%s", event_type, route_name)
             return web.json_response({"status": "ignored", "reason": "filter", "route": route_name})
-        try:
-            main_mode = self._main_mode(route_config)
-        except ValueError:
-            logger.exception("[webhook] Invalid session mode for route %s", route_name)
-            return _json_error("Webhook route is misconfigured", 503)
+        # Validated with the route (connect / dynamic reload), so this cannot raise here.
+        main_mode = self._main_mode(route_config)
         # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
         # only enters the routed profile's scope later around handle_message, so enter it here.
         # See #67277.

@@ -54,13 +54,19 @@ def cron_session_mode(job: dict, cfg: Optional[dict] = None) -> str:
     return normalize_session_mode(cron_cfg.get("session") if isinstance(cron_cfg, dict) else None)
 
 
-def fire_session_mode(job: dict, job_id: str, job_name: str):
-    """``(main, early_result)`` for ``run_job``: an unknown mode fails this fire with its reason."""
+def prepare_fire(job: dict, job_id: str, job_name: str, extra_prompt, cancel_event, prepare):
+    """``run_job``'s ``(early_result, prompt)``: ``prepare`` is ``_prepare_job_prompt`` (every pre-agent
+    gate) told which conversation the fire runs in. A main fire's result is its commit to the home
+    conversation, so ``run_job`` builds no agent; an unknown hand-edited mode fails the fire."""
     try:
-        return cron_session_mode(job) == "main", None
+        main = cron_session_mode(job) == "main"
     except ValueError as exc:
         logger.error("Job '%s': %s", job_id, exc)
-        return False, (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc))
+        return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
+    early, prompt = prepare(job, job_id, job_name, extra_prompt, cancel_event, main)
+    if early is None and main:
+        early = run_main_session_fire(job, job_id, job_name, prompt)
+    return early, prompt
 
 
 def _doc(job_name: str, job_id: str, lines: list[str]) -> str:

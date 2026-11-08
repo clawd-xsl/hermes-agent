@@ -52,8 +52,8 @@ def validate_destination(delivery):
         result['mirror'] = True
         if delivery.get('route'):
             result['route'] = delivery['route']  # the mirror's label only
-    if target == MAIN_DESTINATION and delivery.get('route'):
-        result['route'] = delivery['route']  # the handoff's label and its skills
+    # A reviewer's handoff carries its route: the label and the skills it applies.
+    result.update({'route': delivery['route']} if target == MAIN_DESTINATION and delivery.get('route') else {})
     return result
 
 

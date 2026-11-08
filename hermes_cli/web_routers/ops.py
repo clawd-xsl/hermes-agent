@@ -193,6 +193,20 @@ async def enable_webhooks(profile: Optional[str] = None):
     }
 
 
+def _webhook_session_fields(body: WebhookCreate) -> dict[str, Any]:
+    """``session`` (validated: isolated | main) and ``filter_before_main`` for a new route."""
+    fields: dict[str, Any] = {}
+    if body.session is not None and str(body.session).strip():
+        from gateway.main_session import normalize_session_mode
+        try:
+            fields["session"] = normalize_session_mode(body.session)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.filter_before_main is not None:
+        fields["filter_before_main"] = bool(body.filter_before_main)
+    return fields
+
+
 @router.post("/api/webhooks")
 async def create_webhook(body: WebhookCreate, profile: Optional[str] = None):
     import hermes_cli.webhook as wh
@@ -213,12 +227,7 @@ async def create_webhook(body: WebhookCreate, profile: Optional[str] = None):
         raise HTTPException(
             status_code=400, detail="Direct delivery requires a real target (telegram, discord, …), not 'log'.",
         )
-    if body.session is not None:
-        from gateway.main_session import normalize_session_mode
-        try:
-            normalize_session_mode(body.session)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session_fields = _webhook_session_fields(body)
 
     def _snapshot():
         subscriptions = wh._load_subscriptions()
@@ -240,10 +249,7 @@ async def create_webhook(body: WebhookCreate, profile: Optional[str] = None):
         route["script"] = body.script.strip()
     if body.deliver_only:
         route["deliver_only"] = True
-    if body.session:
-        route["session"] = body.session.strip().lower()
-    if body.filter_before_main is not None:
-        route["filter_before_main"] = bool(body.filter_before_main)
+    route.update(session_fields)
     if body.deliver_chat_id:
         route["deliver_extra"] = {"chat_id": body.deliver_chat_id}
 

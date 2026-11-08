@@ -1402,9 +1402,10 @@ def _notify_context_engine_turn_complete(
     agent: Any, messages: list[dict[str, Any]], *, usage: Optional[dict[str, Any]] = None, logger: Any, **meta: Any
 ) -> None:
     """Notify the active context engine that a user turn has finished (fail-open; the engine
-    gets a copy so it cannot mutate the persisted transcript)."""
+    gets a copy so it cannot mutate the persisted transcript). A read-only memory turn
+    (``skip_memory_sync``: a classifier over an untrusted external event) is never observed."""
     engine = getattr(agent, "context_compressor", None)
-    if not _engine_overrides_hook(engine, "on_turn_complete"):
+    if getattr(agent, "skip_memory_sync", False) or not _engine_overrides_hook(engine, "on_turn_complete"):
         return
     try:
         # Structural clones: dict(m) would let a hook write into nested containers of the

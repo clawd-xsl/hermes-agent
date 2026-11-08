@@ -947,8 +947,6 @@ def _update_run_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str
         updates["enabled_toolsets"] = a["enabled_toolsets"]
     if a["attach_to_session"] is not None:
         updates["attach_to_session"] = bool(a["attach_to_session"])
-    if a["session"] is not None:
-        updates["session"] = a["session"]  # '' clears back to cron.session; update_job validates
     if a["workdir"] is not None:
         # Empty string clears; otherwise update_job() validates/normalizes.
         updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
@@ -988,8 +986,16 @@ def _update_run_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str
     return None
 
 
+def _update_session_field(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
+    """session: '' clears back to cron.session; update_job validates the mode."""
+    if a["session"] is not None:
+        updates["session"] = a["session"]
+    return None
+
+
 # Validation order is behavior (first failing field wins): keep this sequence.
-_UPDATE_STEPS = (_update_core_fields, _update_script_fields, _update_context_from, _update_run_fields)
+_UPDATE_STEPS = (_update_core_fields, _update_script_fields, _update_context_from, _update_run_fields,
+                 _update_session_field)
 
 
 def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:

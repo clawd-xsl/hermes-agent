@@ -8,7 +8,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from run_agent import AIAgent
-from tests.agent.test_skip_background_review import _run_finalize, _stub_agent_for_finalize
 
 
 def _make_agent(**kwargs) -> AIAgent:
@@ -44,12 +43,13 @@ def test_ordinary_turn_still_syncs():
 
 
 def test_context_engine_does_not_observe_the_turn(monkeypatch):
+    """finalize_turn always calls this hook; a read-only turn is dropped there."""
+    import logging
+    from types import SimpleNamespace
     import agent.conversation_loop as loop
-    calls = []
-    monkeypatch.setattr(loop, "_notify_context_engine_turn_complete", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(loop, "_engine_overrides_hook", lambda engine, hook: True)
     for flag, expected in ((True, 0), (False, 1)):
-        calls.clear()
-        agent = _make_agent(skip_memory_sync=flag)
-        _stub_agent_for_finalize(agent)
-        _run_finalize(agent)
-        assert len(calls) == expected
+        agent = SimpleNamespace(skip_memory_sync=flag, context_compressor=MagicMock(), session_id="s")
+        loop._notify_context_engine_turn_complete(agent, [{"role": "user", "content": "x"}],
+                                                  logger=logging.getLogger("t"))
+        assert agent.context_compressor.on_turn_complete.call_count == expected
