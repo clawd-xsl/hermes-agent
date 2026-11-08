@@ -1807,6 +1807,11 @@ class ClaudeCliSession:
         final_candidate = ""
         seen_message_ids: set[tuple[str, str]] = set()
         projected_tool_ids: set[str] = set()
+        # Claude Code 2.1+ emits one assistant record per content block; the
+        # reader below expects one complete record per message.
+        from plugins.claude_cli.coalesce import AssistantRecordCoalescer
+
+        events = AssistantRecordCoalescer(lambda: self._events)
         try:
             self._write_json(
                 {
@@ -1820,7 +1825,7 @@ class ClaudeCliSession:
             deadline = time.monotonic() + self.turn_timeout
             while time.monotonic() < deadline:
                 try:
-                    event = self._events.get(timeout=0.25)
+                    event = events.get(timeout=0.25)
                 except queue.Empty:
                     heartbeat_now = time.monotonic()
                     if heartbeat_now - last_activity_heartbeat >= 30.0:
