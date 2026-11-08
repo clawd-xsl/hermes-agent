@@ -154,3 +154,23 @@ def test_an_explicit_empty_toolset_override_means_zero_tools(monkeypatch):
     monkeypatch.setattr(runner, "_delivery_adapter_for", lambda source: reviewer, raising=False)
     tools = runner._resolve_enabled_toolsets_for_source({}, SimpleNamespace(), "webhook")
     assert "terminal" not in tools and "web" not in tools
+
+
+@pytest.mark.parametrize("chat_type, read_only", [("webhook_review", True), ("webhook", False)])
+def test_reviewer_agent_reads_memory_but_never_writes_back(chat_type, read_only):
+    from gateway.session_execution import GatewaySessionAgentMixin
+    from gateway.session import SessionSource
+    from gateway.config import Platform
+    built = {}
+    source = SessionSource(platform=Platform.WEBHOOK, chat_id="webhook:v2:x", chat_type=chat_type,
+                           user_id="webhook:mail")
+    ctx = SimpleNamespace(source=source, user_config={}, enabled_toolsets=[], disabled_toolsets=None,
+                          session_id="s", session_key="k", AIAgent=lambda **kw: built.update(kw) or "agent")
+    runner = SimpleNamespace(_session_db=None, _service_tier=None, _prefill_messages=None,
+                             _refresh_fallback_model=lambda: None)
+    holder = SimpleNamespace(_ctx=ctx, _runner=runner)
+    GatewaySessionAgentMixin._build_fresh_agent(holder, {"model": "m", "runtime": {}}, "webhook", None, 5,
+                                                None, {}, True)
+    assert built.get("skip_memory_sync", False) is read_only
+    assert built.get("skip_background_review", False) is read_only
+    assert built["skip_memory"] is False  # recall stays on
