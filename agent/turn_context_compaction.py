@@ -215,16 +215,10 @@ def _idle_compaction(
 
 
 def _codex_native_auto_compaction(agent: Any) -> bool:
-    """Codex app-server threads are compacted by the codex agent itself; Hermes only
-    initiates compaction in "hermes" mode."""
-    return (
-        # See #36801.
-        getattr(agent, "api_mode", None) == "codex_app_server"
-        and str(
-            getattr(agent, "codex_app_server_auto_compaction", "native") or "native"
-        ).lower()
-        in {"native", "off"}
-    )
+    """A turn runtime's thread is compacted by the runtime itself (codex app-server unless
+    ``compression.codex_app_server_auto`` is "hermes", #36801); Hermes skips its preflight."""
+    from agent.turn_runtime_registry import call_runtime_hook
+    return bool(call_runtime_hook(agent, "native_auto_compaction", default=False))
 
 
 def _preflight_compression(
@@ -303,8 +297,9 @@ def _preflight_compression(
             _compress_block_reason = f"cooldown:{_cooldown_secs:.0f}"
     elif _codex_native_auto:
         logger.info(
-            "Skipping Hermes preflight compression for codex app-server "
-            "(mode=%s); Hermes will not start thread compaction here.",
+            "Skipping Hermes preflight compression for the %s turn runtime "
+            "(codex mode=%s); Hermes will not start thread compaction here.",
+            getattr(agent, "api_mode", None),
             getattr(agent, "codex_app_server_auto_compaction", "native"),
         )
     else:

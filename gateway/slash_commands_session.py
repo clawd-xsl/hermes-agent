@@ -683,6 +683,39 @@ class GatewaySessionCommandsMixin:
             return t("gateway.compress.codex_compacted")
         return t("gateway.compress.codex_incomplete")
 
+    async def _compress_turn_runtime_session(
+        self, session_key: str, session_id: str, history: list, request,
+    ) -> Optional[str]:
+        """Manual /compress for a plugin turn runtime while the session's agent is LIVE: its native thread
+        belongs to that agent, so compact through it (the runtime's own compaction) and keep it cached.
+        ``/compress here N`` reaches the runtime as the verbatim tail it must keep. None when no live agent
+        runs this runtime (the caller then compacts through a temporary agent)."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        from agent.turn_runtime_registry import agent_turn_runtime
+
+        agent = self._cached_agent_for(session_key, lockless_fallback=True)
+        runtime = None if agent is None or agent is _AGENT_PENDING_SENTINEL else agent_turn_runtime(agent)
+        if runtime is None:
+            return None
+        msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
+        head, tail = msgs, None
+        if request.partial:
+            from hermes_cli.partial_compress import split_history_for_partial_compress
+            head, tail = split_history_for_partial_compress(msgs, request.keep_last)
+            tail = tail or None
+        compressor = getattr(agent, "context_compressor", None)
+        count_before = getattr(compressor, "compression_count", 0)
+        try:
+            await self._run_in_executor_with_context(
+                lambda: agent._compress_context(
+                    head, "", force=True, focus_topic=request.focus_topic, verbatim_tail=tail,
+                    task_id=session_id or "default"))
+        except Exception as exc:
+            return t("gateway.compress.failed", error=exc)
+        if getattr(compressor, "compression_count", 0) > count_before:
+            return t("gateway.compress.runtime_compacted", runtime=runtime.display_name)
+        return t("gateway.compress.runtime_incomplete", runtime=runtime.display_name)
+
     async def _handle_compress_command_inner(self, event: MessageEvent) -> str:
         """Handle /compress -- manually compress conversation context; ``/compress <focus>`` tells
         the summariser what to preserve. Flags/positional forms are parsed by the shared core."""
@@ -719,11 +752,20 @@ class GatewaySessionCommandsMixin:
         # the original conversation, not a default "cli" host.
         platform_key = _platform_config_key(source.platform) if source.platform else None
         model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, session_key=session_key)
-        if str(runtime_kwargs.get("api_mode") or "").lower() == "codex_app_server":
+        _api_mode = str(runtime_kwargs.get("api_mode") or "").lower()
+        if _api_mode == "codex_app_server":
             # Context lives in the server-side thread of the LIVE cached agent; a temporary agent
             # has none (and finally-eviction would destroy the real context).
             return await self._compress_codex_app_server_session(session_key, session_entry.session_id)
-        if not runtime_kwargs.get("api_key"):
+        from agent.turn_runtime_registry import is_turn_runtime_mode
+        if is_turn_runtime_mode(_api_mode):
+            live_reply = await self._compress_turn_runtime_session(
+                session_key, session_entry.session_id, history, request)
+            if live_reply is not None:
+                return live_reply
+            # No live agent: the temporary agent below binds the runtime's resumable native session
+            # (a turn runtime authenticates itself, so it carries no api_key).
+        elif not runtime_kwargs.get("api_key"):
             return t("gateway.compress.no_provider")
         # FULL transcript (tool results included), like auto-compress: user/assistant-only starves
         # tool-result pruning and can trip the protect-first/last early-return.
@@ -797,6 +839,9 @@ class GatewaySessionCommandsMixin:
         tmp_agent._print_fn = lambda *a, **kw: None
         # close() must not end the rotated session the gateway entry now points at.
         tmp_agent._end_session_on_close = False
+        # Nor tear down a turn runtime's live native session it borrowed to compact: the next real agent
+        # rebinds that warm child (``TurnRuntimeProvider.release``).
+        tmp_agent._borrows_session_runtime = True
         return tmp_agent
 
     async def _persist_manual_compression(self, tmp_agent, session_entry, source, compressed) -> None:

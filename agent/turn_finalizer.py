@@ -25,7 +25,12 @@ from agent.served_model import result_model_fields
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
 # real content and is not flagged. (#65919)
-_VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic")
+# Loop-control rows (not conversation content): verification nudges, plus the private assistant/user
+# pairs empty-response recovery and a turn runtime's cross-provider fallback use to keep role alternation.
+_VERIFICATION_CONTINUATION_FLAGS = (
+    "_verification_stop_synthetic", "_pre_verify_synthetic", "_empty_recovery_synthetic",
+    "_provider_fallback_synthetic",
+)
 
 _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
 
@@ -317,6 +322,9 @@ def _micro_compact_after_turn(agent, messages, final_response, logger, task_id) 
             and final_response
             and getattr(agent, "compression_checkpoint_required", False) is not True
             and not getattr(agent, "_persist_disabled", False)
+            # A turn runtime's native thread is the authoritative context: rewriting only the mirror
+            # would make restart/bootstrap history diverge from what the model saw.
+            and not _turn_runtime_owns_compaction(agent)
         ):
             _before = len(messages)
             # A rotating compaction earlier in this turn may have moved the agent to a child session.
@@ -614,6 +622,11 @@ def _mirror_turn_to_memory(
                 messages_snapshot=list(messages), review_memory=review_memory,
                 review_skills=review_skills,
             )
+
+
+def _turn_runtime_owns_compaction(agent) -> bool:
+    from agent.turn_runtime_registry import call_runtime_hook
+    return call_runtime_hook(agent, "owns_compaction", default=False) is True
 
 
 def finalize_turn(

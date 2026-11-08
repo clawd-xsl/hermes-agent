@@ -1482,6 +1482,9 @@ class _LoopState:
     # reports a prompt below threshold.
     max_compression_attempts: Any
     api_call_count: int = 0
+    # True once the turn was handed between a turn runtime and the generic loop (a fallback): the user
+    # row and turn context are already in place, so the next owner must not prepare them again.
+    continuation: bool = False
     final_response: Any = None
     interrupted: bool = False
     failed: bool = False
@@ -1574,6 +1577,10 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
     while s.retry_count < s.max_retries:
+        # A fallback decision (in an error handler below, or in the previous iteration) may have activated
+        # a turn runtime: it has no per-request wire, so the prepared turn goes to the runtime.
+        if (_handoff := _handoff_to_activated_runtime(agent, s)) is not None:
+            return _handoff
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result
@@ -1611,30 +1618,53 @@ def _finalize_from_state(agent: Any, s: _LoopState) -> dict[str, Any]:
 def _turn_without_loop(agent: Any, s: _LoopState, block_message: str) -> Optional[dict[str, Any]]:
     """The turn's result when it never enters the generic loop, else None. A ``pre_llm_call``
     veto finalizes with no inference request (the block message closes the transcript pair);
-    the opt-in codex app-server runtime runs the whole turn in its subprocess
-    (agent/transports/codex_app_server_session.py)."""
+    a turn runtime (the opt-in codex app-server, a plugin runtime) runs the whole turn itself."""
     if block_message:
         s.final_response, s._turn_exit_reason = block_message, PRE_LLM_BLOCK_EXIT_REASON
         return _finalize_from_state(agent, s)
-    return _codex_app_server_turn(agent, s) if agent.api_mode == "codex_app_server" else None
+    return _turn_runtime_turn(agent, s)
 
 
-def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
-    """The codex app-server's result for this turn, or None when its failure activated a fallback and the
-    generic loop retries the same user turn."""
-    codex_result = agent._run_codex_app_server_turn(
-        user_message=s.user_message, original_user_message=s.original_user_message,
-        messages=s.messages, effective_task_id=s.effective_task_id,
-        should_review_memory=s._should_review_memory, turn_id=s.turn_id,
-    )
-    from agent.turn_recovery import activate_codex_app_server_fallback
-    if not activate_codex_app_server_fallback(agent, codex_result):
-        return codex_result
+def _turn_runtime_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
+    """The turn runtime's result for this turn, or None when the agent has no runtime, or the runtime's
+    failure activated a fallback and the generic loop retries the same user turn."""
+    from agent.turn_runtime_registry import agent_turn_runtime
+    runtime = agent_turn_runtime(agent)
+    if runtime is None:
+        return None
+    result = runtime.run_turn(agent, s)
+    if result is not None:
+        return result
+    _require_failover(agent, runtime)
     # Fallback activation rewrote provider/model/api_mode: retry this same user turn on the generic
-    # loop below, keeping codex's projected rows and its failed API call in the turn's accounting.
-    s.api_call_count = int(codex_result.get("api_calls") or 0)
+    # loop below, keeping the runtime's projected rows and its failed API calls in the turn's accounting.
+    s.continuation = True
     s.active_system_prompt = _sync_failover_system_message(agent, None, s.active_system_prompt)
     return None
+
+
+def _handoff_to_activated_runtime(agent: Any, s: Any) -> Optional[dict[str, Any]]:
+    """A generic-loop fallback activated a turn runtime mid-turn: hand it the already-prepared turn
+    (user row appended, turn context run) instead of issuing an HTTP request in a mode with no wire."""
+    from agent.turn_runtime_registry import agent_turn_runtime
+    runtime = agent_turn_runtime(agent)
+    if runtime is None:
+        return None
+    s.continuation = True
+    result = runtime.run_turn(agent, s)
+    if result is None:
+        _require_failover(agent, runtime)
+        # The runtime failed over again (back to a wire mode): the loop carries on with that route.
+        s.active_system_prompt = _sync_failover_system_message(agent, None, s.active_system_prompt)
+    return result
+
+
+def _require_failover(agent: Any, runtime: Any) -> None:
+    """A runtime returning no result must have moved the agent to another route; otherwise the loop
+    would hand the same turn straight back to it forever."""
+    from agent.turn_runtime_registry import agent_turn_runtime
+    if agent_turn_runtime(agent) is runtime:
+        raise RuntimeError(f"turn runtime {runtime.name!r} returned no result without activating a fallback")
 
 
 def _run_conversation_turn(

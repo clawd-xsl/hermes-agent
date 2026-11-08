@@ -160,6 +160,8 @@ gateway:
     codex_nothing: "🗜️ Sıkıştırılacak bir şey yok: bu oturum Codex app-server çalışma zamanında çalışıyor; bağlamı, yalnızca ajan aktifken var olan Codex'e ait bir thread'de tutulur. Önce bir mesaj gönderin, sonra /compress — ya da sıfırdan başlamak için /reset kullanın."
     codex_compacted: "🗜️ Codex app-server thread'i sıkıştırıldı (thread/compact). Transkript aynası tasarım gereği değişmedi — sıkıştırılmış bağlamı artık app-server taşıyor."
     codex_incomplete: "⚠️ Codex app-server sıkıştırması tamamlanmadı — thread değişmedi. App-server günlüklerini kontrol edin, /compress komutunu yeniden deneyin veya temiz bir oturum için /reset kullanın."
+    runtime_compacted: "🗜️ {runtime} compacted its native context. The transcript mirror is unchanged by design — the runtime now carries the compacted context."
+    runtime_incomplete: "⚠️ {runtime} compaction did not complete — its context is unchanged. Retry /compress, or /reset for a clean session."
   debug:
     upload_failed: "✗ Hata ayıklama raporu yüklenemedi: {error}"
     header: "**Hata ayıklama raporu yüklendi:**"

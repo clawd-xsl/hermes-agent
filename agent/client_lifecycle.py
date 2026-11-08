@@ -264,13 +264,14 @@ class ClientLifecycleMixin:
                     abort(cached, reason=reason)
             except Exception:
                 logger.debug("Abandoned-worker drain: %s client abort failed", label, exc_info=True)
-        # Codex app-server session watches a private interrupt event.
+        # A turn runtime (codex app-server, a plugin runtime) watches its own interrupt signal.
         try:
-            request_interrupt = getattr(getattr(self, "_codex_session", None), "request_interrupt", None)
-            if callable(request_interrupt):
-                request_interrupt()
+            from agent.turn_runtime_registry import agent_turn_runtime
+            turn_runtime = agent_turn_runtime(self)
+            if turn_runtime is not None:
+                turn_runtime.request_interrupt(self)
         except Exception:
-            logger.debug("Abandoned-worker drain: codex interrupt failed", exc_info=True)
+            logger.debug("Abandoned-worker drain: turn runtime interrupt failed", exc_info=True)
         # Inline (cron-style) request abort hook, when registered.
         try:
             abort_active = getattr(self, "_active_request_abort", None)

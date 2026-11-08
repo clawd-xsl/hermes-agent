@@ -35,6 +35,10 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     if base_url_hint and base_url_host_matches(base_url_hint, "ollama.com") and not api_key_hint:
         from agent.secret_scope import get_secret
         api_key_hint = get_secret("OLLAMA_API_KEY") or None
+    from agent.turn_runtime_binding import runtime_for_route
+    turn_runtime = runtime_for_route(api_mode) if api_mode_explicit else None
+    if turn_runtime is not None:
+        return _bind_turn_runtime_route(agent, turn_runtime, entry, provider, model)
     # raw_codex=True: the main agent needs direct responses.stream() access for Codex providers.
     client, _resolved_model = resolve_provider_client(
         provider, model=model, raw_codex=True, explicit_base_url=base_url_hint, explicit_api_key=api_key_hint,
@@ -93,6 +97,37 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     return old_model, old_provider
 
 
+def _bind_turn_runtime_route(agent: Any, runtime: Any, entry: dict[str, Any], provider: str, model: str) -> tuple[str, str]:
+    """``bind_route_entry`` for an entry whose explicit ``api_mode`` names a turn runtime: no HTTP client to
+    resolve; the runtime owns inference and authenticates itself."""
+    from agent.chat_completion_helpers import (
+        _reresolve_fallback_reasoning_config, _rescope_fallback_extra_body, _update_fallback_context_compressor,
+    )
+    from agent.turn_runtime_binding import bind_turn_runtime_client, release_left_runtime
+    try:
+        from hermes_cli.model_normalize import normalize_model_for_provider
+        model = normalize_model_for_provider(model, provider)
+    except Exception as norm_err:  # health: allow BLE001 -- same contract as bind_route_entry
+        logger.warning("Could not normalize fallback model %r for provider %r: %s", model, provider, norm_err)
+    old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+    old_api_mode = agent.api_mode
+    agent._config_context_length = None
+    agent.model, agent.provider, agent.requested_provider = model, provider, provider
+    agent.api_mode = runtime.name
+    agent._reasoning_echo_flag = bool(entry.get("reasoning_echo", False))
+    from agent.turn_recovery_codex import reset_codex_reasoning_replay
+    reset_codex_reasoning_replay(agent)
+    agent._fallback_activated = True
+    bind_turn_runtime_client(agent, runtime)
+    agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
+        provider=provider, base_url="", api_mode=runtime.name, model=model)
+    _update_fallback_context_compressor(agent)
+    _reresolve_fallback_reasoning_config(agent)
+    _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+    release_left_runtime(agent, old_api_mode, old_model)
+    return old_model, old_provider
+
+
 def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     """Put ``agent`` on the runtime recorded in ``rt`` (a ``_primary_runtime``-shaped snapshot):
     identity, client, caching flags, compressor, reasoning and prompt identity. Credential pool
@@ -100,6 +135,7 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     from agent.agent_runtime_helpers import (
         _apply_primary_runtime_fields, _rebuild_primary_client, _restore_runtime_capabilities,
     )
+    left_api_mode, left_model = getattr(agent, "api_mode", None), getattr(agent, "model", None)
     _apply_primary_runtime_fields(agent, rt)
     from agent.turn_recovery_codex import reset_codex_reasoning_replay
     reset_codex_reasoning_replay(agent)
@@ -115,6 +151,8 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
         agent._use_prompt_caching = False
         agent._use_native_cache_layout = False
     _rebuild_primary_client(agent, rt, reason="restore_primary")
+    from agent.turn_runtime_binding import release_left_runtime
+    release_left_runtime(agent, left_api_mode, left_model)
     agent.context_compressor.update_model(
         model=rt["compressor_model"], context_length=rt["compressor_context_length"],
         base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
@@ -146,6 +184,11 @@ def reinstall_primary_runtime(
     _rebind_primary_credential_pool(
         agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
     )
+    from agent.turn_runtime_binding import runtime_for_route
+    if runtime_for_route(agent.api_mode) is not None:
+        # A turn runtime authenticates itself; an HTTP pool would only mislead credential recovery.
+        agent._credential_pool = None
+        agent._credential_pool_entry_id = None
     agent._fallback_activated = False
     agent._fallback_index = 0
     agent._rate_limit_backoff_count = 0

@@ -375,8 +375,9 @@ class PreparedCompaction:
     def _blocked(self, agent: Any, compressor: Any, origin: str) -> bool:
         if not getattr(agent, "compression_enabled", False) or getattr(agent, "_persist_disabled", False):
             return True  # compression off, or a background-review fork of the live session
+        from agent.turn_runtime_registry import call_runtime_hook
         if (
-            getattr(agent, "api_mode", None) == "codex_app_server"
+            call_runtime_hook(agent, "owns_compaction", default=False)
             or getattr(agent, "codex_responses_native_compaction", False)
             or getattr(compressor, "_micro_compact_enabled", False)
         ):

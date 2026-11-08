@@ -4459,7 +4459,8 @@ def _main_route_target(runtime: dict[str, Any], task: Optional[str]) -> tuple[st
     main_model = str(runtime.get("model") or _read_main_model() or "")
     runtime_base_url = str(runtime.get("base_url") or "")
     runtime_api_key = runtime.get("api_key", "")
-    runtime_api_mode = str(runtime.get("api_mode") or "")
+    from agent.auxiliary_turn_runtime import main_route_api_mode
+    runtime_api_mode = main_route_api_mode(str(runtime.get("api_mode") or ""), main_provider)
     # Latency-critical tasks (titling only) opt in to the provider's fast model. Opt-in only:
     # every settings surface defines "auto" as the main model.
     if _task_prefers_fast_model(task) and main_provider and main_provider not in {"auto", ""}:
@@ -5374,6 +5375,14 @@ def resolve_provider_client(
         # pre-filling it sends the image to a model that cannot accept one and the Portal 404s. Leave
         # ``model`` unset and let the Portal slot through; only an explicit caller model may override it.
         model = _get_aux_model_for_provider(provider) or _read_main_model_for_aux() or model
+    # A turn runtime that authenticates itself (agent/auxiliary_turn_runtime.py) serves the main
+    # provider's auxiliary calls through its own isolated client: there is no HTTP key to find.
+    from agent.auxiliary_turn_runtime import resolve_runtime_auxiliary_client
+    runtime_routed = resolve_runtime_auxiliary_client(
+        provider, model, async_mode=async_mode, is_vision=is_vision, task=task, api_mode=api_mode,
+        explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key, main_runtime=main_runtime)
+    if runtime_routed is not None:
+        return runtime_routed
     req = _ResolveRequest(
         provider, original_provider, model, async_mode, raw_codex,
         explicit_base_url, explicit_api_key, api_mode, main_runtime, is_vision, task,

@@ -120,12 +120,10 @@ def requeue_drained_steer(agent, steer_text: str) -> None:
         _set_steer_parts(agent, _steer_parts(agent) + parts)
 
 
-def _ic_codex_method(agent, name: str):
-    """Codex app-server owns its model/tool loop; return its ``name`` hook or None."""
-    if getattr(agent, "api_mode", None) != "codex_app_server":
-        return None
-    method = getattr(getattr(agent, "_codex_session", None), name, None)
-    return method if callable(method) else None
+def _ic_turn_runtime(agent):
+    """The turn runtime that owns ``agent``'s model/tool loop (codex app-server, a plugin runtime), or None."""
+    from agent.turn_runtime_registry import agent_turn_runtime
+    return agent_turn_runtime(agent)
 
 
 def _ic_abort_active_request(agent, reason: str, failure_log: str) -> None:
@@ -234,13 +232,14 @@ class InterruptControlMixin:
             )
             self._pending_redirect = None
 
-        # Codex watches a private interrupt event rather than Hermes' per-thread flag.
-        _request_interrupt = _ic_codex_method(self, "request_interrupt")
-        if _request_interrupt is not None:
+        # A turn runtime (codex app-server, a plugin runtime) watches its own interrupt signal rather
+        # than Hermes' per-thread flag.
+        _turn_runtime = _ic_turn_runtime(self)
+        if _turn_runtime is not None:
             try:
-                _request_interrupt()
+                _turn_runtime.request_interrupt(self)
             except Exception:
-                logger.debug("Failed to interrupt Codex app-server turn", exc_info=True)
+                logger.debug("Failed to interrupt %s turn", _turn_runtime.name, exc_info=True)
 
         # Cron turns request on the conversation thread (no nested interrupt-worker deadlock); their client
         # is registered here so this cross-thread interrupt can still shut the sockets.
@@ -324,24 +323,26 @@ class InterruptControlMixin:
         """Redirect the active turn without converting it into a new task: during a model request only that
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
         correction is appended as a real user message, the loop retries); during tool execution it degrades
-        to ``steer()``; Codex app-server uses native ``turn/steer``. False when no live turn / empty text."""
+        to ``steer()``; a turn runtime with native steer (Codex app-server ``turn/steer``) takes it
+        directly. False when no live turn / empty text."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
 
-        _native_steer = _ic_codex_method(self, "request_steer")
-        if _native_steer is not None:
+        _turn_runtime = _ic_turn_runtime(self)
+        if _turn_runtime is not None:
             with _ic_lock(self, "_pending_redirect_lock"):
                 if self._interrupt_requested:
                     return False
             try:
-                accepted = bool(_native_steer(cleaned))
+                accepted = _turn_runtime.request_steer(self, cleaned)
+            except Exception:
+                logger.debug("%s native steer failed", _turn_runtime.name, exc_info=True)
+                return False
+            if accepted is not None:
                 if accepted:
                     self._turn_user_intervened = True
-                return accepted
-            except Exception:
-                logger.debug("Codex app-server turn/steer failed", exc_info=True)
-                return False
+                return bool(accepted)
 
         # Never kill a tool to deliver guidance; the steer drain puts it on the final tool result.
         # A foreground terminal command would park that delivery until it exits (a 5-minute

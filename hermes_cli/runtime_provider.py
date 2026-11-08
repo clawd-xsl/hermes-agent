@@ -175,7 +175,12 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
     if not normalized:
         return None
     from agent.transports import registered_api_modes
-    return normalized if normalized in _VALID_API_MODES or normalized in registered_api_modes() else None
+    if normalized in _VALID_API_MODES or normalized in registered_api_modes():
+        return normalized
+    # A plugin turn runtime (``agent.turn_runtime_registry``) is a valid explicit mode too, e.g. a
+    # fallback entry with ``api_mode: claude_cli``.
+    from agent.turn_runtime_registry import is_turn_runtime_mode
+    return normalized if is_turn_runtime_mode(normalized) else None
 
 
 def _fallback_api_mode(provider: str, base_url: str, model: str = "") -> str:
@@ -1070,8 +1075,21 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     requested_alias = requested_provider
     requested_provider, explicit_base_url = expand_direct_api_alias(requested_provider, explicit_base_url)
     _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
+    # A plugin turn runtime that owns this provider (``agent.turn_runtime_registry``) authenticates
+    # itself, so it is resolved BEFORE the credential ladder: a login-only setup has no key for the
+    # ladder to find. Explicit --api-key/--base-url always mean the provider's own HTTP route.
+    if not (explicit_api_key or explicit_base_url):
+        plugin_runtime = _plugin_turn_runtime(requested_provider, "", requested_provider)
+        if plugin_runtime is not None:
+            return plugin_runtime
     runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
     _raise_for_credentialless_bare_custom(requested_provider, runtime)
+    if not (explicit_api_key or explicit_base_url):
+        # The ladder resolved an implicit request (``auto``) to a provider a plugin runtime claims.
+        plugin_runtime = _plugin_turn_runtime(runtime.get("provider", ""), runtime.get("api_mode", ""),
+                                              requested_provider)
+        if plugin_runtime is not None:
+            return plugin_runtime
     # model.openai_runtime is applied ONCE, after the ladder: every rung (pool, OAuth store,
     # explicit --api-key/--base-url, env key) hardcodes the wire api_mode for openai/openai-codex,
     # so applying the opt-in inside one rung left the others on codex_responses (#115169).
@@ -1085,6 +1103,23 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     from hermes_cli.runtime_provider_missing_key import raise_if_declared_key_missing
     raise_if_declared_key_missing(requested_provider, runtime, _get_model_config(), _FROZEN_RUNTIME_CONFIG.get(),
                                   explicit_api_key=explicit_api_key)
+    return runtime
+
+
+def _plugin_turn_runtime(provider: str, api_mode: str, requested_provider: str) -> Optional[dict[str, Any]]:
+    """The runtime dict for a plugin turn runtime opting ``provider`` in via config, else None."""
+    if not provider or provider == "auto":
+        return None
+    from agent.turn_runtime_registry import resolve_runtime_overlay
+    overlay = resolve_runtime_overlay(provider=provider, api_mode=api_mode, model_cfg=_get_model_config())
+    if overlay is None:
+        return None
+    runtime: dict[str, Any] = {
+        "provider": provider, "base_url": "", "api_key": "", "source": overlay["api_mode"],
+        "credential_pool": None, "requested_provider": requested_provider,
+    }
+    runtime.update(overlay)
+    logger.debug("Turn runtime %s owns provider %s", overlay["api_mode"], provider)
     return runtime
 
 

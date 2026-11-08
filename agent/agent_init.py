@@ -291,6 +291,13 @@ _EXPLICIT_API_MODES = {
 }
 
 
+def _is_turn_runtime_mode(api_mode) -> bool:
+    if not api_mode or api_mode in _EXPLICIT_API_MODES:
+        return False
+    from agent.turn_runtime_registry import is_turn_runtime_mode
+    return is_turn_runtime_mode(api_mode)
+
+
 def _resolve_api_mode(agent, api_mode, provider_name, base_url):
     """Set ``agent.api_mode`` (and provider rewrites) — ordered ladder, first match wins."""
     from hermes_cli.providers import is_actual_route
@@ -298,9 +305,11 @@ def _resolve_api_mode(agent, api_mode, provider_name, base_url):
     host, url = agent._base_url_hostname, agent._base_url_lower
     if is_actual_route(agent.provider, base_url):
         agent.api_mode = "chat_completions"
-    elif api_mode in _EXPLICIT_API_MODES or (api_mode and api_mode in registered_api_modes()):
-        # A provider plugin's own dialect (``register_transport(api_mode, cls)``) is as explicit
-        # as the in-tree modes; rewriting it to chat_completions silently dropped its transport.
+    elif api_mode in _EXPLICIT_API_MODES or (api_mode and api_mode in registered_api_modes()) \
+            or _is_turn_runtime_mode(api_mode):
+        # A provider plugin's own dialect (``register_transport(api_mode, cls)``) or a plugin turn
+        # runtime is as explicit as the in-tree modes; rewriting it to chat_completions silently
+        # dropped its transport.
         agent.api_mode = api_mode
     elif agent.provider in {"openai-codex", "xai", "xai-oauth"}:
         agent.api_mode = "codex_responses"
@@ -948,6 +957,15 @@ def _build_client(agent, api_key, base_url, fallback_model):
     # responses.stream()). One provider/model timeout up front so every path applies it.
     agent._anthropic_client = None
     agent._is_anthropic_oauth = False
+    from agent.turn_runtime_registry import agent_turn_runtime
+    _turn_runtime = agent_turn_runtime(agent)
+    if _turn_runtime is not None:
+        # Wire-client invariants every later reader (fallback snapshot, rebuild after interrupt) expects.
+        agent._client_kwargs = {}
+        agent.client = None
+        if _turn_runtime.init_client(agent):
+            # The runtime owns inference and authentication: no HTTP client for the main model.
+            return
     _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
     if agent.api_mode == "anthropic_messages":
         _init_anthropic_client(agent, api_key, base_url, _provider_timeout)

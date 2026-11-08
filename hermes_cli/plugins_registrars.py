@@ -88,6 +88,12 @@ _SCOPED_PROVIDER_REGISTRARS: tuple[tuple[str, str, str, str, str, str, dict[str,
      "``delegation.backend``. It decides each ``delegate_task`` task's route (model/provider or a Hermes "
      "profile) and may add per-task schema parameters; core keeps the subagent lifecycle.",
      {"normalize": "lower"}),
+    ("register_turn_runtime", "turn_runtime", "agent.turn_runtime_registry",
+     "agent.turn_runtime_provider:TurnRuntimeProvider", "turn runtime",
+     "Register an :class:`agent.turn_runtime_provider.TurnRuntimeProvider`; ``provider.name`` is the "
+     "``api_mode`` whose turns it owns (selected through its ``resolve_runtime`` overlay). Built-in "
+     "runtime names are refused. In-process only: the runtime drives live agents.",
+     {"normalize": "lower"}),
 )
 
 _NAME_NORMALIZERS: dict[Optional[str], Optional[Callable[[str], str]]] = {

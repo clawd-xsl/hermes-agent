@@ -41,6 +41,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     "_kanban_stop_synthetic",  # kanban worker stop-guard
     "_dropped_toolcall_nudge",  # internal retry instruction; must not replay as user context
+    "_provider_fallback_synthetic",  # bridge pair when a turn runtime's failure hands the turn to a fallback
 )
 
 _IMAGE_PART_TYPES = {"image", "image_url", "input_image"}

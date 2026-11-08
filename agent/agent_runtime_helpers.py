@@ -1125,7 +1125,14 @@ def _build_anthropic_client_from_runtime(agent, rt: dict[str, Any]) -> None:
 
 
 def _rebuild_primary_client(agent, rt: dict[str, Any], *, reason: str) -> None:
-    """Rebuild the primary client from a ``_primary_runtime`` snapshot (MoA facade / native Anthropic / OpenAI wire)."""
+    """Rebuild the primary client from a ``_primary_runtime`` snapshot (turn runtime / MoA facade / native
+    Anthropic / OpenAI wire)."""
+    from agent.turn_runtime_binding import bind_turn_runtime_client, runtime_for_route
+    turn_runtime = runtime_for_route(agent.api_mode)
+    if turn_runtime is not None:
+        # The runtime owns inference: its snapshot has no client_kwargs to rebuild from.
+        bind_turn_runtime_client(agent, turn_runtime)
+        return
     if (agent.provider or "").strip().lower() == "moa":
         # MoA has empty client_kwargs; rebuild via the shared facade factory so the
         # reference_callback relay survives recovery.
@@ -2234,6 +2241,15 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
     # Empty base_url while the provider changes means upstream resolution failed; falling back to
     # the old provider's URL pairs the wrong host and persists via _primary_runtime. Fail loud.
     # Same-provider re-select (credential refresh) may keep the URL.
+    from agent.turn_runtime_binding import bind_turn_runtime_client, runtime_for_route
+    turn_runtime = runtime_for_route(api_mode)
+    if turn_runtime is not None:
+        # A turn runtime owns its own transport and auth: no endpoint, key or pool by design.
+        agent.api_mode = api_mode
+        from agent.turn_recovery_codex import reset_codex_reasoning_replay
+        reset_codex_reasoning_replay(agent)
+        bind_turn_runtime_client(agent, turn_runtime)
+        return
     if base_url:
         agent.base_url = base_url
     elif old_norm != new_norm:
@@ -2444,6 +2460,9 @@ def switch_model(
     _reset_stale_streak(agent)
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
     _finish_switch(agent, new_provider, old_norm, new_norm)
+    # A turn runtime's child is scoped to its model/route: retire it once the swap has committed.
+    from agent.turn_runtime_binding import release_left_runtime
+    release_left_runtime(agent, snapshot.get("api_mode"), old_model)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,

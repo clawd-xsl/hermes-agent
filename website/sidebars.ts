@@ -821,6 +821,7 @@ const sidebars: SidebarsConfig = {
                 'developer-guide/browser-provider-plugin',
                 'developer-guide/terminal-environment-plugin',
                 'developer-guide/delegation-provider-plugin',
+                'developer-guide/turn-runtime-plugin',
                 'developer-guide/plugins/application-declarations',
                 'developer-guide/plugins/catalog-submission',
               ],

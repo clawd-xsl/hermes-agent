@@ -1759,9 +1759,12 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     agent._cached_system_prompt = sp
 
 
-def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
+def _fallback_entry_key(fb: dict) -> tuple[str, str, str, str]:
+    # api_mode is part of the key: the same provider+model over HTTP and over a turn runtime
+    # (``api_mode: claude_cli``) are separate chain entries with separate availability.
     return (str(fb.get("provider") or "").strip().lower(), str(fb.get("model") or "").strip(),
-            str(fb.get("base_url") or "").strip().rstrip("/"))
+            str(fb.get("base_url") or "").strip().rstrip("/"),
+            str(fb.get("api_mode") or fb.get("transport") or "").strip().lower())
 
 
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
@@ -1964,9 +1967,12 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
     # See #22548, #62984, #70893.
     from agent.backend_identity import BackendIdentity, should_skip_candidate
+    from agent.turn_runtime_binding import runtime_identity_base_url
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
-        model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
-    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
+        model=getattr(agent, "model", ""),
+        base_url=runtime_identity_base_url(getattr(agent, "api_mode", None), getattr(agent, "base_url", "")))
+    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=runtime_identity_base_url(
+        fb.get("api_mode") or fb.get("transport"), fb.get("base_url") or ""))
     if should_skip_candidate(fb_ident, current_ident):
         logger.warning(
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",

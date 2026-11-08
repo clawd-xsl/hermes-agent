@@ -927,9 +927,10 @@ class AIAgent(
         # and a cross-thread close can release TLS FDs under a still-unwinding worker.
         _quietly(self._drop_shared_client, lambda c: self._retire_shared_openai_client(c, reason="cache_evict"))
         self._close_request_clients("cache_evict")
-        # The Codex app-server child is an LLM client, not session tool state: the evicted instance is popped
-        # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
-        _quietly(self._close_codex_session)
+        # A turn runtime's child (the Codex app-server) is an LLM client, not session tool state: the evicted
+        # instance is popped from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks
+        # for the gateway's life. A runtime may instead keep a resumable child pooled across the rebuild.
+        self._release_turn_runtimes(hard=False)
         if getattr(self, "_memory_manager", None) is not None:
             _quietly(self._memory_manager.release_soft)
         from agent.prepared_compaction import release_for_agent
@@ -946,7 +947,7 @@ class AIAgent(
         _quietly(release_for_agent, self)
         _quietly(self._drop_shared_client, lambda c: self._close_openai_client(c, reason="agent_close", shared=True))
         self._close_request_clients("agent_close")
-        _quietly(self._close_codex_session)
+        self._release_turn_runtimes(hard=True)
         # Free conversation history proactively: callers may still hold the closed agent. The DB-flush
         # settled-prefix snapshot and the streamed-text accumulator are shadow copies of the same transcript;
         # on a closed delegate child they were the only remaining owners, pinning its history in the parent heap.
@@ -999,6 +1000,13 @@ class AIAgent(
         """Drop the cached per-request wire clients (reused across sequential LLM calls)."""
         _quietly(self._close_cached_request_openai_client, reason=reason)
         _quietly(self._close_cached_request_anthropic_client, reason=reason)
+
+    def _release_turn_runtimes(self, *, hard: bool) -> None:
+        """Let every turn runtime release what it holds for this agent (a fallback may have moved
+        ``api_mode`` off the runtime that still owns a child), each guarded on its own."""
+        from agent.turn_runtime_registry import all_turn_runtimes
+        for runtime in all_turn_runtimes():
+            _quietly(runtime.release, self, hard=hard)
 
     def _close_codex_session(self) -> None:
         """Close the Codex app-server session (else the child keeps running); the attribute is cleared BEFORE

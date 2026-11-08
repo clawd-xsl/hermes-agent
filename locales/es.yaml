@@ -160,6 +160,8 @@ gateway:
     codex_nothing: "🗜️ Nada que compactar: esta sesión usa el runtime app-server de Codex, cuyo contexto vive en un hilo propio de Codex que solo existe mientras el agente está activo. Envía primero un mensaje y luego /compress, o /reset para empezar de cero."
     codex_compacted: "🗜️ Hilo del app-server de Codex compactado (thread/compact). El espejo de la transcripción no cambia por diseño: ahora el app-server lleva el contexto compactado."
     codex_incomplete: "⚠️ La compactación del app-server de Codex no se completó: el hilo no cambió. Revisa los registros del app-server, reintenta /compress o usa /reset para una sesión limpia."
+    runtime_compacted: "🗜️ {runtime} compacted its native context. The transcript mirror is unchanged by design — the runtime now carries the compacted context."
+    runtime_incomplete: "⚠️ {runtime} compaction did not complete — its context is unchanged. Retry /compress, or /reset for a clean session."
   debug:
     upload_failed: "✗ No se pudo subir el informe de depuración: {error}"
     header: "**Informe de depuración subido:**"

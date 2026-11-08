@@ -19,6 +19,7 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 from agent.sdk_transform_bypass import bypass_sdk_request_transform
 from agent.stream_diag import buffer_connect_exhausted_notice
+from agent.turn_runtime_provider import TurnRuntimeProvider
 from agent.usage_anchor import set_usage_anchor
 
 logger = logging.getLogger(__name__)
@@ -1473,7 +1474,72 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 _close_event_stream(event_stream)
 
 
+class CodexAppServerTurnRuntime(TurnRuntimeProvider):
+    """The built-in ``codex_app_server`` turn runtime (``agent.turn_runtime_registry``): the codex agent owns
+    the thread, its model/tool loop, interrupt/steer and compaction; Hermes keeps the turn around it."""
+
+    @property
+    def name(self) -> str:
+        return "codex_app_server"
+
+    @property
+    def display_name(self) -> str:
+        return "Codex app-server"
+
+    def run_turn(self, agent: Any, turn: Any) -> Any:
+        """The app-server's result, or None when its failure activated a fallback and the generic loop
+        retries the same user turn (keeping codex's projected rows and its failed call in the accounting)."""
+        codex_result = agent._run_codex_app_server_turn(
+            user_message=turn.user_message, original_user_message=turn.original_user_message,
+            messages=turn.messages, effective_task_id=turn.effective_task_id,
+            should_review_memory=turn._should_review_memory, turn_id=turn.turn_id,
+        )
+        from agent.turn_recovery import activate_codex_app_server_fallback
+        if not activate_codex_app_server_fallback(agent, codex_result):
+            return codex_result
+        turn.api_call_count = int(codex_result.get("api_calls") or 0)
+        return None
+
+    @staticmethod
+    def _session_method(agent: Any, name: str) -> Any:
+        method = getattr(getattr(agent, "_codex_session", None), name, None)
+        return method if callable(method) else None
+
+    def request_interrupt(self, agent: Any) -> None:
+        method = self._session_method(agent, "request_interrupt")
+        if method is not None:
+            method()
+
+    def request_steer(self, agent: Any, text: str) -> Any:
+        method = self._session_method(agent, "request_steer")
+        return None if method is None else bool(method(text))
+
+    def release(self, agent: Any, *, hard: bool) -> None:
+        close = getattr(agent, "_close_codex_session", None)
+        if callable(close):
+            close()
+
+    def native_auto_compaction(self, agent: Any) -> bool:
+        # Hermes initiates thread compaction only in compression.codex_app_server_auto: "hermes" (#36801).
+        mode = str(getattr(agent, "codex_app_server_auto_compaction", "native") or "native").lower()
+        return mode in {"native", "off"}
+
+    def compact(self, agent: Any, messages: list, system_message: Any, *, force: bool, focus_topic: Any = None,
+                verbatim_tail: Any = None, approx_tokens: Any = None, task_id: str = "default",
+                trigger: Any = None, commit_fence: Any = None, attempt: Any = None,
+                defer_context_engine_notification: bool = False) -> Any:
+        from agent.conversation_compression import _route_codex_compaction
+        return _route_codex_compaction(
+            agent, messages, system_message, commit_fence=commit_fence, attempt=attempt,
+            approx_tokens=approx_tokens, task_id=task_id, force=force,
+        )
+
+    def image_input_mode(self, agent: Any) -> Any:
+        return "text"
+
+
 __all__ = [
+    "CodexAppServerTurnRuntime",
     "_consume_codex_event_stream",
     "make_codex_app_server_event_bridge",
     "run_codex_app_server_turn",

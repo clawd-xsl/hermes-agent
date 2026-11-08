@@ -186,6 +186,8 @@ gateway:
     codex_nothing: "🗜️ Rien à compacter : cette session tourne sur le runtime app-server de Codex, dont le contexte réside dans un fil géré par Codex qui n'existe que tant que l'agent est actif. Envoyez d'abord un message, puis /compress — ou /reset pour repartir de zéro."
     codex_compacted: "🗜️ Fil app-server Codex compacté (thread/compact). Le miroir de la transcription est volontairement inchangé — c'est désormais l'app-server qui porte le contexte compacté."
     codex_incomplete: "⚠️ La compaction app-server Codex ne s'est pas terminée — le fil est inchangé. Consultez les journaux de l'app-server, relancez /compress, ou /reset pour une session propre."
+    runtime_compacted: "🗜️ {runtime} compacted its native context. The transcript mirror is unchanged by design — the runtime now carries the compacted context."
+    runtime_incomplete: "⚠️ {runtime} compaction did not complete — its context is unchanged. Retry /compress, or /reset for a clean session."
   debug:
     upload_failed: "✗ Échec de l'envoi du rapport de débogage : {error}"
     header: "**Rapport de débogage envoyé :**"

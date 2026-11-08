@@ -160,6 +160,8 @@ gateway:
     codex_nothing: "🗜️ Нічого стискати: цей сеанс працює в середовищі Codex app-server, контекст якого живе в треді, що належить Codex і існує лише поки агент активний. Спочатку надішліть повідомлення, потім /compress — або /reset, щоб почати з чистого аркуша."
     codex_compacted: "🗜️ Тред Codex app-server стиснуто (thread/compact). Дзеркало стенограми навмисно не змінено — стиснутий контекст тепер зберігає app-server."
     codex_incomplete: "⚠️ Стиснення Codex app-server не завершилося — тред без змін. Перевірте журнали app-server, повторіть /compress або виконайте /reset для чистого сеансу."
+    runtime_compacted: "🗜️ {runtime} compacted its native context. The transcript mirror is unchanged by design — the runtime now carries the compacted context."
+    runtime_incomplete: "⚠️ {runtime} compaction did not complete — its context is unchanged. Retry /compress, or /reset for a clean session."
   debug:
     upload_failed: "✗ Не вдалося завантажити звіт налагодження: {error}"
     header: "**Звіт налагодження завантажено:**"

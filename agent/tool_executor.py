@@ -200,7 +200,12 @@ def _resolve_concurrent_tool_timeout() -> float | None:
 
 def _flush_session_db_after_tool_progress(agent, messages: list, *, stage: str) -> bool:
     """Flush tool-call progress to the session DB before projecting it to any UI: tool side
-    effects can kill/restart the process before turn-end persistence runs."""
+    effects can kill/restart the process before turn-end persistence runs.
+
+    A turn runtime executing tools for its own model loop (``agent._tool_progress_persistence_deferred``)
+    owns the canonical transcript and its durability: the rows here are a scratch projection."""
+    if getattr(agent, "_tool_progress_persistence_deferred", False) is True:
+        return True
     from agent.conversation_loop import _maybe_inject_run_budget_wrapup
     from agent.turn_iteration_prep import _maybe_inject_iteration_budget_warning
 

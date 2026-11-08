@@ -4023,24 +4023,37 @@ def compress_context(
         approx_tokens=approx_tokens, overflow_reason=overflow_reason,
     )
 
-    # Codex owns the real thread; route compaction to its own compact (config
-    # compression.codex_app_server_auto). Memory handoff is Hermes-only: no native
-    # summary prompt to inject into. `is True`: MagicMock attributes are truthy.
+    # A turn runtime (codex app-server, a plugin runtime) owns the real thread; route compaction to
+    # its own compact (codex: config compression.codex_app_server_auto). Memory handoff is
+    # Hermes-only unless the runtime does it. `is True`: MagicMock attributes are truthy.
     checkpoint_required = getattr(agent, "compression_checkpoint_required", False) is True
-    if getattr(agent, "api_mode", None) == "codex_app_server":
+    from agent.turn_runtime_registry import agent_turn_runtime
+    turn_runtime = agent_turn_runtime(agent)
+    if turn_runtime is not None and turn_runtime.owns_compaction(agent):
         if checkpoint_required:
             blocked = _checkpoint_blocked(
-                "codex_app_server owns the authoritative thread and does not expose a truthful pre-compaction transcript boundary"
+                f"{turn_runtime.name} owns the authoritative thread and does not expose a truthful "
+                "pre-compaction transcript boundary"
             )
             _emit_bypassed_attempt_telemetry(
                 agent, attempt.started_at, commit_status="aborted", failure_class=f"exception:{type(blocked).__name__}",
-                approx_tokens=approx_tokens, route="codex_app_server", attempt_seed=attempt.seed,
+                approx_tokens=approx_tokens, route=turn_runtime.name, attempt_seed=attempt.seed,
             )
             raise blocked
-        return _route_codex_compaction(
-            agent, messages, system_message, commit_fence=commit_fence, attempt=attempt, approx_tokens=approx_tokens,
-            task_id=task_id, force=force,
+        compacted = turn_runtime.compact(
+            agent, messages, system_message, force=force, focus_topic=focus_topic, verbatim_tail=verbatim_tail,
+            approx_tokens=approx_tokens, task_id=task_id, trigger=trigger, commit_fence=commit_fence,
+            attempt=attempt, defer_context_engine_notification=defer_context_engine_notification,
         )
+        if compacted is not None:
+            return compacted
+        # No native compaction: Hermes must still not rewrite a mirror the runtime does not read.
+        attempt.restore_compressor(agent.context_compressor)
+        _emit_bypassed_attempt_telemetry(
+            agent, attempt.started_at, commit_status="aborted", failure_class="turn_runtime_skipped",
+            approx_tokens=approx_tokens, route=turn_runtime.name, attempt_seed=attempt.seed,
+        )
+        return messages, _existing_system_prompt(agent, system_message)
 
     # All automatic entrypoints honor compressor cooldown/breaker state; hygiene's
     # fresh AIAgent loads the persisted streak via bind_session_state() first.
