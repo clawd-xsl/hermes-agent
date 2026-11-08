@@ -636,7 +636,8 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, f
         then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
 
 
-_ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})
+# Main-session automation (gateway/main_session.py) follows the home route like Kanban wakes.
+_ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick', 'cron-main', 'webhook-main'})
 
 
 def route_owner_lock(runner, session_id):
