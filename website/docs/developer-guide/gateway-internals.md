@@ -572,7 +572,7 @@ plugins/platforms/                  # plugin-packaged adapters (one dir each)
 ├── wecom/adapter.py        # WeCom (WeChat Work) callback
 ├── line/adapter.py         # LINE Messaging API
 ├── teams/adapter.py        # Microsoft Teams
-├── signal/adapter.py       # Signal via signal-cli HTTP daemon (SSE + JSON-RPC)
+├── signal/adapter.py       # Signal via a persistent signal-ts Node sidecar (NDJSON over stdio)
 ├── irc/adapter.py          # IRC (canonical scoped-lock example)
 ├── bluebubbles/adapter.py  # Apple iMessage via BlueBubbles macOS server
 ├── weixin/adapter.py       # Weixin (personal WeChat) via iLink Bot API

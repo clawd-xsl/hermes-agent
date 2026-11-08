@@ -1,262 +1,178 @@
 ---
 sidebar_position: 6
 title: "Signal"
-description: "Set up Hermes Agent as a Signal messenger bot via signal-cli daemon"
+description: "Run Hermes on Signal through one persistent signal-ts linked-device connection"
 ---
 
 # Signal Setup
 
-Hermes connects to Signal through the [signal-cli](https://github.com/AsamK/signal-cli) daemon running in HTTP mode. The adapter streams messages in real-time via SSE (Server-Sent Events) and sends responses via JSON-RPC.
+Hermes connects to Signal with [signal-ts](https://github.com/clawd-xsl/signal-ts), a TypeScript Signal
+client built on `@signalapp/libsignal-client`. The gateway starts one persistent Node sidecar that acts as
+a **linked device** of your Signal account: it owns the authenticated Signal socket, the libsignal session
+state, attachment transfers and reconnects for the gateway's whole lifetime. There is no signal-cli daemon,
+no Java process and no HTTP/SSE bridge.
 
-Signal is the most privacy-focused mainstream messenger — end-to-end encrypted by default, open-source protocol, minimal metadata collection. This makes it ideal for security-sensitive agent workflows.
-
-:::info No New Python Dependencies
-The Signal adapter uses `httpx` (already a core Hermes dependency) for all communication. No additional Python packages are required. You just need signal-cli installed externally.
-:::
+The integration is built for one Signal account serving a personal Hermes agent. Voice and video calls are
+out of scope; voice notes and other files work as normal attachments.
 
 ---
 
 ## Prerequisites
 
-- **signal-cli** — Java-based Signal client ([GitHub](https://github.com/AsamK/signal-cli))
-- **Java 17+** runtime — required by signal-cli
-- **A phone number** with Signal installed (for linking as a secondary device)
+- **Node.js 22.19 or newer.** Hermes uses `node` from `PATH`, or the Node it manages itself, unless you set
+  `node_command`.
+- **A built signal-ts checkout** (the package is private, so it is not on npm).
+- **A linked-device state file** created by signal-ts. Treat it like a password: anyone holding it can read
+  and send messages as your linked device.
+- Hermes and the state file on the same machine, owned by the user that runs the gateway. Only one process
+  may use a state file at a time.
 
-### Installing signal-cli
+### 1. Build the SDK
 
 ```bash
-# macOS
-brew install signal-cli
-
-# Linux (download latest release)
-VERSION=$(curl -Ls -o /dev/null -w %{url_effective} \
-  https://github.com/AsamK/signal-cli/releases/latest | sed 's/^.*\/v//')
-curl -L -O "https://github.com/AsamK/signal-cli/releases/download/v${VERSION}/signal-cli-${VERSION}.tar.gz"
-sudo tar xf "signal-cli-${VERSION}.tar.gz" -C /opt
-sudo ln -sf "/opt/signal-cli-${VERSION}/bin/signal-cli" /usr/local/bin/
+git clone git@github.com:clawd-xsl/signal-ts.git
+cd signal-ts
+pnpm install --frozen-lockfile
+pnpm build
 ```
 
-:::caution
-signal-cli is **not** in apt or snap repositories. The Linux install above downloads directly from [GitHub releases](https://github.com/AsamK/signal-cli/releases).
-:::
+Cloning it next to your Hermes checkout (`../signal-ts`) lets the setup wizard find it automatically.
+
+### 2. Link a device
+
+If you already have signal-ts state (for example from OpenClaw), reuse that file; you do not need to link
+again.
+
+To link a new device, run the SDK's opt-in QR link flow from the signal-ts checkout:
+
+```bash
+SIGNAL_TS_E2E=1 \
+SIGNAL_TS_E2E_LINK_DEVICE=1 \
+SIGNAL_TS_E2E_LINK_DEVICE_NAME="Hermes" \
+SIGNAL_TS_E2E_LINK_OUTPUT_FILE="$HOME/.hermes/signal-ts/default.json" \
+pnpm test:e2e -- src/e2e/live-link-device.e2e.test.ts
+```
+
+It prints an `sgnl://linkdevice` URL. Open Signal on your phone, go to **Settings → Linked devices → Link new
+device**, and scan that URL as a QR code (any QR generator works). The state file is written when linking
+finishes. Keep it private (`chmod 600`), back it up securely, and never commit it.
 
 ---
 
-## Step 1: Link Your Signal Account
-
-Signal-cli works as a **linked device** — like WhatsApp Web, but for Signal. Your phone stays the primary device.
-
-```bash
-# Generate a linking URI (displays a QR code or link)
-signal-cli link -n "HermesAgent"
-```
-
-1. Open **Signal** on your phone
-2. Go to **Settings → Linked Devices**
-3. Tap **Link New Device**
-4. Scan the QR code or enter the URI
-
----
-
-## Step 2: Start the signal-cli Daemon
-
-```bash
-# Replace +1234567890 with your Signal phone number (E.164 format)
-signal-cli --account +1234567890 daemon --http 127.0.0.1:8080
-```
-
-:::tip
-Keep this running in the background. You can use `systemd`, `tmux`, `screen`, or run it as a service.
-:::
-
-Verify it's running:
-
-```bash
-curl http://127.0.0.1:8080/api/v1/check
-# Should return: {"versions":{"signal-cli":...}}
-```
-
----
-
-## Step 3: Configure Hermes
-
-The easiest way:
+## Configure Hermes
 
 ```bash
 hermes gateway setup
 ```
 
-Select **Signal** from the platform menu. The wizard will:
+Choose **Signal** and answer the prompts:
 
-1. Check if signal-cli is installed
-2. Prompt for the HTTP URL (default: `http://127.0.0.1:8080`)
-3. Test connectivity to the daemon
-4. Ask for your account phone number
-5. Configure allowed users and access policies
+| Prompt | What to enter |
+|---|---|
+| Node executable | A Node 22.19+ binary (defaults to `node` on `PATH`) |
+| signal-ts SDK path | The built checkout (the directory holding `package.json` and `dist/index.js`) |
+| Signal state file | The linked-device state file from step 2 |
+| Expected Signal number | Optional E.164 number; startup refuses a state file for a different account |
+| Home conversation | Optional chat for cron results and notifications (a number, ACI or `group:<id>`) |
+| Allowed users | Numbers or ACIs allowed to talk to the agent; leave empty for pairing mode |
+| Group messaging | Off by default; enter group IDs or `*` |
 
-### Manual Configuration
+The wizard never pre-fills the home conversation or the allowlist with the linked account's own number.
 
-Add to `~/.hermes/.env`:
+Signal is configured **only in `config.yaml`**; nothing goes into `.env`. The wizard writes:
 
-```bash
-# Required
-SIGNAL_HTTP_URL=http://127.0.0.1:8080
-SIGNAL_ACCOUNT=+1234567890
-
-# Security (recommended)
-SIGNAL_ALLOWED_USERS=+1234567890,+0987654321    # Comma-separated E.164 numbers or UUIDs
-
-# Optional
-SIGNAL_GROUP_ALLOWED_USERS=groupId1,groupId2     # Enable groups (omit to disable, * for all)
-SIGNAL_HOME_CHANNEL=+1234567890                  # Default delivery target for cron jobs
+```yaml
+platforms:
+  signal:
+    enabled: true
+    home_channel:
+      platform: signal
+      chat_id: "+15550001111"
+      name: "Signal home"
+    extra:
+      node_command: /usr/local/bin/node        # optional: default is node on PATH / Hermes' Node
+      sdk_path: /home/me/signal-ts
+      state_path: /home/me/.hermes/signal-ts/default.json
+      account: "+15559990000"                   # optional: validated against the state file
+      allow_from:                               # empty = pairing mode
+        - "+15550001111"
+      group_allow_from: []                      # empty = groups disabled; "*" = all groups
+      require_mention: false                    # groups: only answer when @mentioned
+      ignore_stories: true
+      reactions: true                           # 👀 while working, then ✅ / ❌
+      startup_timeout_seconds: 30
+      call_timeout_seconds: 30
 ```
 
-Then start the gateway:
+Then start or restart the gateway:
 
 ```bash
-hermes gateway              # Foreground
-hermes gateway install      # Install as a user service
-sudo hermes gateway install --system   # Linux only: boot-time system service
+hermes gateway restart
 ```
+
+`hermes status` and `hermes gateway setup` show Signal as configured once the state file and SDK path exist.
+
+### Access control
+
+- **`allow_from` set**: a strict allowlist enforced by the adapter before any reaction or agent work. It
+  applies to group messages too: in an allowed group only listed senders are answered. `"*"` admits
+  everyone.
+- **`allow_from` empty**: pairing mode. An unknown DM receives Hermes' pairing code, which the operator
+  approves with `hermes pairing approve signal CODE`. Unknown contacts never get a 👀 reaction.
+- **`group_allow_from`**: group IDs the agent may answer in; empty disables groups.
+
+Use `/sethome` in a Signal chat to make it the home conversation later.
+
+### Sending from tools and cron
+
+`send_message` and cron `deliver: signal` go through the running gateway's Signal connection, because a
+second client would fight the gateway over the linked device's protocol state. Run scheduled jobs inside
+the gateway (the default). A send from a separate process without a running gateway fails with an explicit
+error.
 
 ---
 
-## Access Control
+## How it works
 
-### DM Access
-
-DM access follows the same pattern as all other Hermes platforms:
-
-1. **`SIGNAL_ALLOWED_USERS` set** → only those users can message
-2. **No allowlist set** → unknown users get a DM pairing code (approve via `hermes pairing approve signal CODE`)
-3. **`SIGNAL_ALLOW_ALL_USERS=true`** → anyone can message (use with caution)
-
-### Group Access
-
-Group access is controlled by the `SIGNAL_GROUP_ALLOWED_USERS` env var:
-
-| Configuration | Behavior |
-|---------------|----------|
-| Not set (default) | All group messages are ignored. The bot only responds to DMs. |
-| Set with group IDs | Only listed groups are monitored (e.g., `groupId1,groupId2`). |
-| Set to `*` | The bot responds in any group it's a member of. |
-
----
-
-## Features
-
-### Attachments
-
-The adapter supports sending and receiving media in both directions.
-
-**Incoming** (user → agent):
-
-- **Images** — PNG, JPEG, GIF, WebP (auto-detected via magic bytes)
-- **Audio** — MP3, OGG, WAV, M4A (voice messages transcribed if Whisper is configured)
-- **Documents** — PDF, ZIP, and other file types
-
-**Outgoing** (agent → user):
-
-The agent can send media files via `MEDIA:` tags in responses. The following delivery methods are supported:
-
-- **Images** — `send_multiple_images` and `send_image_file` send PNG, JPEG, GIF, WebP as native Signal attachments
-- **Voice** — `send_voice` sends audio files (OGG, MP3, WAV, M4A, AAC) as attachments
-- **Video** — `send_video` sends MP4 video files
-- **Documents** — `send_document` sends any file type (PDF, ZIP, etc.)
-
-All outgoing media goes through Signal's standard attachment API. Unlike some platforms, Signal does not distinguish between voice messages and file attachments at the protocol level.
-
-Attachment size limit: **100 MB** (both directions).
-:::warning
-**Signal servers will rate-limit attachment uploads**, the adapter uses a scheduler for multiple image sending that batches images in groups of 32 and throttles uploads to match the Signal server policy.
-:::
-
-### Native Formatting, Reply Quotes, and Reactions
-
-Signal messages render with **native formatting** instead of literal markdown characters. The adapter converts markdown (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `||spoiler||`, headings) into Signal `bodyRanges` so the text shows up with real styling on the recipient's client rather than as visible `**` / `` ` `` characters.
-
-**Reply quotes.** When Hermes replies to a specific message, it now posts a native reply that quotes the original — same UI affordance Signal users see when they use "Reply" themselves. This is automatic for replies generated in response to an inbound message.
-
-**Reactions.** The agent can react to messages via the standard reaction API; reactions surface in Signal as emoji reactions on the referenced message rather than as extra text.
-
-None of this requires additional config — it ships on by default in recent signal-cli builds. If your `signal-cli` version is too old, Hermes falls back to plaintext delivery and logs a one-time warning.
-
-### Long Messages
-
-Signal caps a single message at **8,000 characters**. Hermes splits longer responses into numbered chunks (`(1/3)`, `(2/3)`, …) automatically instead of truncating them. This applies to every delivery path — live conversation replies, cron job deliveries, `hermes send`, and MCP `send_message` calls — and native formatting (bold, italic, code, spoilers) is preserved across chunk boundaries.
-
-### Typing Indicators
-
-The bot sends typing indicators while processing messages, refreshing every 8 seconds.
-
-### Tool Progress Display
-
-Signal does not support editing already-sent messages. Hermes therefore suppresses gateway tool-progress bubbles on Signal, even when `/verbose` is enabled and saves a non-`off` mode for the platform.
-
-You can still see tool activity in the CLI, and final Signal replies can include normal assistant output. If you need live per-tool progress in chat, use a messaging platform with message editing support.
-
-### Phone Number Redaction
-
-All phone numbers are automatically redacted in logs:
-- `+15551234567` → `+155****4567`
-- This applies to both Hermes gateway logs and the global redaction system
-
-### Note to Self (Single-Number Setup)
-
-If you run signal-cli as a **linked secondary device** on your own phone number (rather than a separate bot number), you can interact with Hermes through Signal's "Note to Self" feature.
-
-Just send a message to yourself from your phone — signal-cli picks it up and Hermes responds in the same conversation.
-
-**How it works:**
-- "Note to Self" messages arrive as `syncMessage.sentMessage` envelopes
-- The adapter detects when these are addressed to the bot's own account and processes them as regular inbound messages
-- Echo-back protection (sent-timestamp tracking) prevents infinite loops — the bot's own replies are filtered out automatically
-
-**No extra configuration needed.** This works automatically as long as `SIGNAL_ACCOUNT` matches your phone number.
-
-### Health Monitoring
-
-The adapter monitors the SSE connection and automatically reconnects if:
-- The connection drops (with exponential backoff: 2s → 60s)
-- No activity is detected for 120 seconds (pings signal-cli to verify)
+- The sidecar (`plugins/platforms/signal/sidecar/index.mjs`) talks newline-delimited JSON to the adapter
+  over stdio. It decrypts and acknowledges inbound envelopes and normalizes them into Hermes' gateway
+  message shape: DMs, Note to Self, groups, quotes/replies, edits, mentions and attachments.
+- Inbound messages are handled one at a time in arrival order, on their own task, so typing indicators,
+  reactions and sends never wait behind an inbound message.
+- Markdown bold, italic, strikethrough and code become native Signal text styles; long replies are split at
+  8000 characters.
+- Attachments up to 100 MB, up to 32 per message, paced by a rate-limit scheduler that follows the server's
+  retry hints.
+- Ordinary sends fetch recipient prekeys over the account's own authenticated connection, so recipients who
+  restrict sealed-sender access still receive messages.
+- If the connection drops, the sidecar exits and Hermes starts a fresh one with backoff (1s, doubling to
+  10s), reusing the same state file. A scoped lock per account (or per state file) stops a second gateway
+  from using the same linked device.
+- Signal cannot edit sent messages, so streaming replies are delivered without edit calls.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| **"Cannot reach signal-cli"** during setup | Ensure signal-cli daemon is running: `signal-cli --account +YOUR_NUMBER daemon --http 127.0.0.1:8080` |
-| **Messages not received** | Check that `SIGNAL_ALLOWED_USERS` includes the sender's number in E.164 format (with `+` prefix) |
-| **"signal-cli not found on PATH"** | Install signal-cli and ensure it's in your PATH, or use Docker |
-| **Connection keeps dropping** | Check signal-cli logs for errors. Ensure Java 17+ is installed. |
-| **Group messages ignored** | Configure `SIGNAL_GROUP_ALLOWED_USERS` with specific group IDs, or `*` to allow all groups. |
-| **Bot responds to no one** | Configure `SIGNAL_ALLOWED_USERS`, use DM pairing, or explicitly allow all users through gateway policy if you want broader access. |
-| **Duplicate messages** | Ensure only one signal-cli instance is listening on your phone number |
+| Symptom | Check |
+|---|---|
+| Signal shows "not configured" | `state_path` and `sdk_path` must point at existing files; an explicit `node_command` must be runnable. |
+| `signal-ts SDK is not built` | Run `pnpm install --frozen-lockfile && pnpm build` in the checkout. |
+| `state file does not exist` / `no linked account` | Link a device (step 2) or point `state_path` at the right file. |
+| `does not match configured account` | Fix `extra.account`, or select the state file for that number. |
+| `requires Node >= 22.19` | Install a newer Node or set `node_command` to one. |
+| `rejected this linked device` | The device was unlinked on the phone; link it again. |
+| Gateway keeps reconnecting | Check `~/.hermes/logs/gateway.log` and make sure no other process (OpenClaw, another gateway) uses the same state file. |
+| Unknown DMs get pairing codes | Set `extra.allow_from`. |
+| Group messages are ignored | Add the group ID to `extra.group_allow_from`; with `allow_from` set, the sender must be listed too. |
 
----
+Configuration errors (missing state, unlinked device, account mismatch, old Node) stop the adapter without
+retrying; network errors are retried.
 
-## Security
+## Migrating from signal-cli
 
-:::warning
-**Always configure access controls.** The bot has terminal access by default. Without `SIGNAL_ALLOWED_USERS` or DM pairing, the gateway denies all incoming messages as a safety measure.
-:::
-
-- Phone numbers are redacted in all log output
-- Use DM pairing or explicit allowlists for safe onboarding of new users
-- Keep groups disabled unless you specifically need group support, or allowlist only the groups you trust
-- Signal's end-to-end encryption protects message content in transit
-- The signal-cli session data in `~/.local/share/signal-cli/` contains account credentials — protect it like a password
-
----
-
-## Environment Variables Reference
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `SIGNAL_HTTP_URL` | Yes | — | signal-cli HTTP endpoint |
-| `SIGNAL_ACCOUNT` | Yes | — | Bot phone number (E.164) |
-| `SIGNAL_ALLOWED_USERS` | No | — | Comma-separated phone numbers/UUIDs |
-| `SIGNAL_GROUP_ALLOWED_USERS` | No | — | Group IDs to monitor, or `*` for all (omit to disable groups) |
-| `SIGNAL_ALLOW_ALL_USERS` | No | `false` | Allow any user to interact (skip allowlist) |
-| `SIGNAL_HOME_CHANNEL` | No | — | Default delivery target for cron jobs |
+The signal-cli adapter and its `SIGNAL_HTTP_URL`, `SIGNAL_ACCOUNT`, `SIGNAL_ALLOWED_USERS`,
+`SIGNAL_GROUP_ALLOWED_USERS`, `SIGNAL_ALLOW_ALL_USERS`, `SIGNAL_REQUIRE_MENTION`, `SIGNAL_IGNORE_STORIES` and
+`SIGNAL_REACTIONS` variables are gone; they are ignored if still present. Link a signal-ts device, run
+`hermes gateway setup`, move your allowlists to `allow_from` / `group_allow_from`, and stop the signal-cli
+daemon. `SIGNAL_HOME_CHANNEL` (written by `/sethome`) still works as a mirror of the configured home channel.

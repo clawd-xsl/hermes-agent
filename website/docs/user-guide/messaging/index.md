@@ -389,7 +389,7 @@ a crash before that point keeps the human-turn safeguard.
 # Restrict to specific users (recommended):
 TELEGRAM_ALLOWED_USERS=123456789,987654321
 DISCORD_ALLOWED_USERS=123456789012345678
-SIGNAL_ALLOWED_USERS=+155****4567,+155****6543
+# Signal's allowlist lives in config.yaml: platforms.signal.extra.allow_from (see the Signal guide)
 SMS_ALLOWED_USERS=+155****4567,+155****6543
 EMAIL_ALLOWED_USERS=trusted@example.com,colleague@work.com
 MATTERMOST_ALLOWED_USERS=3uo8dkh1p7g1mfk49ear5fzs5c

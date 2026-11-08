@@ -147,9 +147,7 @@ TTS settings are read from **two** OpenClaw config locations with this priority:
 | Slack | `channels.slack.appToken` or `.accounts.default.appToken` | `SLACK_APP_TOKEN` | |
 | Slack | `channels.slack.allowFrom` or `.accounts.default.allowFrom` | `SLACK_ALLOWED_USERS` | |
 | WhatsApp | `channels.whatsapp.allowFrom` or `.accounts.default.allowFrom` | `WHATSAPP_ALLOWED_USERS` | Auth via Baileys QR pairing — requires re-pairing after migration |
-| Signal | `channels.signal.account` or `.accounts.default.account` | `SIGNAL_ACCOUNT` | |
-| Signal | `channels.signal.httpUrl` or `.accounts.default.httpUrl` | `SIGNAL_HTTP_URL` | |
-| Signal | `channels.signal.allowFrom` or `.accounts.default.allowFrom` | `SIGNAL_ALLOWED_USERS` | |
+| Signal | `channels.signal.*` | — | Not migrated to `.env`: Hermes runs signal-ts itself and keeps Signal in `config.yaml`. Point `hermes gateway setup` at OpenClaw's existing signal-ts state file (no re-link) and move `allowFrom` to `platforms.signal.extra.allow_from`; see [Signal setup](../user-guide/messaging/signal.md). |
 | Matrix | `channels.matrix.accessToken` or `.accounts.default.accessToken` | `MATRIX_ACCESS_TOKEN` | Uses `accessToken` (not `botToken`) |
 | Mattermost | `channels.mattermost.botToken` or `.accounts.default.botToken` | `MATTERMOST_BOT_TOKEN` | |
 
