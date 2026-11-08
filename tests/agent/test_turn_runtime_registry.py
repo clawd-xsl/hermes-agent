@@ -241,3 +241,33 @@ class TestCompactionRouting:
         history = [{"role": "user", "content": "a"}]
         agent._compress_context(history, "sys", force=False)
         assert "compact" not in fake_runtime.names()
+
+
+class TestReleaseRuntimeSessions:
+    """One-shot runs (webhook deliveries, cron fires) end holding only session ids, no live agent."""
+
+    def test_base_runtime_holds_nothing_per_session(self):
+        assert FakeRuntime().release_sessions(["s1"]) == 0
+
+    def test_every_runtime_gets_the_deduplicated_ids(self, fake_runtime, monkeypatch):
+        seen = []
+
+        def release(session_ids):
+            seen.append(list(session_ids))
+            return len(session_ids)
+        monkeypatch.setattr(fake_runtime, "release_sessions", release, raising=False)
+        assert registry.release_runtime_sessions("tip", "orig", "tip", "", None) == 2
+        assert seen == [["tip", "orig"]]
+
+    def test_no_ids_asks_nobody(self, fake_runtime, monkeypatch):
+        monkeypatch.setattr(fake_runtime, "release_sessions",
+                            lambda ids: (_ for _ in ()).throw(AssertionError("must not be asked")), raising=False)
+        assert registry.release_runtime_sessions("", None) == 0
+
+    def test_a_failing_runtime_does_not_stop_the_others(self, fake_runtime, monkeypatch):
+        other = FakeRuntime("other_runtime")
+        registry.register_provider(other)
+        monkeypatch.setattr(fake_runtime, "release_sessions",
+                            lambda ids: (_ for _ in ()).throw(RuntimeError("boom")), raising=False)
+        monkeypatch.setattr(other, "release_sessions", lambda ids: 1, raising=False)
+        assert registry.release_runtime_sessions("webhook_1") == 1

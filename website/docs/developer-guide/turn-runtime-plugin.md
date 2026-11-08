@@ -22,6 +22,7 @@ conversation asks the runtime first:
 | Interrupt (any thread) | `request_interrupt(agent)` | no-op |
 | Mid-turn steer / redirect | `request_steer(agent, text)` → True/False, or None to use Hermes' steer buffer | None |
 | Teardown | `release(agent, hard=)` — `close()` is hard, cache eviction soft | no-op |
+| One-shot run ended (webhook delivery, cron fire; no live agent) | `release_sessions(session_ids)` → count released | 0 |
 | Compaction ownership | `owns_compaction(agent)`, `native_auto_compaction(agent)` | True, True |
 | Compaction (`compress_context`, `/compress`) | `compact(agent, messages, system_message, force=, focus_topic=, verbatim_tail=, trigger=, ...)` | None (skip) |
 | Attached images | `image_input_mode(agent)` → `"text"`, `"native"` or None | None |

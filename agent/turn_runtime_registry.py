@@ -96,6 +96,22 @@ def all_turn_runtimes() -> list[TurnRuntimeProvider]:
     return builtins + list(_registry.list_providers())
 
 
+def release_runtime_sessions(*session_ids: Any) -> int:
+    """Ask every runtime to release what it holds for ``session_ids`` (one-shot runs that ended with no
+    live agent); the total released. Blank and duplicate ids are dropped; a failing runtime is logged
+    and skipped so the others still release."""
+    ids = list(dict.fromkeys(str(sid).strip() for sid in session_ids if sid and str(sid).strip()))
+    if not ids:
+        return 0
+    released = 0
+    for runtime in all_turn_runtimes():
+        try:
+            released += int(runtime.release_sessions(list(ids)) or 0)
+        except Exception:
+            logger.debug("turn runtime %s.release_sessions() failed", runtime.name, exc_info=True)
+    return released
+
+
 def turn_runtime_names() -> frozenset[str]:
     """Every runtime name currently available (built in + registered)."""
     return BUILTIN_RUNTIMES | frozenset(p.name for p in _registry.list_providers())

@@ -19,7 +19,7 @@ supported under ``plugins.isolation: host``.
 from __future__ import annotations
 
 import abc
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from agent.provider_base import ProviderBase
 
@@ -84,6 +84,13 @@ class TurnRuntimeProvider(ProviderBase):
         (``release_clients()``), after which a rebuilt agent may resume the same session. A helper
         agent that only borrowed the live session's runtime (``agent._borrows_session_runtime``,
         e.g. the gateway's manual-compression agent) must leave that runtime running on close."""
+
+    def release_sessions(self, session_ids: Iterable[str]) -> int:
+        """Release what the runtime holds for Hermes sessions that ended with no live ``AIAgent`` to
+        :meth:`release` (a finished webhook delivery or cron fire: the gateway and the scheduler hold
+        only session ids by then). Several ids arrive when a compression mid-run rotated the work onto
+        a continuation. Returns how many were released; the default holds nothing per session."""
+        return 0
 
     # -- compaction ----------------------------------------------------------------------------
 

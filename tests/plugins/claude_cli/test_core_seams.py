@@ -168,3 +168,20 @@ def test_release_detaches_borrowed_sessions_and_closes_owned_ones(monkeypatch):
     runtime.release(owner, hard=True)
     runtime.release(helper, hard=True)
     assert calls == [("release", owner), ("detach", helper)]
+
+
+def test_release_sessions_closes_pooled_one_shot_children(monkeypatch):
+    """Core's generic one-shot release reaches the plugin's by-owner pool release."""
+    from plugins.claude_cli import runtime as rt
+
+    class _Session:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    before, after, live = _Session(), _Session(), _Session()
+    monkeypatch.setattr(rt, "_SESSIONS", {"cron_orig": before, "cron_tip": after, "chat": live}, raising=False)
+    assert ClaudeCliTurnRuntime().release_sessions(["cron_tip", "cron_orig"]) == 2
+    assert before.closed and after.closed and not live.closed
+    assert list(rt._SESSIONS) == ["chat"]

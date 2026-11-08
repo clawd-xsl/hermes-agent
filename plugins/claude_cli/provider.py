@@ -10,7 +10,7 @@ over a private MCP server) and ``journal.py`` (tool-effect write-ahead log).
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from agent.turn_runtime_provider import TurnRuntimeProvider
 
@@ -191,6 +191,13 @@ class ClaudeCliTurnRuntime(TurnRuntimeProvider):
             detach_claude_cli_session(agent)
             return
         release_claude_cli_session(agent)
+
+    def release_sessions(self, session_ids: Iterable[str]) -> int:
+        # A one-shot run (webhook delivery, cron fire) bakes a fresh id into its pool key, so its child
+        # can never serve another turn; the pool only evicts under LRU pressure, so an idle child would
+        # otherwise hold its memory for hours and a burst could push a live chat out of the pool.
+        from plugins.claude_cli.runtime import release_claude_cli_sessions_by_owner
+        return release_claude_cli_sessions_by_owner(*session_ids)
 
     # -- compaction ------------------------------------------------------------------------------------
 
