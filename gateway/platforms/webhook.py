@@ -6,7 +6,7 @@ deliver/deliver_extra, deliver_only (rendered prompt IS the message), cron_job (
 job per event; the rendered prompt is transient per-run context; exclusive with deliver_only), mirror_to_session
 (opt-in: a delivered response is also written into the target chat's transcript so follow-ups there have
 context), session (isolated | main: the event enters the gateway home conversation, by default through
-a one-shot reviewer — filter_before_main; webhook_main.py). Per-route rate
+a one-shot reviewer — filter_before_main), model/provider (webhook_main.py). Per-route rate
 limiting, idempotency cache, body-size caps checked before reading. Generic HMAC V2 binds a timestamp for
 replay protection; body-only V1 is deprecated but accepted with a warning."""
 
@@ -244,6 +244,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(script_timeout_seconds=self._script_timeout_seconds)
         # Opt-in per-route debounce of rapid same-entity events (route ``coalesce`` block). #92066
         self._coalescer = WebhookCoalescer(dispatch=self._spawn_agent_run, render=self._render_prompt)
+        webhook_main.sync_model_channel_overrides(self)
 
     @property
     def token(self):
@@ -461,6 +462,7 @@ class WebhookAdapter(BasePlatformAdapter):
         except FileNotFoundError:
             if self._dynamic_routes:
                 self._dynamic_routes, self._routes = {}, dict(self._static_routes)
+                webhook_main.sync_model_channel_overrides(self)
                 logger.debug("[webhook] Dynamic subscriptions file removed, cleared dynamic routes")
             self._dynamic_routes_stat = None
             return
@@ -488,6 +490,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 if isinstance(v, dict) and k not in self._static_routes and self._dynamic_route_allowed(k, v)
             }
             self._routes = {**self._dynamic_routes, **self._static_routes}
+            webhook_main.sync_model_channel_overrides(self)
             self._dynamic_routes_stat = stat_key
             logger.info("[webhook] Reloaded %d dynamic route(s): %s", len(self._dynamic_routes),
                         ", ".join(self._dynamic_routes.keys()) or "(none)")
@@ -810,7 +813,8 @@ class WebhookAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=identity.session_chat_id, chat_name=f"webhook/{route_name}",
             chat_type=webhook_main.REVIEW_CHAT_TYPE if review else "webhook", user_id=f"webhook:{route_name}",
-            user_name=route_name)
+            user_name=route_name,
+            parent_chat_id=webhook_main.model_parent_id(self, route_name, self._routes.get(route_name)))
         if profile and isinstance(profile, str):
             # The ``/p/<profile>/`` prefix names the profile and wins over ``profile_routes``; the
             # edge already refused it (retryable 503) when that profile is not served. Drop what

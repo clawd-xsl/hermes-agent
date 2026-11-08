@@ -1,4 +1,4 @@
-"""Webhook route policy for ``session: main``.
+"""Webhook route policy for ``session: main`` and per-route runtime knobs.
 
 Route keys (each overridable per route, platform-wide default under ``platforms.webhook.extra``):
 
@@ -9,6 +9,9 @@ Route keys (each overridable per route, platform-wide default under ``platforms.
   whose destination is the main conversation. A bare ``NO_REPLY`` filters the event; anything else
   is a concise handoff that wakes main. ``false`` (trusted routes only) commits the rendered event
   straight into main.
+- ``model`` / ``provider``: the isolated run's (or reviewer's) model. Delivery chat ids are one-shot,
+  so each delivery inherits a stable route-scoped parent channel whose synthesized
+  ``ChannelOverride`` reuses the gateway's normal channel model/credential resolution.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 REVIEW_CHAT_TYPE = "webhook_review"
 MAIN_DESTINATION = "main_session"
+MODEL_OVERRIDE_CHANNEL_PREFIX = "__webhook_model__:"
 MAX_MAIN_HANDOFF_CHARS = 2_000
 
 
@@ -39,6 +43,10 @@ def coerce_bool(value: Any, *, default: bool) -> bool:
     return bool(value)
 
 
+def _clean(value: Any) -> Optional[str]:
+    return (str(value).strip() or None) if value is not None else None
+
+
 def _route_or_default(adapter, route: dict, key: str, default: Any) -> Any:
     value = route.get(key)
     return adapter.config.extra.get(key, default) if value is None or value == "" else value
@@ -52,6 +60,41 @@ def route_session_mode(adapter, route: dict) -> str:
 
 def route_reviews_before_main(adapter, route: dict) -> bool:
     return coerce_bool(_route_or_default(adapter, route, "filter_before_main", True), default=True)
+
+
+def route_model_override(adapter, route: dict) -> tuple[Optional[str], Optional[str]]:
+    extra = adapter.config.extra
+    return (_clean(route.get("model")) or _clean(extra.get("model")),
+            _clean(route.get("provider")) or _clean(extra.get("provider")))
+
+
+def model_parent_id(adapter, route_name: str, route: Optional[dict]) -> Optional[str]:
+    """The route-scoped parent channel a delivery inherits its model from, or None."""
+    if not isinstance(route, dict) or not any(route_model_override(adapter, route)):
+        return None
+    return f"{MODEL_OVERRIDE_CHANNEL_PREFIX}{route_name}"
+
+
+def sync_model_channel_overrides(adapter) -> None:
+    """Publish one synthesized ``ChannelOverride`` per route with a model/provider override (and drop
+    the ones a removed route left). An explicit ``channel_overrides`` entry under the reserved id wins."""
+    from gateway.config import ChannelOverride
+    overrides = adapter.config.channel_overrides
+    managed = adapter.__dict__.setdefault("_managed_model_channels", set())
+    for channel_id in managed:
+        overrides.pop(channel_id, None)
+    managed.clear()
+    for route_name, route in adapter._routes.items():
+        channel_id = model_parent_id(adapter, str(route_name), route)
+        if channel_id is None:
+            continue
+        if channel_id in overrides:
+            logger.warning("[webhook] Reserved channel override %s already exists; keeping the explicit "
+                           "channel_overrides entry", channel_id)
+            continue
+        model, provider = route_model_override(adapter, route)
+        overrides[channel_id] = ChannelOverride(model=model, provider=provider)
+        managed.add(channel_id)
 
 
 def build_review_prompt(*, route_name: str, event_type: str, rendered_event: str) -> str:
