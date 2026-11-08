@@ -443,7 +443,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             override = adapter.toolsets_for_source(source) if adapter is not None else None
         except Exception:
             override = None
-        if override and isinstance(override, list):
+        # None = no per-source override; an explicit [] = zero tools (a webhook main-session reviewer).
+        if isinstance(override, list):
             pts = dict(user_config.get("platform_toolsets") or {})
             pts[platform_key] = [str(x) for x in override]
             user_config = {**user_config, "platform_toolsets": pts}

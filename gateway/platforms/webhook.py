@@ -5,8 +5,9 @@ secret (REQUIRED; "INSECURE_NO_AUTH" skips validation, loopback only), prompt te
 deliver/deliver_extra, deliver_only (rendered prompt IS the message), cron_job (fire an existing cron
 job per event; the rendered prompt is transient per-run context; exclusive with deliver_only), mirror_to_session
 (opt-in: a delivered response is also written into the target chat's transcript so follow-ups there have
-context). Per-route rate limiting,
-idempotency cache, body-size caps checked before reading. Generic HMAC V2 binds a timestamp for
+context), session (isolated | main: the event enters the gateway home conversation, by default through
+a one-shot reviewer — filter_before_main; webhook_main.py). Per-route rate
+limiting, idempotency cache, body-size caps checked before reading. Generic HMAC V2 binds a timestamp for
 replay protection; body-only V1 is deprecated but accepted with a warning."""
 
 import asyncio
@@ -43,6 +44,7 @@ from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coales
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.platforms.webhook_mcp_events import (
     handle_mcp_event_control, mcp_event_delivery_id, render_mcp_event_prompt)
+from gateway.platforms import webhook_main
 from gateway.response_filters import is_autonomous_silence_response
 
 logger = logging.getLogger(__name__)
@@ -274,6 +276,10 @@ class WebhookAdapter(BasePlatformAdapter):
                                  f"exclusive: deliver_only pushes the rendered template as a message, cron_job fires "
                                  f"an existing cron job (which handles its own delivery).")
         validate_coalesce_config(name, route)
+        try:
+            webhook_main.route_session_mode(self, route)
+        except ValueError as exc:
+            raise ValueError(f"[webhook] Route '{name}': {exc}") from exc
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._reload_dynamic_routes()
@@ -330,6 +336,8 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception:
             logger.warning("[webhook] Destination unavailable for %s", chat_id, exc_info=True)
             return SendResult(success=False, error="Webhook destination unavailable or unauthorized")
+        if delivery["deliver"] == webhook_main.MAIN_DESTINATION:  # a reviewer's handoff wakes main
+            return await webhook_main.handoff_to_main(self, chat_id, content, delivery, metadata)
         return await self._deliver_to(delivery, chat_id, content)
 
     async def _deliver_to(self, delivery: dict[str, Any], chat_id: str, content: str) -> SendResult:
@@ -402,6 +410,8 @@ class WebhookAdapter(BasePlatformAdapter):
         user_id = str(getattr(source, "user_id", "") or "")
         if not user_id.startswith("webhook:"):
             return None
+        if getattr(source, "chat_type", None) == webhook_main.REVIEW_CHAT_TYPE:
+            return []  # a main-session reviewer is a classifier, never an actor: zero tools, not configurable
         route_config = self._routes.get(user_id[len("webhook:"):])
         toolsets = route_config.get("toolsets") if isinstance(route_config, dict) else None
         if not isinstance(toolsets, list):
@@ -430,6 +440,7 @@ class WebhookAdapter(BasePlatformAdapter):
         try:
             # Hot-reloaded from the request handler: a malformed block must skip the route, not 500 the request.
             validate_coalesce_config(name, route)
+            webhook_main.route_session_mode(self, route)
         except ValueError as e:
             logger.warning("[webhook] Dynamic route '%s' skipped: %s", name, e)
             return False
@@ -701,6 +712,11 @@ class WebhookAdapter(BasePlatformAdapter):
         if not self._route_processor.route_filters_match(route_config, payload, event_type, request.headers):
             logger.info("[webhook] filtered event=%s route=%s", event_type, route_name)
             return web.json_response({"status": "ignored", "reason": "filter", "route": route_name})
+        try:
+            main_mode = self._main_mode(route_config)
+        except ValueError:
+            logger.exception("[webhook] Invalid session mode for route %s", route_name)
+            return _json_error("Webhook route is misconfigured", 503)
         # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
         # only enters the routed profile's scope later around handle_message, so enter it here.
         # See #67277.
@@ -718,7 +734,8 @@ class WebhookAdapter(BasePlatformAdapter):
             prompt = (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
                       or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name))
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
-            if (skills := route_config.get("skills", [])) and not route_config.get("cron_job"):
+            # A reviewed main route applies them to the handoff that wakes main, never to the reviewer.
+            if (skills := route_config.get("skills", [])) and not route_config.get("cron_job") and main_mode != "review":
                 prompt = self._apply_skills(prompt, skills)
         now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
         delivery_identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
@@ -727,7 +744,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # the ledger cannot dedupe a provider retry or a replayed signed delivery; the route-scoped
         # in-memory guard is their only replay defence (main dedupes every route here).
         non_durable = bool(route_config.get("deliver_only") or route_config.get("cron_job")
-                           or isinstance(coalesce, dict))
+                           or isinstance(coalesce, dict) or main_mode == "direct")
         if non_durable and not self._record_delivery_id(delivery_identity, now):
             logger.info("[webhook] Skipping duplicate delivery %s on route %s", delivery_id, route_name)
             return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
@@ -755,8 +772,10 @@ class WebhookAdapter(BasePlatformAdapter):
             return _json_error("Admission unavailable; retry this delivery", 503)
         if outcome == "duplicate":
             return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
+        main_mode = self._main_mode(route_config)
+        main = {"session": "main", "reviewing": main_mode == "review"} if main_mode else {}
         return web.json_response({"status": "accepted", "route": route_name, "event": event_type,
-                                  "delivery_id": delivery_id}, status=202)
+                                  "delivery_id": delivery_id, **main}, status=202)
 
     def _spawn_agent_run(self, payload: Any, prompt: str, delivery_id: str, now: float, *, route_config: dict,
                          route_name: str, profile, event_type: str, superseded=()) -> asyncio.Task:
@@ -776,13 +795,22 @@ class WebhookAdapter(BasePlatformAdapter):
         task.add_done_callback(self._background_tasks.discard)
         return task
 
-    def _admission_source(self, route_name: str, profile, delivery_id: str):
+    def _main_mode(self, route_config: dict) -> Optional[str]:
+        """``None`` (isolated run), ``"review"`` (main through a one-shot reviewer) or ``"direct"``
+        (the rendered event straight into main). Raises ValueError on an unknown ``session``."""
+        if webhook_main.route_session_mode(self, route_config) != "main":
+            return None
+        return "review" if webhook_main.route_reviews_before_main(self, route_config) else "direct"
+
+    def _admission_source(self, route_name: str, profile, delivery_id: str, *, review: bool = False):
         """The ``SessionSource`` admission builds for one delivery, ``profile_routes`` resolved on it.
         The edge's coalesced-route check (``parked_profile_refusal``) asks this same source, so a
         route rule matches there exactly when it matches at admission."""
         identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
-        source = self.build_source(chat_id=identity.session_chat_id, chat_name=f"webhook/{route_name}",
-                                   chat_type="webhook", user_id=f"webhook:{route_name}", user_name=route_name)
+        source = self.build_source(
+            chat_id=identity.session_chat_id, chat_name=f"webhook/{route_name}",
+            chat_type=webhook_main.REVIEW_CHAT_TYPE if review else "webhook", user_id=f"webhook:{route_name}",
+            user_name=route_name)
         if profile and isinstance(profile, str):
             # The ``/p/<profile>/`` prefix names the profile and wins over ``profile_routes``; the
             # edge already refused it (retryable 503) when that profile is not served. Drop what
@@ -795,6 +823,10 @@ class WebhookAdapter(BasePlatformAdapter):
                                route_name: str, profile, event_type: str) -> Optional[str]:
         """Record delivery info and admit the run through the durable producer (shared by the immediate
         and coalesced paths). ``"accepted"`` / ``"duplicate"``, or None when admission failed."""
+        main_mode = self._main_mode(route_config)
+        if main_mode == "direct":
+            return await self._admit_main_direct(prompt, delivery_id, route_name=route_name, profile=profile,
+                                                 event_type=event_type)
         # (profile, route, delivery_id) in the session key → concurrent webhooks get independent runs.
         identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
         session_chat_id = identity.session_chat_id
@@ -804,11 +836,17 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver": route_config.get("deliver", "log"), "profile": profile,
             "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload),
             "route": route_name,
-            "mirror": route_config.get("mirror_to_session") is True}
+            "mirror": route_config.get("mirror_to_session") is True} if main_mode is None else {
+            # A reviewer's only destination is the main conversation (``webhook_main.handoff_to_main``).
+            "deliver": webhook_main.MAIN_DESTINATION, "profile": profile, "route": route_name,
+            "deliver_extra": {"event_type": event_type}}
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
-        source = self._admission_source(route_name, profile, delivery_id)
+        source = self._admission_source(route_name, profile, delivery_id, review=main_mode == "review")
+        if main_mode == "review":
+            prompt = webhook_main.build_review_prompt(route_name=route_name, event_type=event_type,
+                                                      rendered_event=prompt)
         event = MessageEvent(text=prompt, message_type=MessageType.TEXT, source=source, raw_message=payload,
                              message_id=delivery_id, timestamp=datetime.fromtimestamp(0, UTC))
         from gateway.platforms.webhook_ingress import admit_producer
@@ -834,6 +872,21 @@ class WebhookAdapter(BasePlatformAdapter):
         task = asyncio.create_task(self._finalize_delivery(event, authority, receipt))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return "accepted"
+
+    async def _admit_main_direct(self, prompt: str, delivery_id: str, *, route_name: str, profile,
+                                 event_type: str) -> Optional[str]:
+        """``filter_before_main: false``: commit the rendered event straight into the home conversation.
+        A main outage is retryable, so the delivery id is released for the provider's retry."""
+        try:
+            accepted = await webhook_main.enqueue_main(
+                self, profile=profile, text=webhook_main.main_event_text(route_name, event_type, prompt))
+        except Exception:
+            self._seen_deliveries.pop(_WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id), None)
+            logger.exception("[webhook] Main-session enqueue failed route=%s delivery=%s", route_name, delivery_id)
+            return None
+        logger.info("[webhook] Main-session event admitted route=%s delivery=%s session=%s queued=%s", route_name,
+                    delivery_id, accepted.session_key, accepted.queued)
         return "accepted"
 
     async def _finalize_delivery(self, event, authority, receipt):

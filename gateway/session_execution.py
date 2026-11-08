@@ -183,6 +183,10 @@ class GatewaySessionAgentMixin:
             load_soul_identity=not bool(policy and policy.ignore_rules),
             skip_memory=bool(policy and policy.ignore_rules),
             pass_session_id=bool(policy and policy.pass_session_id),
+            # A webhook main-session reviewer (gateway/platforms/webhook_main.py) classifies an untrusted
+            # external event: it may read memory but never writes back or forks a review of itself.
+            **({"skip_memory_sync": True, "skip_background_review": True}
+               if getattr(src, "chat_type", None) == "webhook_review" else {}),
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
             # None leaves the agent reading the owner's config, as before.
             run_budget_seconds=policy.run_budget_seconds if policy else None,
