@@ -160,3 +160,27 @@ def test_fire_outside_a_session_owner_fails_closed(monkeypatch):
     from cron.scheduler_main_session import run_main_session_fire
     success, _doc, final, error = run_main_session_fire({"id": "j"}, "j", "job", "prompt")
     assert success is False and final == "" and "live gateway" in error
+
+
+def test_admit_resolves_the_owning_profiles_home_and_commits_as_cron_main(monkeypatch, tmp_path):
+    import cron.scheduler_main_session as main_session
+    import gateway.main_session as gms
+    seen = {}
+
+    def resolve(runner, *, origin=None, profile=None):
+        seen["resolve"] = (origin, profile)
+        return "home-source"
+
+    async def enqueue(runner, *, source, text, producer, metadata=None):
+        seen["enqueue"] = (source, text, producer, metadata)
+        return "receipt"
+    monkeypatch.setattr(gms, "resolve_main_session_source", resolve)
+    monkeypatch.setattr(gms, "enqueue_main_session_turn", enqueue)
+    runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False),
+                             _served_profile_for_home=lambda home: "work")
+    authority = SimpleNamespace(runner=runner, db=SimpleNamespace(db_path=tmp_path / "state.db"), profile_id="p")
+    job = {"id": "j1", "origin": {"platform": "signal", "chat_id": "+1", "session_key": "k"}}
+    assert asyncio.run(main_session._admit(authority, job, "[Scheduled task: x]\n\ny")) == "receipt"
+    assert seen["resolve"] == ({"platform": "signal", "chat_id": "+1", "session_key": "k"}, "work")
+    assert seen["enqueue"] == ("home-source", "[Scheduled task: x]\n\ny", gms.CRON_PRODUCER,
+                               {"trigger": "cron", "job_id": "j1"})
