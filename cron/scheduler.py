@@ -2173,6 +2173,13 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to end session: %s", job_id, e)
     try:
+        # A fire is one-shot: a turn runtime's child pooled for it can never serve another turn.
+        # Both ids: a compression mid-run left the pre-rotation child pooled under the original.
+        from agent.turn_runtime_registry import release_runtime_sessions
+        release_runtime_sessions(_final_cron_session_id, cron_session_id)
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to release turn runtime sessions: %s", job_id, e)
+    try:
         from hermes_state_registry import release_or_close
         release_or_close(_session_db)
     except (Exception, KeyboardInterrupt) as e:
