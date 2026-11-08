@@ -120,6 +120,7 @@ hermes gateway restart
 - **`allow_from` empty**: pairing mode. An unknown DM receives Hermes' pairing code, which the operator
   approves with `hermes pairing approve signal CODE`. Unknown contacts never get a 👀 reaction.
 - **`group_allow_from`**: group IDs the agent may answer in; empty disables groups.
+- **Note to Self** is answered when your own number is in `allow_from` (Hermes never adds it for you).
 
 Use `/sethome` in a Signal chat to make it the home conversation later.
 
