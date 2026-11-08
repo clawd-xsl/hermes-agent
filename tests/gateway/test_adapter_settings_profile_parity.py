@@ -72,8 +72,6 @@ _SETTINGS = [
      lambda m: m.FeishuAdapter._load_settings({}).connection_mode),
     ("plugins.platforms.bluebubbles.adapter", "BLUEBUBBLES_WEBHOOK_PORT", "18010", "18110",
      lambda m: m._extra_or_secret({}, "webhook_port", "BLUEBUBBLES_WEBHOOK_PORT", "0")),
-    ("plugins.platforms.signal.adapter", "SIGNAL_REACTIONS", "true", "false",
-     lambda m: _signal_reactions(m)),
     ("plugins.platforms.line.adapter", "LINE_PORT", "18015", "18115",
      lambda m: (m._env_enablement() or {}).get("port")),
     ("plugins.platforms.buzz.adapter", "BUZZ_RELAY_URL", "wss://default.relay", "wss://secondary.relay",
@@ -91,12 +89,6 @@ def _slack(mod, method):
     adapter = object.__new__(mod.SlackAdapter)
     adapter.config = PlatformConfig(enabled=True)
     return getattr(adapter, method)()
-
-
-def _signal_reactions(mod):
-    adapter = object.__new__(mod.SignalAdapter)
-    adapter.dm_allow_from = {"*"}
-    return adapter._reactions_enabled()
 
 
 def _discord(mod, method):
@@ -120,23 +112,22 @@ def test_served_secondary_resolves_its_own_setting(monkeypatch, module, var, def
     assert served == standalone, f"{var}: served={served!r} standalone={standalone!r}"
 
 
-def test_signal_startup_gate_reads_the_profile_env(monkeypatch):
-    """A secondary whose SIGNAL_HTTP_URL/SIGNAL_ACCOUNT live only in its own .env must pass the startup
-    gate served exactly as it does standalone; a secondary WITHOUT them must not borrow the default's."""
+def test_signal_settings_and_startup_gate_are_config_only(monkeypatch, tmp_path):
+    """signal-ts reads its settings and startup gate from PlatformConfig.extra alone, so a served
+    secondary resolves exactly what it does standalone and can never borrow the default's env."""
     from plugins.platforms.signal import adapter as sig
-    for k in ("SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT"):
-        monkeypatch.delenv(k, raising=False)
-    ss.set_multiplex_active(True)
-    token = ss.set_secret_scope({"SIGNAL_HTTP_URL": "http://secondary.invalid:8080", "SIGNAL_ACCOUNT": "+15550000001"})
-    try:
-        assert sig.validate_signal_config(PlatformConfig(enabled=True)) is True
-    finally:
-        ss.reset_secret_scope(token)
+    state = tmp_path / "state.json"
+    state.write_text("{}")
+    extra = {"state_path": str(state), "sdk_path": str(tmp_path), "reactions": True}
+    monkeypatch.setenv("SIGNAL_REACTIONS", "false")
     monkeypatch.setenv("SIGNAL_HTTP_URL", "http://default.invalid:8080")
     monkeypatch.setenv("SIGNAL_ACCOUNT", "+15550000000")
-    token = ss.set_secret_scope({})
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({"SIGNAL_REACTIONS": "false"})
     try:
         assert sig.validate_signal_config(PlatformConfig(enabled=True)) is False
+        assert sig.validate_signal_config(PlatformConfig(enabled=True, extra=extra)) is True
+        assert sig.SignalAdapter(PlatformConfig(enabled=True, extra=extra)).reactions_enabled is True
     finally:
         ss.reset_secret_scope(token)
 

@@ -1,6 +1,6 @@
 """A serial receive loop's busy burst still merges, and the loop never waits out the hold window.
 
-Signal (``_sse_listener``) and IRC (``_receive_loop``) await ``handle_message`` before reading their
+Signal (``_inbound_loop``) and IRC (``_receive_loop``) await ``handle_message`` before reading their
 next input. A busy input held for its burst window must therefore return at once; otherwise the
 burst's next input arrives only after the burst committed alone (main returned once the input was
 merged into the pending slot). The reader still never runs ahead of what it returned on: a command
@@ -66,8 +66,7 @@ async def _busy_owner(monkeypatch, adapter, source, **wiring):
 
 def _signal(monkeypatch):
     from plugins.platforms.signal.adapter import SignalAdapter
-    monkeypatch.setenv('SIGNAL_ALLOWED_USERS', '+15550001')
-    adapter = SignalAdapter(PlatformConfig(enabled=True, extra={'account': '+15559999'}))
+    adapter = SignalAdapter(PlatformConfig(enabled=True, extra={'account': '+15559999', 'allow_from': ['+15550001']}))
     return adapter, adapter.build_source(chat_id='+15550001', chat_type='dm', user_id='+15550001')
 
 
@@ -95,7 +94,7 @@ def _hold_capture(monkeypatch):
 async def test_signal_busy_photos_merge_without_holding_the_reader(monkeypatch, tmp_path):
     adapter, source = _signal(monkeypatch)
     owner = await _busy_owner(monkeypatch, adapter, source)
-    for n in (1, 2):  # as _sse_listener does: the next envelope only after handle_message returned
+    for n in (1, 2):  # as _inbound_loop does: the next envelope only after handle_message returned
         await adapter.handle_message(_photo(source, tmp_path, n))
         assert owner.key in adapter._shared_bursts, 'the reader waited out the hold window'
     assert await owner.settle(2) == [('', 2)]

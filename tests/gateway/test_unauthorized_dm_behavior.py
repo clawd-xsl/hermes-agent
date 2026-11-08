@@ -84,6 +84,13 @@ def _make_runner(platform: Platform, config: GatewayConfig):
     return runner, adapter
 
 
+def _as_signal_allowlist_adapter(adapter, allowed):
+    """Give the stand-in adapter the signal-ts adapter's own-policy surface."""
+    adapter._dm_policy, adapter._group_policy = "allowlist", "disabled"
+    adapter.enforces_own_access_policy = True
+    adapter._is_dm_allowed = lambda sender: sender in allowed
+
+
 def test_whatsapp_lid_user_matches_phone_allowlist_via_modern_session_mapping(
     monkeypatch, tmp_path,
 ):
@@ -294,19 +301,21 @@ async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_signal_with_allowlist_ignores_unauthorized_dm(monkeypatch):
-    """When SIGNAL_ALLOWED_USERS is set, unauthorized DMs are silently dropped.
+    """When Signal's config allowlist (``extra.allow_from``) is set, unauthorized DMs are silently dropped.
 
     This is the primary regression test for #9337: before the fix, Signal
     would send pairing codes to ANY sender even when a strict allowlist was
-    configured, spamming personal contacts with cryptic bot messages.
+    configured, spamming personal contacts with cryptic bot messages. The
+    signal-ts adapter also drops such senders at intake; this covers the
+    gateway's own fallback when an event reaches it anyway.
     """
     _clear_auth_env(monkeypatch)
-    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+15550000001")  # allowlist set
 
     config = GatewayConfig(
-        platforms={Platform.SIGNAL: PlatformConfig(enabled=True)},
+        platforms={Platform.SIGNAL: PlatformConfig(enabled=True, extra={"allow_from": ["+15550000001"]})},
     )
     runner, adapter = _make_runner(Platform.SIGNAL, config)
+    _as_signal_allowlist_adapter(adapter, {"+15550000001"})
 
     result = await runner._handle_message(
         _make_event(Platform.SIGNAL, "+15559999999", "+15559999999")  # not in allowlist
@@ -364,12 +373,12 @@ def test_allowlist_authorized_user_returns_ignore_for_unauthorized(monkeypatch):
     authorized users is covered by the integration tests in this module.
     """
     _clear_auth_env(monkeypatch)
-    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+15550000001")
 
     config = GatewayConfig(
-        platforms={Platform.SIGNAL: PlatformConfig(enabled=True)},
+        platforms={Platform.SIGNAL: PlatformConfig(enabled=True, extra={"allow_from": ["+15550000001"]})},
     )
-    runner, _adapter = _make_runner(Platform.SIGNAL, config)
+    runner, adapter = _make_runner(Platform.SIGNAL, config)
+    _as_signal_allowlist_adapter(adapter, {"+15550000001"})
 
     behavior = runner._get_unauthorized_dm_behavior(Platform.SIGNAL)
     assert behavior == "ignore"

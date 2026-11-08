@@ -242,7 +242,7 @@ class TestGatewayRunnerInjection:
         assert runner._create_adapter(Platform.SIGNAL, PlatformConfig(enabled=True)) is None
 
     @pytest.mark.asyncio
-    async def test_real_signal_factory_routes_inbound_group_event(self, monkeypatch):
+    async def test_real_signal_factory_routes_inbound_group_event(self, monkeypatch, tmp_path):
         """A factory-built Signal adapter (bundled plugin, via the registry) resolves
         profile_routes for a real inbound envelope — the original bug was a bare
         ``SignalAdapter(config)`` with no runner."""
@@ -252,7 +252,8 @@ class TestGatewayRunnerInjection:
         discover_plugins()  # the gateway does this at startup; Signal is a plugin platform now
 
         group_id = "test-signal-route"
-        monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", group_id)
+        state = tmp_path / "state.json"
+        state.write_text("{}")
         runner = object.__new__(GatewayRunner)
         runner.config = GatewayConfig(
             multiplex_profiles=True,
@@ -262,7 +263,8 @@ class TestGatewayRunnerInjection:
         )
         adapter = runner._create_adapter(
             Platform.SIGNAL,
-            PlatformConfig(enabled=True, extra={"http_url": "http://127.0.0.1:18080", "account": "+15555550123"}),
+            PlatformConfig(enabled=True, extra={"state_path": str(state), "sdk_path": str(tmp_path),
+                                                "account": "+15555550123", "group_allow_from": [group_id]}),
         )
         assert adapter is not None and adapter.gateway_runner is runner
 

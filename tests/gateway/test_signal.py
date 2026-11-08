@@ -1,10 +1,9 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
-import base64
+import sys
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
-from urllib.parse import quote
 
 from gateway.config import Platform, PlatformConfig
 
@@ -24,24 +23,35 @@ def _reset_signal_scheduler():
 # ---------------------------------------------------------------------------
 
 def _make_signal_adapter(monkeypatch, account="+15551234567", **extra):
-    """Create a SignalAdapter with sensible test defaults."""
-    monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", extra.pop("group_allowed", ""))
+    """Create a SignalAdapter with sensible test defaults (config-owned signal-ts runtime)."""
+    group_allowed = extra.pop("group_allowed", "")
     from plugins.platforms.signal.adapter import SignalAdapter
     config = PlatformConfig()
     config.enabled = True
     config.extra = {
-        "http_url": "http://localhost:8080",
         "account": account,
+        "state_path": "/tmp/hermes-test-signal-state.json",
+        "sdk_path": "/tmp/hermes-test-signal-sdk",
+        "node_command": sys.executable,
+        "group_allow_from": group_allowed,
         **extra,
     }
     return SignalAdapter(config)
+
+
+def _runtime_files(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}")
+    sdk_path = tmp_path / "sdk"
+    sdk_path.mkdir()
+    return state_path, sdk_path
 
 
 def _stub_rpc(return_value):
     """Return an async mock for SignalAdapter._rpc that captures call params."""
     captured = []
 
-    async def mock_rpc(method, params, rpc_id=None):
+    async def mock_rpc(method, params, rpc_id=None, **kwargs):
         captured.append({"method": method, "params": dict(params)})
         return return_value
 
@@ -53,7 +63,7 @@ def _stub_rpc(return_value):
 # ---------------------------------------------------------------------------
 
 class TestSignalConfigLoading:
-    def test_apply_env_overrides_signal(self, monkeypatch):
+    def test_signal_cli_env_does_not_enable_signal(self, monkeypatch):
         monkeypatch.setenv("SIGNAL_HTTP_URL", "http://localhost:9090")
         monkeypatch.setenv("SIGNAL_ACCOUNT", "+15551234567")
 
@@ -61,11 +71,16 @@ class TestSignalConfigLoading:
         config = GatewayConfig()
         _apply_env_overrides(config)
 
-        assert Platform.SIGNAL in config.platforms
-        sc = config.platforms[Platform.SIGNAL]
-        assert sc.enabled is True
-        assert sc.extra["http_url"] == "http://localhost:9090"
-        assert sc.extra["account"] == "+15551234567"
+        assert Platform.SIGNAL not in config.platforms
+
+    def test_home_channel_env_mirror_applies_to_configured_signal(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_HOME_CHANNEL", "+15550000002")
+
+        from gateway.config import GatewayConfig, _apply_env_overrides
+        config = GatewayConfig(platforms={Platform.SIGNAL: PlatformConfig(enabled=True)})
+        _apply_env_overrides(config)
+
+        assert config.platforms[Platform.SIGNAL].home_channel.chat_id == "+15550000002"
 
 
 # ---------------------------------------------------------------------------
@@ -75,32 +90,188 @@ class TestSignalConfigLoading:
 class TestSignalAdapterInit:
     def test_init_parses_config(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch, group_allowed="group123,group456")
-        assert adapter.http_url == "http://localhost:8080"
+        assert str(adapter.state_path) == str(Path("/tmp/hermes-test-signal-state.json").resolve())
+        assert str(adapter.sdk_path) == str(Path("/tmp/hermes-test-signal-sdk").resolve())
+        assert adapter.node_executable == sys.executable
         assert adapter.account == "+15551234567"
         assert "group123" in adapter.group_allow_from
+        assert adapter._group_policy == "allowlist"
+
+    def test_empty_allowlists_mean_pairing_and_no_groups(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter.group_allow_from == set()
+        assert adapter._dm_policy == "pairing"
+        assert adapter._group_policy == "disabled"
+        assert adapter.enforces_own_access_policy is True
+
+    def test_list_allowlists_and_truthy_flags(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch, allow_from=["+15550000001", " "], group_allowed=["g1"],
+            require_mention="yes", ignore_stories="false", reactions=False)
+        assert adapter.dm_allow_from == {"+15550000001"}
+        assert adapter._dm_policy == "allowlist"
+        assert adapter.group_allow_from == {"g1"}
+        assert adapter.require_mention is True
+        assert adapter.ignore_stories is False
+        assert adapter.reactions_enabled is False
+
+    def test_init_expands_runtime_paths(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SIGNAL_TEST_ROOT", str(tmp_path))
+        adapter = _make_signal_adapter(
+            monkeypatch, state_path="$SIGNAL_TEST_ROOT/state.json", sdk_path=str(tmp_path / "sdk"))
+        assert adapter.state_path == (tmp_path / "state.json").resolve()
+        assert adapter.sdk_path == (tmp_path / "sdk").resolve()
+
+    def test_attachment_cache_is_under_hermes_home(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter._signal_cache_dir == tmp_path / "home" / "cache" / "signal-ts"
 
 
 class TestSignalConnectCleanup:
-    """Regression coverage for failed connect() cleanup."""
+    """Regression coverage for failed direct-runtime startup cleanup."""
 
     @pytest.mark.asyncio
-    async def test_releases_lock_and_closes_client_on_healthcheck_failure(self, monkeypatch):
-        adapter = _make_signal_adapter(monkeypatch)
+    async def test_releases_lock_on_sidecar_startup_failure(self, monkeypatch, tmp_path):
+        state_path, sdk_path = _runtime_files(tmp_path)
+        adapter = _make_signal_adapter(monkeypatch, state_path=str(state_path), sdk_path=str(sdk_path))
+        sidecar = MagicMock()
+        from plugins.platforms.signal.signal_ts import SignalTsStartupError
+        sidecar.start = AsyncMock(side_effect=SignalTsStartupError(
+            "state has no linked account", code="state_unlinked", retryable=False))
 
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=MagicMock(status_code=503))
-        mock_client.aclose = AsyncMock()
-
-        with patch("plugins.platforms.signal.adapter.httpx.AsyncClient", return_value=mock_client), \
+        with patch.object(adapter, "_new_sidecar", return_value=sidecar), \
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
              patch("gateway.status_scoped_locks.release_scoped_lock") as mock_release:
             result = await adapter.connect()
 
         assert result is False
-        mock_client.aclose.assert_awaited_once()
         mock_release.assert_called_once_with("signal-phone", "+15551234567")
-        assert adapter.client is None
+        assert adapter._sidecar is None
+        assert adapter._inbound_task is None
         assert adapter._platform_lock_identity is None
+        assert adapter.fatal_error_code == "signal_ts_state_unlinked"
+        assert adapter.fatal_error_retryable is False
+
+    @pytest.mark.asyncio
+    async def test_missing_runtime_files_fail_without_spawning(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(
+            monkeypatch, state_path=str(tmp_path / "missing.json"), sdk_path=str(tmp_path))
+        with patch.object(adapter, "_new_sidecar") as new_sidecar:
+            assert await adapter.connect() is False
+        new_sidecar.assert_not_called()
+        assert adapter.fatal_error_code == "signal_ts_config"
+
+    @pytest.mark.asyncio
+    async def test_connect_adopts_account_from_state(self, monkeypatch, tmp_path):
+        state_path, sdk_path = _runtime_files(tmp_path)
+        adapter = _make_signal_adapter(monkeypatch, account="", state_path=str(state_path), sdk_path=str(sdk_path))
+        sidecar = MagicMock()
+        sidecar.start = AsyncMock()
+        sidecar.account, sidecar.aci = "+15551234567", "aci-1"
+        sidecar.wait_closed = AsyncMock(side_effect=asyncio.Event().wait)
+        sidecar.close = AsyncMock()
+
+        with patch.object(adapter, "_new_sidecar", return_value=sidecar), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)) as acquire, \
+             patch("gateway.status_scoped_locks.release_scoped_lock"):
+            assert await adapter.connect() is True
+            # No configured account: the lock guards the state file two clients would share.
+            assert acquire.call_args.args[:2] == ("signal-phone", str(state_path.resolve()))
+            assert adapter.account == adapter._account_normalized == "+15551234567"
+            await adapter.disconnect()
+        sidecar.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_supervisor_replaces_exited_sidecar(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        current = MagicMock()
+        current.wait_closed = AsyncMock()
+        replacement = MagicMock()
+        replacement.start = AsyncMock()
+
+        async def replacement_closed():
+            adapter._running = False
+
+        replacement.wait_closed = AsyncMock(side_effect=replacement_closed)
+        adapter._running = True
+        adapter._sidecar = current
+
+        with patch.object(adapter, "_new_sidecar", return_value=replacement), \
+             patch("plugins.platforms.signal.adapter.asyncio.sleep", new=AsyncMock()):
+            await adapter._supervise_sidecar(current)
+
+        replacement.start.assert_awaited_once()
+        assert adapter._sidecar is replacement
+
+    @pytest.mark.asyncio
+    async def test_supervisor_backs_off_on_failed_restart(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        current = MagicMock()
+        current.wait_closed = AsyncMock()
+        failing = MagicMock()
+        failing.start = AsyncMock(side_effect=RuntimeError("network down"))
+        working = MagicMock()
+        working.start = AsyncMock()
+
+        async def working_closed():
+            adapter._running = False
+
+        working.wait_closed = AsyncMock(side_effect=working_closed)
+        sleeps = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        adapter._running = True
+        with patch.object(adapter, "_new_sidecar", side_effect=[failing, failing, working]), \
+             patch("plugins.platforms.signal.adapter.asyncio.sleep", new=fake_sleep):
+            await adapter._supervise_sidecar(current)
+
+        assert sleeps == [1.0, 2.0, 4.0]
+        assert adapter._sidecar is working
+
+
+class TestSignalInboundOrdering:
+    @pytest.mark.asyncio
+    async def test_envelopes_are_handled_one_at_a_time_in_order(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        order, release = [], asyncio.Event()
+
+        async def handle(envelope):
+            order.append(("start", envelope["n"]))
+            if envelope["n"] == 1:
+                await release.wait()
+            order.append(("end", envelope["n"]))
+
+        adapter._handle_envelope = handle
+        adapter._inbound = asyncio.Queue()
+        adapter._inbound_task = asyncio.create_task(adapter._inbound_loop(adapter._inbound))
+        for n in (1, 2, 3):
+            adapter._enqueue_envelope({"n": n})
+        await asyncio.sleep(0.01)
+        assert order == [("start", 1)]
+        release.set()
+        await adapter._stop_inbound(drain=True)
+        assert order == [("start", 1), ("end", 1), ("start", 2), ("end", 2), ("start", 3), ("end", 3)]
+
+    @pytest.mark.asyncio
+    async def test_handler_failure_does_not_stop_the_loop(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        seen = []
+
+        async def handle(envelope):
+            seen.append(envelope["n"])
+            if envelope["n"] == 1:
+                raise RuntimeError("boom")
+
+        adapter._handle_envelope = handle
+        adapter._inbound = asyncio.Queue()
+        adapter._inbound_task = asyncio.create_task(adapter._inbound_loop(adapter._inbound))
+        adapter._enqueue_envelope({"n": 1})
+        adapter._enqueue_envelope({"n": 2})
+        await adapter._stop_inbound(drain=True)
+        assert seen == [1, 2]
 
 
 class TestSignalHelpers:
@@ -199,10 +370,8 @@ class TestSignalHelpers:
 
 
 
-    def test_check_requirements(self, monkeypatch):
+    def test_check_requirements_is_a_passive_probe(self):
         from plugins.platforms.signal.adapter import check_signal_requirements
-        monkeypatch.setenv("SIGNAL_HTTP_URL", "http://localhost:8080")
-        monkeypatch.setenv("SIGNAL_ACCOUNT", "+15551234567")
         assert check_signal_requirements() is True
 
     def test_render_mentions(self):
@@ -214,32 +383,18 @@ class TestSignalHelpers:
         assert "\uFFFC" not in result
 
 
-    def test_validate_signal_config_accepts_platform_values(self, monkeypatch):
-        monkeypatch.delenv("SIGNAL_HTTP_URL", raising=False)
-        monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
+    def test_validate_signal_config_needs_existing_runtime_files(self, tmp_path):
         from plugins.platforms.signal.adapter import validate_signal_config
-
-        config = PlatformConfig(
-            enabled=True,
-            extra={
-                "http_url": "http://localhost:8080",
-                "account": "+155****4567",
-            },
-        )
-        assert validate_signal_config(config) is True
-
-
-# ---------------------------------------------------------------------------
-# SSE URL Encoding (Bug Fix: phone numbers with + must be URL-encoded)
-# ---------------------------------------------------------------------------
-
-class TestSignalSSEUrlEncoding:
-    """Verify that phone numbers with + are URL-encoded in the SSE endpoint."""
-
-    def test_sse_url_encodes_plus_in_account(self):
-        """The + in E.164 phone numbers must be percent-encoded in the SSE query string."""
-        encoded = quote("+31612345678", safe="")
-        assert encoded == "%2B31612345678"
+        state_path, sdk_path = _runtime_files(tmp_path)
+        extra = {"state_path": str(state_path), "sdk_path": str(sdk_path)}
+        assert validate_signal_config(PlatformConfig(enabled=True, extra=extra)) is True
+        assert validate_signal_config(PlatformConfig(enabled=True, extra={**extra, "node_command": sys.executable}))
+        assert validate_signal_config(PlatformConfig(enabled=True, extra={})) is False
+        assert validate_signal_config(PlatformConfig(
+            enabled=True, extra={**extra, "state_path": str(tmp_path / "missing.json")})) is False
+        # An explicit node_command must resolve; it is a scalar executable, never a shell line.
+        assert validate_signal_config(PlatformConfig(
+            enabled=True, extra={**extra, "node_command": f"{sys.executable} --flag"})) is False
 
 
 # ---------------------------------------------------------------------------
@@ -250,14 +405,16 @@ class TestSignalAttachmentFetch:
     """Verify that _fetch_attachment uses the correct RPC parameter name."""
 
     @pytest.mark.asyncio
-    async def test_fetch_attachment_uses_id_parameter(self, monkeypatch):
-        """RPC getAttachment must use 'id', not 'attachmentId' (signal-cli requirement)."""
+    async def test_fetch_attachment_uses_id_parameter(self, monkeypatch, tmp_path):
+        """getAttachment takes the opaque inbound id; the staged file is consumed."""
         adapter = _make_signal_adapter(monkeypatch)
+        adapter._signal_cache_dir = tmp_path
 
         png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
-        b64_data = base64.b64encode(png_data).decode()
+        staged = tmp_path / "attachment"
+        staged.write_bytes(png_data)
 
-        adapter._rpc, captured = _stub_rpc({"data": b64_data})
+        adapter._rpc, captured = _stub_rpc({"path": str(staged)})
 
         with patch(
             "plugins.platforms.signal.adapter.cache_image_from_bytes_async",
@@ -268,8 +425,39 @@ class TestSignalAttachmentFetch:
         call = captured[0]
         assert call["method"] == "getAttachment"
         assert call["params"]["id"] == "attachment-123"
-        assert "attachmentId" not in call["params"], "Must NOT use 'attachmentId' — causes NullPointerException in signal-cli"
+        assert "attachmentId" not in call["params"]
         assert call["params"]["account"] == "+15551234567"
+        assert not staged.exists()
+
+    @pytest.mark.asyncio
+    async def test_fetch_attachment_returns_none_on_empty(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._rpc, _ = _stub_rpc(None)
+        assert await adapter._fetch_attachment("missing-id") == (None, "")
+
+    @pytest.mark.asyncio
+    async def test_fetch_attachment_refuses_paths_outside_cache(self, monkeypatch, tmp_path):
+        from plugins.platforms.signal.signal_ts import SignalTsProcessError
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._signal_cache_dir = tmp_path / "cache"
+        outside = tmp_path / "secret.txt"
+        outside.write_bytes(b"secret")
+        adapter._rpc, _ = _stub_rpc({"path": str(outside)})
+        with pytest.raises(SignalTsProcessError):
+            await adapter._fetch_attachment("evil")
+        assert outside.exists()
+
+    @pytest.mark.asyncio
+    async def test_fetch_attachment_caches_documents(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._signal_cache_dir = tmp_path
+        staged = tmp_path / "attachment"
+        staged.write_bytes(b"%PDF-1.4" + b"\x00" * 100)
+        adapter._rpc, _ = _stub_rpc({"path": str(staged)})
+        with patch("plugins.platforms.signal.adapter.cache_document_from_bytes_async",
+                   new=AsyncMock(return_value="/tmp/test.pdf")):
+            assert await adapter._fetch_attachment("doc-456") == ("/tmp/test.pdf", ".pdf")
+        assert not staged.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +530,100 @@ class TestSignalAuthorization:
             result = gw._is_user_authorized(source)
             assert result is False
 
+    @staticmethod
+    def _runner_with(adapter):
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        gw = GatewayRunner.__new__(GatewayRunner)
+        gw.config = GatewayConfig(platforms={Platform.SIGNAL: adapter.config})
+        gw.adapters = {Platform.SIGNAL: adapter}
+        gw.pairing_store = MagicMock()
+        gw.pairing_store.is_approved.return_value = False
+        return gw
+
+    @staticmethod
+    def _source(user_id, chat_type="dm", chat_id=None):
+        source = MagicMock()
+        source.platform = Platform.SIGNAL
+        source.user_id = user_id
+        source.chat_id = chat_id or user_id
+        source.chat_type = chat_type
+        source.profile = None
+        source.is_bot = False
+        source.delivered_via_upstream_relay = False
+        return source
+
+    def test_config_allowlist_authorizes_listed_sender(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, allow_from=["+15559999999"])
+        gw = self._runner_with(adapter)
+        with patch.dict("os.environ", {}, clear=True):
+            assert gw._is_user_authorized(self._source("+15559999999")) is True
+            assert gw._is_user_authorized(self._source("+15550000000")) is False
+
+    def test_config_allowlist_matches_known_aci_for_a_number(self, monkeypatch):
+        aci = "05668cf3-8ffa-467e-9b24-f5eefa5cf475"
+        adapter = _make_signal_adapter(monkeypatch, allow_from=[aci])
+        adapter._remember_recipient_identifiers("+15559999999", aci)
+        gw = self._runner_with(adapter)
+        with patch.dict("os.environ", {}, clear=True):
+            assert gw._is_user_authorized(self._source("+15559999999")) is True
+
+    def test_stale_signal_env_allowlist_grants_nothing(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, allow_from=["+15559999999"])
+        gw = self._runner_with(adapter)
+        with patch.dict("os.environ", {"SIGNAL_ALLOWED_USERS": "+15550000000",
+                                       "SIGNAL_ALLOW_ALL_USERS": "true"}, clear=True):
+            assert gw._is_user_authorized(self._source("+15550000000")) is False
+
+    def test_allowed_group_authorizes_its_members(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, group_allowed="grp1")
+        gw = self._runner_with(adapter)
+        with patch.dict("os.environ", {}, clear=True):
+            assert gw._is_user_authorized(self._source("+15550000000", "group", "group:grp1")) is True
+
+    @pytest.mark.asyncio
+    async def test_adapter_drops_sender_outside_config_allowlist(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, allow_from=["+15550000001"])
+        handler = AsyncMock()
+        adapter.handle_message = handler
+
+        def envelope(sender: str) -> dict:
+            return {"sourceNumber": sender, "sourceName": "User", "timestamp": 1_700_000_000_000,
+                    "dataMessage": {"message": "hello"}}
+
+        await adapter._handle_envelope(envelope("+15550000002"))
+        await adapter._handle_envelope(envelope("+15550000001"))
+
+        handler.assert_awaited_once()
+        assert handler.await_args.args[0].source.user_id == "+15550000001"
+
+    @pytest.mark.asyncio
+    async def test_pairing_mode_forwards_unknown_dm(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        handler = AsyncMock()
+        adapter.handle_message = handler
+        await adapter._handle_envelope({"sourceNumber": "+15550000002", "timestamp": 1_700_000_000_000,
+                                        "dataMessage": {"message": "hi"}})
+        handler.assert_awaited_once()
+
+    def test_reactions_follow_access_policy(self, monkeypatch):
+        from types import SimpleNamespace
+        allow = _make_signal_adapter(monkeypatch, allow_from=["+15550000001"], group_allowed="grp1")
+        pairing = _make_signal_adapter(monkeypatch, group_allowed="grp1")
+        off = _make_signal_adapter(monkeypatch, allow_from=["*"], reactions=False)
+
+        def event(user, chat_type="dm", chat_id=None):
+            return SimpleNamespace(source=SimpleNamespace(
+                user_id=user, user_id_alt=None, chat_type=chat_type, chat_id=chat_id or user))
+
+        assert allow._reactions_enabled(event("+15550000001")) is True
+        assert allow._reactions_enabled(event("+15550000002")) is False
+        # Pairing mode: an unknown DM must not learn a bot is listening.
+        assert pairing._reactions_enabled(event("+15550000002")) is False
+        assert pairing._reactions_enabled(event("+15550000002", "group", "group:grp1")) is True
+        assert off._reactions_enabled(event("+15550000001")) is False
+
 
 # ---------------------------------------------------------------------------
 # Send Message Tool
@@ -351,10 +633,65 @@ class TestSignalAuthorization:
 # send_image_file method (#5105)
 # ---------------------------------------------------------------------------
 
+class TestSignalSendFiles:
+    @pytest.mark.asyncio
+    async def test_send_files_batches_into_one_message_with_formatted_caption(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(monkeypatch)
+        first, second = tmp_path / "one.png", tmp_path / "two.pdf"
+        first.write_bytes(b"\x89PNG")
+        second.write_bytes(b"%PDF-1.4")
+        adapter._rpc, captured = _stub_rpc({"timestamp": 1234567890, "results": [{"type": "SUCCESS"}]})
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send_files("+155****9999", [str(first), str(second)], caption="**Report** ready")
+
+        assert result.success is True
+        assert len(captured) == 1
+        params = captured[0]["params"]
+        assert captured[0]["method"] == "send"
+        assert params["recipient"] == ["+155****9999"]
+        assert params["attachments"] == [str(first.resolve()), str(second.resolve())]
+        assert params["message"] == "Report ready"
+        assert params["textStyle"] == "0:6:BOLD"
+        assert 1234567890 in adapter._recent_sent_timestamps
+
+    @pytest.mark.asyncio
+    async def test_send_files_fails_when_every_path_is_missing(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        result = await adapter.send_files("+155****9999", [str(tmp_path / "missing.png")])
+        assert result.success is False
+        assert "No valid" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_files_reports_undelivered_batch(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        doc = tmp_path / "a.pdf"
+        doc.write_bytes(b"%PDF")
+        adapter._rpc, _ = _stub_rpc(None)
+        with patch("plugins.platforms.signal.adapter.asyncio.sleep", new=AsyncMock()):
+            result = await adapter.send_files("group:g1", [str(doc)])
+        assert result.success is False
+        assert "not delivered" in result.error
+
+
+class TestSignalReactionRemoval:
+    @pytest.mark.asyncio
+    async def test_remove_reaction_names_the_lifecycle_emoji(self, monkeypatch):
+        """Signal's protocol needs the original emoji on a removal; an empty one removes nothing."""
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._rpc, captured = _stub_rpc({"timestamp": 1})
+        assert await adapter.remove_reaction("+15550000001", "+15550000001", 1700000000000) is True
+        params = captured[0]["params"]
+        assert captured[0]["method"] == "sendReaction"
+        assert params["emoji"] == "👀" and params["remove"] is True
+
+
 class TestSignalSendImageFile:
     @pytest.mark.asyncio
     async def test_send_image_file_sends_via_rpc(self, monkeypatch, tmp_path):
-        """send_image_file should send image as attachment via signal-cli RPC."""
+        """send_image_file should send image as attachment through the sidecar."""
         adapter = _make_signal_adapter(monkeypatch)
         mock_rpc, captured = _stub_rpc({"timestamp": 1234567890})
         adapter._rpc = mock_rpc
@@ -438,7 +775,7 @@ class TestSignalRecipientResolution:
 class TestSignalSendVoice:
     @pytest.mark.asyncio
     async def test_send_voice_sends_via_rpc(self, monkeypatch, tmp_path):
-        """send_voice should send audio as attachment via signal-cli RPC."""
+        """send_voice should send audio as attachment through the sidecar."""
         adapter = _make_signal_adapter(monkeypatch)
         mock_rpc, captured = _stub_rpc({"timestamp": 1234567890})
         adapter._rpc = mock_rpc
@@ -485,7 +822,7 @@ class TestSignalSendVoice:
 class TestSignalSendVideo:
     @pytest.mark.asyncio
     async def test_send_video_sends_via_rpc(self, monkeypatch, tmp_path):
-        """send_video should send video as attachment via signal-cli RPC."""
+        """send_video should send video as attachment through the sidecar."""
         adapter = _make_signal_adapter(monkeypatch)
         mock_rpc, captured = _stub_rpc({"timestamp": 1234567890})
         adapter._rpc = mock_rpc
@@ -515,7 +852,7 @@ class TestSignalSendVideo:
 # ---------------------------------------------------------------------------
 
 def _make_dm_envelope(sender: str, attachments: list, text: str = "") -> dict:
-    """Build a minimal signal-cli DM envelope with the given attachments."""
+    """Build a minimal DM envelope with the given attachments."""
     return {
         "envelope": {
             "sourceNumber": sender,
@@ -815,7 +1152,7 @@ class TestSignalTypingBackoff:
     - log WARNING only for the first failure (subsequent failures use DEBUG
       via log_failures=False on the _rpc call)
     - after 3 consecutive failures, skip the RPC entirely during an
-      exponential cooldown window instead of hammering signal-cli every 2s
+      exponential cooldown window instead of hammering the sidecar every 2s
     - reset counters on a successful sendTyping
     - reset counters when _stop_typing_indicator() is called for the chat
     """
@@ -880,7 +1217,7 @@ class TestSignalStopTypingExplicitRPC:
 
         # Now make the stop RPC raise — backoff state must still be cleared.
         async def failing_rpc(method, params, rpc_id=None, **kwargs):
-            raise RuntimeError("signal-cli unreachable")
+            raise RuntimeError("signal-ts unreachable")
 
         adapter._rpc = failing_rpc
 
@@ -948,27 +1285,18 @@ class TestSignalQuoteExtraction:
 # _rpc rate-limit detection
 # ---------------------------------------------------------------------------
 
-class _FakeHttpResponse:
-    """Minimal stand-in for httpx.Response — only what _rpc touches."""
-
-    def __init__(self, json_data):
-        self._json = json_data
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return self._json
-
-
 def _install_fake_client(adapter, json_data):
-    """Replace adapter.client.post with an async fn returning json_data."""
+    """Install a live-looking sidecar whose call returns ``json_data["result"]`` or raises its error."""
     from types import SimpleNamespace
+    from plugins.platforms.signal.signal_ts import SignalTsCallError
 
-    async def _post(url, json=None, timeout=None):
-        return _FakeHttpResponse(json_data)
+    async def _call(method, params, timeout=None):
+        error = json_data.get("error")
+        if error:
+            raise SignalTsCallError(str(error.get("message") or error), details=error)
+        return json_data.get("result")
 
-    adapter.client = SimpleNamespace(post=_post)
+    adapter._sidecar = SimpleNamespace(running=True, call=_call)
 
 
 class TestSignalRpcRateLimit:
@@ -988,10 +1316,43 @@ class TestSignalRpcRateLimit:
 
 
     @pytest.mark.asyncio
-    async def test_raises_with_retry_after_from_v0_14_3_payload(self, monkeypatch):
-        """signal-cli ≥ v0.14.3 surfaces server Retry-After under
-        ``error.data.response.results[*].retryAfterSeconds`` — _rpc
-        carries that value through SignalRateLimitError.retry_after."""
+    async def test_raises_with_retry_after_from_sidecar_error(self, monkeypatch):
+        """The sidecar flags libsignal's RateLimitedError (``rateLimited`` + ``retryAfterSeconds``);
+        _rpc carries the hint through SignalRateLimitError.retry_after."""
+        from plugins.platforms.signal.signal_rate_limit import SignalRateLimitError
+
+        adapter = _make_signal_adapter(monkeypatch)
+        _install_fake_client(adapter, {
+            "error": {"name": "LibSignalErrorBase", "message": "[429] Rate limit exceeded: RateLimitedError",
+                      "rateLimited": True, "retryAfterSeconds": 42},
+        })
+
+        with pytest.raises(SignalRateLimitError) as exc_info:
+            await adapter._rpc("send", {}, raise_on_rate_limit=True)
+
+        assert exc_info.value.retry_after == 42.0
+
+    @pytest.mark.asyncio
+    async def test_process_failure_returns_none(self, monkeypatch):
+        from types import SimpleNamespace
+        from plugins.platforms.signal.signal_ts import SignalTsProcessError
+
+        adapter = _make_signal_adapter(monkeypatch)
+
+        async def _call(method, params, timeout=None):
+            raise SignalTsProcessError("runtime closed")
+
+        adapter._sidecar = SimpleNamespace(running=True, call=_call)
+        assert await adapter._rpc("send", {}, raise_on_rate_limit=True) is None
+
+    @pytest.mark.asyncio
+    async def test_disconnected_returns_none(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        assert await adapter._rpc("send", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_raises_with_retry_after_from_legacy_results_payload(self, monkeypatch):
+        """The legacy ``error.data.response.results[*].retryAfterSeconds`` shape is still read."""
         from plugins.platforms.signal.signal_rate_limit import (
             SignalRateLimitError, SIGNAL_RPC_ERROR_RATELIMIT,
         )
@@ -1132,7 +1493,7 @@ class TestSignalSendMultipleImages:
     async def test_429_without_retry_after_uses_default_rate(
         self, monkeypatch, tmp_path
     ):
-        """signal-cli < v0.14.3 doesn't surface Retry-After. The
+        """A 429 without a server Retry-After hint: the
         scheduler keeps its default refill rate (1 token / 4s), so a
         retry of n=3 waits 12s."""
         from plugins.platforms.signal.signal_rate_limit import (
@@ -1239,9 +1600,10 @@ class TestSignalContentlessEnvelope:
 
 
     @pytest.mark.asyncio
-    async def test_allows_message_with_attachment_no_text(self, monkeypatch):
+    async def test_allows_message_with_attachment_no_text(self, monkeypatch, tmp_path):
         """Messages with attachments but no text should still be processed."""
         adapter = _make_signal_adapter(monkeypatch)
+        adapter._signal_cache_dir = tmp_path
         captured = {}
 
         async def fake_handle(event):
@@ -1251,8 +1613,9 @@ class TestSignalContentlessEnvelope:
 
         # Mock attachment fetch to return a cached image
         png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
-        b64_data = base64.b64encode(png_data).decode()
-        adapter._rpc, _ = _stub_rpc({"data": b64_data})
+        staged = tmp_path / "attachment"
+        staged.write_bytes(png_data)
+        adapter._rpc, _ = _stub_rpc({"path": str(staged)})
 
         with patch(
             "plugins.platforms.signal.adapter.cache_image_from_bytes_async",
@@ -1276,7 +1639,7 @@ class TestSignalContentlessEnvelope:
 
 
 class TestSignalSyncMessageHandling:
-    """signal-cli running as a linked secondary device receives the user's
+    """signal-ts running as a linked secondary device receives the user's
     own messages as ``syncMessage.sentMessage`` envelopes. Two cases must
     be handled:
 

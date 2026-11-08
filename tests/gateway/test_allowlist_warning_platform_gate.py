@@ -24,8 +24,12 @@ def _runner(platforms, tmp_path):
         ({Platform.API_SERVER: PlatformConfig(enabled=True, extra={"key": "k" * 40})}, False),
         ({Platform.API_SERVER: PlatformConfig(enabled=True), Platform.TELEGRAM: PlatformConfig(enabled=True)}, True),
         ({Platform.TELEGRAM: PlatformConfig(enabled=False)}, False),
+        # Signal's allowlist is config-owned (extra.allow_from), not env.
+        ({Platform.SIGNAL: PlatformConfig(enabled=True, extra={"allow_from": ["+15550000001"]})}, False),
+        ({Platform.SIGNAL: PlatformConfig(enabled=True, extra={"allow_from": []})}, True),
     ],
-    ids=["api_server_only", "api_server_plus_telegram", "telegram_disabled"],
+    ids=["api_server_only", "api_server_plus_telegram", "telegram_disabled", "signal_config_allowlist",
+         "signal_pairing_mode"],
 )
 def test_allowlist_warning_requires_an_enabled_messaging_platform(
     monkeypatch, tmp_path, caplog, platforms, expect_warning,

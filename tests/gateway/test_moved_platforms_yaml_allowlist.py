@@ -2,7 +2,8 @@
 
 Their registry entries declare ``allowed_users_env``, so with no env allowlist the gateway reads the live
 adapter's ``extra.allowed_users``, as it already does for Telegram, Discord, Slack and the other plugin
-platforms. Listed senders are admitted; everyone else stays default-deny.
+platforms. Listed senders are admitted; everyone else stays default-deny. (Signal moved too, but its
+signal-ts adapter owns its policy via ``extra.allow_from``; tests/gateway/test_signal.py covers it.)
 """
 
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
 
-_MOVED = ("signal", "weixin", "bluebubbles", "qqbot", "yuanbao", "whatsapp_cloud")
+_MOVED = ("weixin", "bluebubbles", "qqbot", "yuanbao", "whatsapp_cloud")
 
 
 @pytest.mark.parametrize("platform", _MOVED)
