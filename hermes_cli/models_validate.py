@@ -757,7 +757,26 @@ def _for(*providers: str) -> Callable[[_Request], bool]:
 # base_url) → OpenRouter preset parse → LM Studio → Ollama native → custom →
 # codex/xai static → MiniMax → managed local (staged library) → Anthropic native →
 # Anthropic Messages → external process → live listing → Bedrock → curated-catalog fallback (always decides).
+def _is_turn_runtime(req: _Request) -> bool:
+    if not req.api_mode:
+        return False
+    from agent.turn_runtime_registry import is_turn_runtime_mode
+    return is_turn_runtime_mode(req.api_mode) and req.api_mode != "codex_app_server"
+
+
+def _validate_turn_runtime(req: _Request) -> dict[str, Any]:
+    """A plugin turn runtime (claude_cli) has no HTTP endpoint or key to probe: validate against the
+    provider's bundled catalog and soft-accept newer/entitlement-gated ids, which the runtime itself
+    validates when the next turn starts."""
+    match = _match_in_catalog(req.lookup, _static_catalog(req.normalized), suggest_query=req.requested)
+    return match.verdict(req) or _soft_accept(
+        f"Note: `{req.requested}` could not be verified through the {req.api_mode} runtime; it validates "
+        f"access when the next turn starts.{match.suggestion_text}"
+    )
+
+
 _LADDER: tuple[tuple[Callable[[_Request], bool], Callable[[_Request], Optional[dict[str, Any]]]], ...] = (
+    (_is_turn_runtime, _validate_turn_runtime),
     (_for("moa"), _validate_moa),
     (lambda req: True, _reject_whitespace),
     (_for("openrouter"), _parse_openrouter_preset),

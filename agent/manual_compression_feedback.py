@@ -45,12 +45,19 @@ def summarize_manual_compression(
     aborted = flag("_last_compress_aborted")
     refused_would_grow = flag("_last_compress_refused_would_grow")
     fallback_used = flag("_last_summary_fallback_used")
+    # A turn runtime compacted its own native thread: the mirror is deliberately unchanged.
+    native_compaction = flag("_last_native_compaction") and not aborted
+    noop = noop and not native_compaction
     failure_reason = getattr(compression_state, "_last_summary_error", None)
     if not isinstance(failure_reason, str) or not failure_reason.strip():
         failure_reason = None
 
     note = None
-    if refused_would_grow:
+    if native_compaction:
+        headline = f"Compacted the runtime's native context; preserved {after_count} visible messages"
+        note = ("The runtime owns this session's model context. Hermes keeps the full visible transcript "
+                "for search and crash recovery instead of rewriting it into a second, divergent summary.")
+    elif refused_would_grow:
         headline = f"Compression refused (summary would grow the conversation): {before_count} messages preserved"
         note = "The generated summary was larger than what it would replace; no messages were removed."
     elif aborted:
@@ -75,7 +82,9 @@ def summarize_manual_compression(
                 "compression rewrites the transcript into denser summaries."
             )
 
-    if (noop and after_tokens == before_tokens) or refused_would_grow:
+    if native_compaction:
+        token_line = f"Hermes recovery transcript: ~{after_tokens:,} tokens (the live native context was compacted)"
+    elif (noop and after_tokens == before_tokens) or refused_would_grow:
         token_line = f"Approx request size: ~{before_tokens:,} tokens (unchanged)"
     else:
         token_line = f"Approx request size: ~{before_tokens:,} → ~{after_tokens:,} tokens"
@@ -90,6 +99,7 @@ def summarize_manual_compression(
         "aborted": aborted,
         "refused_would_grow": refused_would_grow,
         "fallback_used": fallback_used,
+        "native_compaction": native_compaction,
         "headline": headline,
         "token_line": token_line,
         "note": note,

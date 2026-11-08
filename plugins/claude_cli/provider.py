@@ -41,13 +41,13 @@ def wants_persistent_binding(agent: Any) -> bool:
     """Whether this agent's native session should be resumable across processes.
 
     Long-lived conversations keep a durable binding; one-shot surfaces (cron fires, delegated
-    children, background-review forks, ``chat -q``) never reuse their generated session ids, so a
+    children, background-review forks, side agents such as ``/background``, ``chat -q``) never reuse their generated session ids, so a
     binding would only fill the native-session pool and runtime directory. An explicit
     ``agent._claude_cli_persistent_binding`` bool always wins."""
     explicit = getattr(agent, "_claude_cli_persistent_binding", None)
     if isinstance(explicit, bool):
         return explicit
-    if getattr(agent, "_persist_disabled", False):
+    if getattr(agent, "_persist_disabled", False) or getattr(agent, "side_agent", False) is True:
         return False
     if int(getattr(agent, "_delegate_depth", 0) or 0) > 0:
         return False

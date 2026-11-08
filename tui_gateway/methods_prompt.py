@@ -1253,11 +1253,17 @@ def _(rid, params: dict) -> dict:
             {"task_id": task_id, "text": f"Starting hidden restart agent{history_note}"})
         # Deliberately NOT closed via AIAgent.close(): it would kill the background
         # server this task exists to leave running.
-        result = AIAgent(
+        preview_agent = AIAgent(
             **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
             **_preview_restart_callbacks(parent, task_id),
-        ).run_conversation(
-            user_message=prompt, task_id=task_id, conversation_history=parent_history or None)
+        )
+        try:
+            result = preview_agent.run_conversation(
+                user_message=prompt, task_id=task_id, conversation_history=parent_history or None)
+        finally:
+            # A turn runtime's child (not task state) must not stay pooled for a one-shot preview agent.
+            with contextlib.suppress(Exception):
+                preview_agent._release_turn_runtimes(hard=True)
         return _final_response_text(result)
 
     def cleanup():

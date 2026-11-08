@@ -1341,7 +1341,9 @@ def _get_usage(agent) -> dict:
 def _probe_credentials(agent) -> str:
     """Warning or '' (``no-key-required`` is a valid sentinel for keyless custom providers)."""
     with contextlib.suppress(Exception):
-        if not (getattr(agent, "api_key", "") or ""):
+        from agent.turn_runtime_registry import agent_turn_runtime
+        if not (getattr(agent, "api_key", "") or "") and agent_turn_runtime(agent) is None:
+            # A turn runtime (claude_cli) authenticates inside its own process: no key is its valid shape.
             provider = getattr(agent, "provider", "") or ""
             return f"No API key configured for provider '{provider}'. First message will fail."
     return ""

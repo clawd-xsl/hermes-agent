@@ -905,6 +905,15 @@ def _overlay_has_creds(b: _PickerBuild, pid: str, hermes_slug: str, overlay) -> 
                 has_creds = True
         except Exception as exc:
             logger.debug("Anthropic external creds check failed: %s", exc)
+    if not has_creds:
+        # A configured turn runtime (model.anthropic_runtime: claude_cli) authenticates inside its own
+        # process, possibly from an OS keychain Hermes cannot read: selecting it is enough to list the
+        # provider; the runtime reports a clear auth error if its login is unavailable.
+        try:
+            from agent.turn_runtime_registry import configured_runtime_mode
+            has_creds = configured_runtime_mode(hermes_slug) is not None
+        except Exception as exc:
+            logger.debug("Turn runtime check failed for %s: %s", hermes_slug, exc)
     return has_creds
 
 

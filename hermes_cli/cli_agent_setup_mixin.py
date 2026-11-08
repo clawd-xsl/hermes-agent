@@ -304,7 +304,12 @@ class CLIAgentSetupMixin:
             list(runtime.get("args") or []))
         # A callable api_key is a bearer-token provider (Azure Entra ID): the OpenAI SDK
         # invokes it per request, so skip string validation / placeholder substitution.
-        if not callable(api_key) and not (isinstance(api_key, str) and api_key):
+        # A turn runtime (claude_cli) authenticates inside its own process: no key, no endpoint.
+        from agent.turn_runtime_registry import route_authenticates_itself
+        _self_authenticating = route_authenticates_itself(runtime)
+        if _self_authenticating:
+            pass
+        elif not callable(api_key) and not (isinstance(api_key, str) and api_key):
             if _keyless_custom_base(base_url):
                 # Placeholder key so the SDK doesn't reject the keyless local endpoint.
                 api_key = "no-key-required"
@@ -320,7 +325,7 @@ class CLIAgentSetupMixin:
                     print(f"\n{t('cli.startup.no_provider_configured')}")
                 print(f"   {t('cli.startup.run_model_or_setup')}")
                 return False
-        if not isinstance(base_url, str) or not base_url:
+        if not _self_authenticating and (not isinstance(base_url, str) or not base_url):
             print(f"\n{t('cli.startup.empty_base_url')}")
             return False
         credentials_changed = api_key != self.api_key or base_url != self.base_url
