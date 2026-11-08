@@ -1835,8 +1835,7 @@ DEFAULT_CONFIG = {
         # untouched. User-written bare platforms address home conversations, unlike `all`
         # broadcast expansions, which do not gain mirror eligibility.
         "mirror_delivery": False,
-        # Conversation an agent fire runs in: "isolated" = its own session; "main" = a turn queued
-        # into the gateway home conversation (full history, live provider session). Per-job `session`.
+        # Agent fire's conversation: "isolated" (own session) | "main" (gateway home turn); per-job `session`.
         "session": "isolated",
         # Max due jobs run in parallel per tick. None/0 = unbounded; 1 = serial. Env: HERMES_CRON_MAX_PARALLEL.
         "max_parallel_jobs": None,
