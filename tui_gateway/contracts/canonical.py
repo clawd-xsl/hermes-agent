@@ -425,6 +425,14 @@ canonical_method("cron.cancel", params=CronAdmissionParams, result=CronCancelRes
                  doc="Cancel a queued cron admission or latch cancellation on a started one.")
 
 
+class CronForgetResult(Result):
+    deleted: bool
+
+
+canonical_method("cron.forget", params=CronAdmissionParams, result=CronForgetResult,
+                 doc="Drop a settled, successful session: main fire's empty run session (emptiness-checked).")
+
+
 class KanbanRunParams(Params):
     board: str
     task_id: str

@@ -15667,6 +15667,20 @@
         "title": "CronCancelResult",
         "type": "object"
       },
+      "CronForgetResult": {
+        "additionalProperties": false,
+        "properties": {
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "title": "CronForgetResult",
+        "type": "object"
+      },
       "CronJobRow": {
         "additionalProperties": true,
         "description": "``tools/cronjob_job_args.py::_format_job``.",
@@ -48837,6 +48851,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CronCancelResult"
+        }
+      }
+    },
+    {
+      "name": "cron.forget",
+      "summary": "Drop a settled, successful session: main fire's empty run session (emptiness-checked).",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/CronAdmissionParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CronForgetResult"
         }
       }
     },

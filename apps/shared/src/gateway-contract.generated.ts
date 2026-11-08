@@ -4974,6 +4974,9 @@ export interface CronAdmissionParams {
 export interface CronCancelResult {
   ok: boolean
 }
+export interface CronForgetResult {
+  deleted: boolean
+}
 export interface KanbanRunParams {
   board: string
   task_id: string
@@ -6953,6 +6956,8 @@ export interface CanonicalRpcMethods {
   'config.set': { params: CanonicalConfigSetParams; result: ConfigSetResult }
   /** Cancel a queued cron admission or latch cancellation on a started one. */
   'cron.cancel': { params: CronAdmissionParams; result: CronCancelResult }
+  /** Drop a settled, successful session: main fire's empty run session (emptiness-checked). */
+  'cron.forget': { params: CronAdmissionParams; result: CronForgetResult }
   /** Re-observe a firing after a scheduler restart (same request identity). */
   'cron.recover': { params: CronRunParams; result: CronStatusResult }
   /** Status and, once terminal, the result of one cron admission. */
@@ -7030,6 +7035,7 @@ export const CANONICAL_RPC_METHODS = [
   'config.get',
   'config.set',
   'cron.cancel',
+  'cron.forget',
   'cron.recover',
   'cron.status',
   'cron.submit',
