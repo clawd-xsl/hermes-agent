@@ -137,12 +137,26 @@ def _cron_summary(hermes_home: Path) -> str:
 
 _PLATFORM_ENV_VARS = {
     "telegram": "TELEGRAM_BOT_TOKEN", "discord": "DISCORD_BOT_TOKEN", "slack": "SLACK_BOT_TOKEN",
-    "whatsapp": "WHATSAPP_ENABLED", "signal": "SIGNAL_HTTP_URL", "email": "EMAIL_ADDRESS",
+    "whatsapp": "WHATSAPP_ENABLED", "email": "EMAIL_ADDRESS",
     "sms": "TWILIO_ACCOUNT_SID", "matrix": "MATRIX_HOMESERVER_URL", "mattermost": "MATTERMOST_URL",
     "dingtalk": "DINGTALK_CLIENT_ID", "feishu": "FEISHU_APP_ID",
     "wecom": "WECOM_BOT_ID", "wecom_callback": "WECOM_CALLBACK_CORP_ID", "weixin": "WEIXIN_ACCOUNT_ID",
     "qqbot": "QQ_APP_ID",
 }
+
+
+def _config_only_platforms() -> list[str]:
+    """Platforms configured in config.yaml alone (no env credential to probe): Signal's signal-ts
+    runtime is judged by the gateway's own connected verdict."""
+    try:
+        from gateway.config import Platform, load_gateway_config
+        gateway_config = load_gateway_config()
+        signal_config = gateway_config.platforms.get(Platform.SIGNAL)
+        if signal_config is not None and gateway_config._is_platform_connected(Platform.SIGNAL, signal_config):
+            return ["signal"]
+    except Exception:
+        pass
+    return []
 
 
 def _get_model_and_provider(config: dict) -> tuple[str, str]:
@@ -316,7 +330,7 @@ def run_dump(args):
     except Exception:
         profile = "(default)"
     toolsets = config.get("toolsets", ["hermes-cli"])
-    platforms = [name for name, env in _PLATFORM_ENV_VARS.items() if os.getenv(env)]
+    platforms = [name for name, env in _PLATFORM_ENV_VARS.items() if os.getenv(env)] + _config_only_platforms()
     lines = [
         "--- hermes dump ---",
         f"version:          {_version_line(project_root)}",

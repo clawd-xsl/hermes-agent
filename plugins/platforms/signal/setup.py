@@ -1,8 +1,10 @@
-"""Interactive ``hermes gateway setup`` wizard for Signal. Helpers resolve late through the
-``hermes_cli.gateway`` facade so the plugin stays importable outside the CLI and the seams tests
-patch there keep intercepting."""
+"""Interactive ``hermes gateway setup`` wizard for Signal's signal-ts runtime, plus the config.yaml
+reader/writer it shares with status checks. Helpers resolve late through the ``hermes_cli.gateway``
+facade so the plugin stays importable outside the CLI and the seams tests patch there keep
+intercepting. Everything is written to ``platforms.signal`` in config.yaml; nothing goes to .env."""
 
 import shutil
+from pathlib import Path
 
 
 def _gw():
@@ -10,104 +12,142 @@ def _gw():
     return gateway
 
 
-def _signal_line_input(prompt_text: str) -> str | None:
-    """``line_input`` for the Signal wizard; None (after printing the cancel line) on EOF/Ctrl+C."""
-    try:
-        return _gw().line_input(prompt_text).strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Setup cancelled.")
+def read_signal_yaml_config() -> dict:
+    """``platforms.signal`` from the profile's raw config.yaml (``gateway.platforms`` first, the
+    top-level ``platforms`` section wins), flattened: ``extra`` keys plus ``home_channel``."""
+    from hermes_cli.config import read_raw_config
+    raw = read_raw_config()
+    merged: dict = {}
+    gateway_section = raw.get("gateway")
+    sources = [gateway_section.get("platforms") if isinstance(gateway_section, dict) else None,
+               raw.get("platforms")]
+    for platforms in sources:
+        signal_config = platforms.get("signal") if isinstance(platforms, dict) else None
+        if not isinstance(signal_config, dict):
+            continue
+        merged.update({key: value for key, value in signal_config.items() if key != "extra"})
+        if isinstance(extra := signal_config.get("extra"), dict):
+            merged.update(extra)
+    return merged
+
+
+def write_signal_yaml_config(values: dict, *, home_channel: str | None = None) -> None:
+    """Enable Signal and merge ``values`` into ``platforms.signal.extra`` (plus an optional home)."""
+    from hermes_cli.config import read_raw_config, save_config
+    config = read_raw_config()
+    platforms = config.get("platforms")
+    if not isinstance(platforms, dict):
+        platforms = config["platforms"] = {}
+    signal_config = platforms.get("signal")
+    if not isinstance(signal_config, dict):
+        signal_config = platforms["signal"] = {}
+    signal_config["enabled"] = True
+    extra = signal_config.get("extra")
+    if not isinstance(extra, dict):
+        extra = signal_config["extra"] = {}
+    extra.update(values)
+    if home_channel:
+        signal_config["home_channel"] = {"platform": "signal", "chat_id": home_channel, "name": "Signal home"}
+    save_config(config)
+
+
+def _csv(value) -> str:
+    return ",".join(str(v) for v in value) if isinstance(value, (list, tuple)) else str(value or "")
+
+
+def _split_csv(text: str) -> list[str]:
+    return [value.strip() for value in (text or "").split(",") if value.strip()]
+
+
+def _prompt_runtime(existing: dict):
+    """Node executable, SDK checkout and state file; None (after an error line) when invalid."""
+    from plugins.platforms.signal.signal_ts import resolve_node_executable
+    gw = _gw()
+    default_node = str(existing.get("node_command") or shutil.which("node") or "node")
+    node_command = gw.prompt("  Node executable (>= 22.19)", default=default_node).strip() or default_node
+    resolved_node = resolve_node_executable(node_command)
+    if not resolved_node:
+        gw.print_error(f"  Node executable is not runnable: {node_command}")
         return None
+
+    sibling_sdk = Path(gw.PROJECT_ROOT).parent / "signal-ts"
+    default_sdk = str(existing.get("sdk_path") or (sibling_sdk if sibling_sdk.exists() else ""))
+    print()
+    gw.print_info("  Path to the signal-ts SDK checkout (the directory with package.json).")
+    sdk_path = Path(gw.prompt("  signal-ts SDK path", default=default_sdk).strip()).expanduser()
+    if not (sdk_path / "package.json").is_file() or not (sdk_path / "dist" / "index.js").is_file():
+        gw.print_error("  SDK path must contain package.json and a built dist/index.js.")
+        gw.print_info("  Build it with: pnpm install --frozen-lockfile && pnpm build")
+        return None
+
+    default_state = str(existing.get("state_path") or (gw.get_hermes_home() / "signal-ts" / "default.json"))
+    print()
+    gw.print_info("  Path to the linked-device state file created by signal-ts when you linked it.")
+    state_path = Path(gw.prompt("  Signal state file", default=default_state).strip()).expanduser()
+    if not state_path.is_file():
+        gw.print_error(f"  Signal state file does not exist: {state_path}")
+        gw.print_info("  Link this device with signal-ts first (see the Signal guide).")
+        return None
+    return resolved_node, sdk_path.resolve(), state_path.resolve()
+
+
+def _prompt_groups(existing: dict) -> list[str]:
+    gw = _gw()
+    existing_groups = existing.get("group_allow_from") or []
+    print()
+    if not gw.prompt_yes_no("  Enable group messaging? (disabled by default)", bool(existing_groups)):
+        return []
+    print()
+    gw.print_info("  Enter group IDs to allow, or * for all groups.")
+    return _split_csv(gw.prompt("  Allowed group IDs", default=_csv(existing_groups) or "*"))
 
 
 def interactive_setup() -> None:
     """``hermes gateway setup`` flow for Signal (registered as the plugin's ``setup_fn``)."""
-    _gw().print_setup_header("📡 Signal")
-
-    existing_url = _gw().get_env_value("SIGNAL_HTTP_URL")
-    existing_account = _gw().get_env_value("SIGNAL_ACCOUNT")
-    if not _gw().confirm_reconfigure("Signal", "SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT"):
-        return
-
-    print()
-    if shutil.which("signal-cli"):
-        _gw().print_success("signal-cli found on PATH.")
-    else:
-        _gw().print_warning("signal-cli not found on PATH.")
-        _gw()._print_info_lines(
-            "  Signal requires signal-cli running as an HTTP daemon.", "  Install options:",
-            "    Linux:  download from https://github.com/AsamK/signal-cli/releases",
-            "    macOS:  brew install signal-cli", "    Docker: bbernhard/signal-cli-rest-api",
-        )
+    gw = _gw()
+    gw.print_setup_header("📡 Signal")
+    existing = read_signal_yaml_config()
+    if existing.get("state_path") and existing.get("sdk_path"):
         print()
-        _gw()._print_info_lines(
-            "  After installing, link your account and start the daemon:",
-            '    signal-cli link -n "HermesAgent"',
-            "    signal-cli --account +YOURNUMBER daemon --http 127.0.0.1:8080",
-        )
-        print()
-
-    print()
-    _gw().print_info("  Enter the URL where signal-cli HTTP daemon is running.")
-    default_url = existing_url or "http://127.0.0.1:8080"
-    url = _signal_line_input(f"  HTTP URL [{default_url}]: ")
-    if url is None:
-        return
-    url = url or default_url
-
-    _gw().print_info("  Testing connection...")
-    try:
-        import httpx
-        resp = httpx.get(f"{url.rstrip('/')}/api/v1/check", timeout=10.0)
-        if resp.status_code == 200:
-            _gw().print_success("  signal-cli daemon is reachable!")
-        else:
-            _gw().print_warning(f"  signal-cli responded with status {resp.status_code}.")
-            if not _gw().prompt_yes_no("  Continue anyway?", False):
-                return
-    except Exception as e:  # health: allow BLE001 -- connectivity probe in a wizard: any failure is "unreachable", the user decides
-        _gw().print_warning(f"  Could not reach signal-cli at {url}: {e}")
-        if not _gw().prompt_yes_no("  Save this URL anyway? (you can start signal-cli later)", True):
+        gw.print_success("Signal is already configured.")
+        if not gw.prompt_yes_no("  Reconfigure Signal?", False):
             return
 
-    _gw().save_env_value("SIGNAL_HTTP_URL", url)
-
-    print()
-    _gw()._print_info_lines("  Enter your Signal account phone number in E.164 format.", "  Example: +15551234567")
-    default_account = existing_account or ""
-    account = _signal_line_input(f"  Account number{f' [{default_account}]' if default_account else ''}: ")
-    if account is None:
-        return
-    account = account or default_account
-    if not account:
-        _gw().print_error("  Account number is required.")
-        return
-
-    _gw().save_env_value("SIGNAL_ACCOUNT", account)
-
-    print()
-    _gw()._print_info_lines(
-        "  The gateway DENIES all users by default for security.",
-        "  Enter phone numbers or UUIDs of allowed users (comma-separated).",
+    gw._print_info_lines(
+        "  Hermes runs signal-ts as a linked device inside the gateway (no signal-cli daemon or Java).",
+        "  The SDK checkout must be built once: pnpm install --frozen-lockfile && pnpm build",
     )
-    default_allowed = _gw().get_env_value("SIGNAL_ALLOWED_USERS") or account
-    allowed = _signal_line_input(f"  Allowed users [{default_allowed}]: ")
-    if allowed is None:
+    runtime = _prompt_runtime(existing)
+    if runtime is None:
         return
-    _gw().save_env_value("SIGNAL_ALLOWED_USERS", allowed or default_allowed)
+    node_command, sdk_path, state_path = runtime
+
+    account = gw.prompt("  Expected Signal number (E.164, optional)",
+                        default=str(existing.get("account") or "")).strip()
+    existing_home = existing.get("home_channel")
+    existing_home_id = str(existing_home.get("chat_id") or "") if isinstance(existing_home, dict) else ""
+    # Never default the home or the allowlist to the bot's own number: that would deliver cron
+    # output to Note to Self and silently authorize only the bot itself.
+    home_channel = gw.prompt("  Home conversation for cron/notifications (optional)",
+                             default=existing_home_id).strip()
+    print()
+    gw.print_info("  Enter phone numbers or ACIs allowed to use this assistant (empty = pairing mode).")
+    allowed = _split_csv(gw.prompt("  Allowed users (comma-separated)", default=_csv(existing.get("allow_from"))))
+    if not allowed:
+        gw.print_warning("  No allowlist saved; unknown DMs will use Hermes pairing mode.")
+    groups = _prompt_groups(existing)
+
+    values = {"node_command": node_command, "sdk_path": str(sdk_path), "state_path": str(state_path),
+              "allow_from": allowed, "group_allow_from": groups}
+    if account:
+        values["account"] = account
+    write_signal_yaml_config(values, home_channel=home_channel or None)
 
     print()
-    if _gw().prompt_yes_no("  Enable group messaging? (disabled by default for security)", False):
-        print()
-        _gw().print_info("  Enter group IDs to allow, or * for all groups.")
-        existing_groups = _gw().get_env_value("SIGNAL_GROUP_ALLOWED_USERS") or ""
-        groups = _signal_line_input(f"  Group IDs [{existing_groups or '*'}]: ")
-        if groups is None:
-            return
-        _gw().save_env_value("SIGNAL_GROUP_ALLOWED_USERS", groups or existing_groups or "*")
-
-    print()
-    _gw().print_success("Signal configured!")
-    _gw()._print_info_lines(
-        f"  URL: {url}", f"  Account: {account}", "  DM auth: via SIGNAL_ALLOWED_USERS + DM pairing",
-        f"  Groups: {'enabled' if _gw().get_env_value('SIGNAL_GROUP_ALLOWED_USERS') else 'disabled'}",
+    gw.print_success("Signal configured!")
+    gw._print_info_lines(
+        f"  Runtime: {node_command} + {sdk_path}", f"  State: {state_path}",
+        f"  Account: {account or 'read from the state file at startup'}",
+        f"  DM auth: {'allowlist' if allowed else 'pairing'}", f"  Groups: {'enabled' if groups else 'disabled'}",
+        f"  Home: {home_channel or 'set later with /sethome'}",
     )

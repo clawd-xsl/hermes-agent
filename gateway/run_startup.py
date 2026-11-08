@@ -1045,15 +1045,31 @@ class GatewayStartupMixin:
     # Builtin platforms whose ``<P>_ALLOWED_USERS`` / ``<P>_ALLOW_ALL_USERS`` env vars count as an
     # allowlist / open-access opt-in; plugin platforms are appended at check time.
     _ALLOWLIST_ENV_PLATFORMS = (
-        "TELEGRAM", "DISCORD", "WHATSAPP", "WHATSAPP_CLOUD", "SLACK", "SIGNAL", "EMAIL", "SMS",
+        "TELEGRAM", "DISCORD", "WHATSAPP", "WHATSAPP_CLOUD", "SLACK", "EMAIL", "SMS",
         "MATTERMOST", "MATRIX", "DINGTALK", "FEISHU", "WECOM", "WECOM_CALLBACK", "WEIXIN",
         "BLUEBUBBLES", "QQ", "YUANBAO",
     )
     _BUILTIN_ALLOWED_USERS_VARS = tuple(f"{p}_ALLOWED_USERS" for p in _ALLOWLIST_ENV_PLATFORMS) + (
-        "SIGNAL_GROUP_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_USERS",
         "TELEGRAM_GROUP_ALLOWED_CHATS", "GATEWAY_ALLOWED_USERS",
     )
     _BUILTIN_ALLOW_ALL_VARS = tuple(f"{p}_ALLOW_ALL_USERS" for p in _ALLOWLIST_ENV_PLATFORMS)
+
+    @staticmethod
+    def _config_has_user_allowlist(config) -> bool:
+        """Whether an enabled platform carries a non-empty config-owned ``allow_from`` /
+        ``group_allow_from`` (Signal's only allowlist lives there, not in env)."""
+        for platform_config in (getattr(config, "platforms", None) or {}).values():
+            extra = getattr(platform_config, "extra", None)
+            if not getattr(platform_config, "enabled", False) or not isinstance(extra, dict):
+                continue
+            for key in ("allow_from", "group_allow_from"):
+                value = extra.get(key)
+                if isinstance(value, str) and value.strip():
+                    return True
+                if isinstance(value, (list, tuple, set)) and any(str(item).strip() for item in value):
+                    return True
+        return False
 
     def _start_check_access_policy(self) -> bool:
         """Warn about missing allowlists; return True when startup must be refused."""
@@ -1080,7 +1096,7 @@ class GatewayStartupMixin:
         )
         if has_messaging and not any(os.getenv(v) for v in allowed_vars) and not any(
             os.getenv(v, "").lower() in {"true", "1", "yes"} for v in allow_all_vars
-        ):
+        ) and not self._config_has_user_allowlist(self.config):
             logger.warning(
                 "No env user allowlists configured. Messaging platforms default to pairing/allowlist "
                 "policies and will deny unknown senders unless you configure platform allowlists (e.g., "

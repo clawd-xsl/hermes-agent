@@ -64,8 +64,8 @@ def _fence_unfenced_tables(text: str) -> str:
 
 
 def markdown_to_signal(text: str) -> tuple[str, list[str]]:
-    """Convert markdown to plain text + Signal textStyles list. Signal uses ``bodyRanges`` (signal-cli
-    ``textStyle`` / ``textStyles`` params) as ``start:length:STYLE`` with positions in UTF-16 code units.
+    """Convert markdown to plain text + Signal textStyles list. Signal uses ``bodyRanges``; Hermes passes
+    them to the sidecar as ``textStyle`` / ``textStyles`` strings ``start:length:STYLE`` with positions in UTF-16 code units.
     Supported styles: BOLD, ITALIC, STRIKETHROUGH, MONOSPACE."""
     text = _fence_tables(_normalize_bullet_markers(re.sub(r"\n{3,}", "\n\n", text).strip()))
     styles: list[tuple[int, int, str]] = []

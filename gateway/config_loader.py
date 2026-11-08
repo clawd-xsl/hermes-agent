@@ -426,7 +426,7 @@ def bridge_core_env_settings(yaml_cfg: dict, platforms_data: dict) -> None:
 
     Top-level ``require_mention`` → Telegram when the ``telegram:`` section has none: users write it
     alongside ``group_sessions_per_user`` expecting it to work, and the telegram plugin's hook only
-    runs when a telegram block exists. Signal ``require_mention`` → ``SIGNAL_REQUIRE_MENTION`` (env wins).
+    runs when a telegram block exists. A top-level ``signal: require_mention`` seeds Signal's ``extra``.
     ``allow_all_users`` (top-level or ``gateway.allow_all_users``) → ``GATEWAY_ALLOW_ALL_USERS``: every
     allow-all reader (authz mixin, startup access check, own-policy adapters, plugin gates) consults
     that env var, so the bridge is the one seam that makes the YAML key reach all of them (#110690).
@@ -479,9 +479,8 @@ def bridge_core_env_settings(yaml_cfg: dict, platforms_data: dict) -> None:
     signal_cfg = yaml_cfg.get("signal", {})
     if isinstance(signal_cfg, dict) and "require_mention" in signal_cfg:
         sig_plat = platforms_data.setdefault(Platform.SIGNAL.value, {})
+        # The signal-ts adapter reads it from extra only (no SIGNAL_REQUIRE_MENTION env).
         sig_plat.setdefault("extra", {}).setdefault("require_mention", signal_cfg["require_mention"])
-        if not skip_env_bridge and not os.getenv("SIGNAL_REQUIRE_MENTION"):
-            os.environ["SIGNAL_REQUIRE_MENTION"] = str(signal_cfg["require_mention"]).lower()
 
 
 def read_yaml_layers(home: Path) -> dict:

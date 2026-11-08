@@ -1,14 +1,15 @@
-"""Signal messenger platform adapter for a signal-cli daemon in HTTP mode (``signal-cli daemon
---http 127.0.0.1:8080``): inbound via SSE, outbound via JSON-RPC 2.0. Requires SIGNAL_HTTP_URL
-and SIGNAL_ACCOUNT."""
+"""Signal messenger platform adapter backed by a persistent ``signal-ts`` sidecar.
+
+The Node sidecar (``sidecar/index.mjs``, managed by :mod:`signal_ts`) embeds the signal-ts SDK as a
+linked device: one authenticated Signal socket and one owner of the libsignal state for the whole
+gateway lifetime. ``_rpc`` is the single transport chokepoint; method names mirror signal-cli's
+(``send``, ``sendTyping``, ``sendReaction``, ``getAttachment``, ``listContacts``, ``getContact``).
+Configuration is YAML-only under ``platforms.signal.extra`` (see ``website/docs/user-guide/messaging/signal.md``)."""
 
 import asyncio
-import base64
 import itertools
-import json
 import logging
 import os
-import random
 import shutil
 import subprocess
 import tempfile
@@ -18,10 +19,8 @@ from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, unquote
-
-import httpx
+from typing import Any, Optional
+from urllib.parse import unquote
 
 from gateway.config import Platform, PlatformConfig
 from agent.i18n import t
@@ -39,17 +38,20 @@ from plugins.platforms.signal.signal_rate_limit import (
     SIGNAL_BATCH_PACING_NOTICE_THRESHOLD, SIGNAL_MAX_ATTACHMENTS_PER_MSG, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
     SignalRateLimitError, _extract_retry_after_seconds, _format_wait, _is_signal_rate_limit_error,
     _signal_send_timeout, get_scheduler)
-from gateway.platforms._shared import get_scoped_secret as _sig_secret
-from utils import TRUTHY_STRINGS
+from plugins.platforms.signal.signal_ts import (
+    SignalTsCallError, SignalTsProcessError, SignalTsSidecar, SignalTsStartupError, default_node_executable,
+    resolve_node_executable, runtime_configured, runtime_settings)
+from hermes_constants import get_hermes_home
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
 SIGNAL_MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_MESSAGE_LENGTH = 8000  # Signal message size limit
-SSE_RETRY_DELAY_INITIAL = 2.0
-SSE_RETRY_DELAY_MAX = 60.0
-HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
-HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+SIGNAL_TS_RETRY_DELAY_INITIAL = 1.0  # supervised sidecar restart backoff (doubles to the max)
+SIGNAL_TS_RETRY_DELAY_MAX = 10.0
+_INBOUND_DRAIN_TIMEOUT = 10.0  # disconnect(): seconds to finish envelopes already acknowledged to Signal
+_INBOUND_STOP = object()
 
 # Magic-byte prefixes checked before delegating to the shared audio/AV sniffer.
 _MAGIC_EXTENSIONS = ((b"\x89PNG", ".png"), (b"\xff\xd8", ".jpg"), (b"GIF8", ".gif"), (b"%PDF", ".pdf"))
@@ -160,55 +162,73 @@ def _looks_like_e164_number(value: str) -> bool:
     return bool(value) and value.startswith("+") and value[1:].isdigit() and 7 <= len(value) - 1 <= 15
 
 
+def _coerce_id_set(value: Any) -> set[str]:
+    """Allowlist entries from a YAML list or a comma-separated string."""
+    if isinstance(value, (list, tuple, set)):
+        return {str(v).strip() for v in value if str(v).strip()}
+    return set(_parse_comma_list(str(value or "")))
+
+
 def check_signal_requirements() -> bool:
-    """Check if Signal runtime dependencies are available."""
+    """Passive dependency probe: the sidecar needs no Python packages (Node is resolved at connect)."""
     return True
 
 
 def validate_signal_config(config: PlatformConfig) -> bool:
-    """Check if Signal has enough config to connect."""
-    extra = getattr(config, "extra", {}) or {}
-    http_url = (extra.get("http_url", "") or _sig_secret("SIGNAL_HTTP_URL", "")).strip()
-    account = (extra.get("account", "") or _sig_secret("SIGNAL_ACCOUNT", "")).strip()
-    return bool(http_url and account)
+    """Whether the signal-ts runtime can start from this config (state file + SDK + resolvable Node)."""
+    return runtime_configured(getattr(config, "extra", None) or {})
 
 
 
 class SignalAdapter(BasePlatformAdapter):
-    """Signal messenger adapter using signal-cli HTTP daemon."""
+    """Signal messenger adapter driving one persistent signal-ts sidecar."""
 
     platform = Platform.SIGNAL
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     splits_long_messages = True  # send() chunks after markdown → Signal formatting conversion
-    serial_receive_loop = True  # _sse_listener awaits each envelope before reading the next
+    serial_receive_loop = True  # _inbound_loop awaits each envelope before handling the next
     # No real edit API; declaring it lets streaming suppress the cursor instead of a stale tofu square.
     SUPPORTS_MESSAGE_EDITING = False
+    # dm/group policy and allowlists come from config.extra and gate at intake (see __init__).
+    enforces_own_access_policy = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SIGNAL)
         extra = config.extra or {}
-        self.http_url = extra.get("http_url", "http://127.0.0.1:8080").rstrip("/")
-        self.account = extra.get("account", "")
-        self.ignore_stories = extra.get("ignore_stories", True)
-        # Allowlists are per-profile (scoped reads); group policy derives from the group allowlist's
-        # presence. The DM allowlist mirrors run.py's SIGNAL_ALLOWED_USERS so reaction hooks (which
-        # fire before run.py's auth gate) can skip unauthorized senders; "*" = open.
-        self.group_allow_from = set(_parse_comma_list(_sig_secret("SIGNAL_GROUP_ALLOWED_USERS", "")))
-        _rm_cfg = extra.get("require_mention")
-        self.require_mention = (bool(_rm_cfg) if _rm_cfg is not None
-                                else (_sig_secret("SIGNAL_REQUIRE_MENTION", "false") or "false").lower() in TRUTHY_STRINGS)
-        self.dm_allow_from = set(_parse_comma_list(_sig_secret("SIGNAL_ALLOWED_USERS", "*")))
-        self.client: Optional[httpx.AsyncClient] = None
-        self._sse_task: Optional[asyncio.Task] = None
-        self._health_monitor_task: Optional[asyncio.Task] = None
+        self.account = str(extra.get("account") or "").strip()
+        settings = runtime_settings(extra)
+        self.state_path: Optional[Path] = settings["state_path"]
+        self.sdk_path: Optional[Path] = settings["sdk_path"]
+        self.node_command = settings["node_command"]
+        self.node_executable = (resolve_node_executable(self.node_command) if self.node_command
+                                else default_node_executable())
+        self.startup_timeout = float(extra.get("startup_timeout_seconds") or 30.0)
+        self.call_timeout = float(extra.get("call_timeout_seconds") or 30.0)
+        # Profile-scoped staging dir for attachments the sidecar downloads.
+        self._signal_cache_dir = get_hermes_home() / "cache" / "signal-ts"
+        self.ignore_stories = is_truthy_value(extra.get("ignore_stories"), default=True)
+        self.require_mention = is_truthy_value(extra.get("require_mention"), default=False)
+        self.reactions_enabled = is_truthy_value(extra.get("reactions"), default=True)
+        # Access policy is config-owned and enforced at intake (``enforces_own_access_policy``):
+        # a non-empty ``allow_from`` is a strict allowlist (DMs and group senders; "*" = everyone),
+        # an empty one is pairing mode (unknown DMs reach the gateway's pairing handshake).
+        # ``group_allow_from`` lists group IDs ("*" = all); empty disables groups.
+        self.dm_allow_from = _coerce_id_set(extra.get("allow_from"))
+        self.group_allow_from = _coerce_id_set(extra.get("group_allow_from"))
+        self._dm_policy = "allowlist" if self.dm_allow_from else "pairing"
+        self._group_policy = "allowlist" if self.group_allow_from else "disabled"
+        self._sidecar: Optional[SignalTsSidecar] = None
+        self._sidecar_task: Optional[asyncio.Task] = None
+        # Envelopes are queued by the sidecar reader and handled one at a time, in arrival order
+        # (``serial_receive_loop``), on a task that never blocks command replies.
+        self._inbound: Optional[asyncio.Queue] = None
+        self._inbound_task: Optional[asyncio.Task] = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
         # Per-chat typing backoff: on NETWORK_FAILURE base.py's _keep_typing would hammer sendTyping every ~2s.
         self._typing_failures: dict[str, int] = {}
         self._typing_skip_until: dict[str, float] = {}
         self._running = False
-        self._last_sse_activity = 0.0
-        self._sse_response: Optional[httpx.Response] = None
-        self._account_normalized = self.account.strip()
+        self._account_normalized = self.account
         # Recently sent timestamps filter echo-backs (Note to Self / linked-device sync-sents); LRU + TTL
         # so a pending echo in a chatty group isn't evicted by many outbounds.
         self._recent_sent_timestamps: OrderedDict[int, float] = OrderedDict()
@@ -218,147 +238,174 @@ class SignalAdapter(BasePlatformAdapter):
         # replies to this bot are recognised after the echo was consumed.
         self._sent_message_timestamps: OrderedDict[str, None] = OrderedDict()
         self._max_sent_message_timestamps = 500
-        # Best-effort number↔ACI/PNI UUID mapping so sends can upgrade a number to the UUID signal-cli prefers.
+        # Best-effort number↔ACI mapping so sends can upgrade a number to the ACI Signal resolves.
         self._recipient_uuid_by_number: dict[str, str] = {}
         self._recipient_number_by_uuid: dict[str, str] = {}
         self._recipient_cache_lock = asyncio.Lock()
-        logger.info("Signal adapter initialized: url=%s account=%s groups=%s", self.http_url,
-                    redact_phone(self.account), "enabled" if self.group_allow_from else "disabled")
+        logger.info("Signal adapter initialized: runtime=signal-ts account=%s dm=%s groups=%s",
+                    redact_phone(self.account) if self.account else "(from state)", self._dm_policy,
+                    "enabled" if self.group_allow_from else "disabled")
+
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        """Strict DM authorization for the gateway's own-policy check (``allowlist`` mode only)."""
+        if self._dm_policy != "allowlist":
+            return False
+        sender = str(sender_id or "").strip()
+        ids = {sender, self._recipient_uuid_by_number.get(sender), self._recipient_number_by_uuid.get(sender)}
+        return self._ids_allowed(ids)
+
+    def _ids_allowed(self, ids) -> bool:
+        return "*" in self.dm_allow_from or bool({i for i in ids if i} & self.dm_allow_from)
+
+    def _lock_identity(self) -> str:
+        """The account when configured, else the state file (the resource two clients would share)."""
+        return self.account or str(self.state_path)
+
+    async def _resolve_node(self) -> Optional[str]:
+        """Configured Node, else PATH / managed Node, else install the managed Node (as Photon does)."""
+        if self.node_executable or self.node_command:
+            return self.node_executable
+        try:
+            import pm
+            await asyncio.to_thread(pm.ensure, "node")
+            installed = pm.installed_package("node")
+            if installed is not None and installed.binary is not None:
+                self.node_executable = str(installed.binary)
+        except Exception as exc:
+            logger.error("Signal: could not provision Node for signal-ts: %s", exc)
+        return self.node_executable
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Connect to signal-cli daemon and start SSE listener."""
-        if not self.http_url or not self.account:
-            logger.error("Signal: SIGNAL_HTTP_URL and SIGNAL_ACCOUNT are required")
+        """Start the persistent signal-ts client, its inbound dispatcher and its reconnect supervisor."""
+        if not validate_signal_config(self.config):
+            message = ("Signal: platforms.signal.extra needs an existing state_path and sdk_path "
+                       "(and a runnable node_command when set)")
+            logger.error(message)
+            self._set_fatal_error("signal_ts_config", message, retryable=False)
             return False
-        lock_acquired = False  # scoped lock prevents duplicate Signal listeners for the same phone
+        node = await self._resolve_node()
+        if not node:
+            message = "Signal: no Node.js >= 22.19 found; set platforms.signal.extra.node_command"
+            logger.error(message)
+            self._set_fatal_error("signal_ts_node_missing", message, retryable=False)
+            return False
+        lock_acquired = False  # scoped lock prevents two clients on the same linked device
         try:
-            if not self._acquire_platform_lock('signal-phone', self.account, 'Signal account'):
+            if not self._acquire_platform_lock('signal-phone', self._lock_identity(), 'Signal account'):
                 return False
             lock_acquired = True
         except Exception as e:
             logger.warning("Signal: Could not acquire phone lock (non-fatal): %s", e)
-        # Tighter keepalive so idle CLOSE_WAIT drains promptly.
-        # See #18451.
-        from gateway.platforms._http_client_limits import platform_httpx_limits
-        self.client = httpx.AsyncClient(timeout=30.0, limits=platform_httpx_limits())
+        self._inbound = asyncio.Queue()
+        self._inbound_task = asyncio.create_task(self._inbound_loop(self._inbound), name="signal-inbound")
         try:
-            try:
-                resp = await self.client.get(f"{self.http_url}/api/v1/check", timeout=10.0)
-            except Exception as e:
-                logger.error("Signal: cannot reach signal-cli at %s: %s", self.http_url, e)
-                return False
-            if resp.status_code != 200:
-                logger.error("Signal: health check failed (status %d)", resp.status_code)
-                return False
-            self._running = True
-            self._last_sse_activity = time.time()
-            self._sse_task = asyncio.create_task(self._sse_listener())
-            self._health_monitor_task = asyncio.create_task(self._health_monitor())
-            logger.info("Signal: connected to %s", self.http_url)
-            # Plugin-registered native handlers (ctx.register_platform_handler).
-            self._wire_plugin_handlers(None)
-            return True
-        finally:
-            if not self._running:
-                await self._close_client()
-                if lock_acquired:
-                    self._release_platform_lock()
-
-    async def _close_client(self) -> None:
-        if self.client:
-            await self.client.aclose()
-            self.client = None
+            sidecar = self._new_sidecar()
+            await sidecar.start()
+        except Exception as exc:
+            logger.error("Signal: signal-ts startup failed: %s", exc)
+            if isinstance(exc, SignalTsStartupError):
+                self._set_fatal_error(f"signal_ts_{exc.code}", str(exc), retryable=exc.retryable)
+            await self._stop_inbound(drain=False)
+            if lock_acquired:
+                self._release_platform_lock()
+            return False
+        self._sidecar = sidecar
+        if not self.account and sidecar.account:
+            self.account = self._account_normalized = sidecar.account
+        self._running = True
+        self._sidecar_task = asyncio.create_task(self._supervise_sidecar(sidecar), name="signal-ts-supervisor")
+        logger.info("Signal: signal-ts connected (account=%s aci=%s)", redact_phone(self.account),
+                    sidecar.aci or "unknown")
+        # Plugin-registered native handlers (ctx.register_platform_handler).
+        self._wire_plugin_handlers(None)
+        return True
 
     async def disconnect(self) -> None:
-        """Stop SSE listener and clean up."""
+        """Stop the persistent signal-ts runtime, finish queued envelopes and clean up."""
         self._running = False
-        for task in (self._sse_task, self._health_monitor_task):
+        task, self._sidecar_task = self._sidecar_task, None
+        if task is not None and task is not asyncio.current_task():
             await cancel_task(task)
-        for task in self._typing_tasks.values():
-            task.cancel()
+        sidecar, self._sidecar = self._sidecar, None
+        if sidecar is not None:
+            await sidecar.close()
+        await self._stop_inbound(drain=True)
+        for typing_task in self._typing_tasks.values():
+            typing_task.cancel()
         self._typing_tasks.clear()
-        await self._close_client()
         self._release_platform_lock()
         logger.info("Signal: disconnected")
 
-    async def _handle_sse_line(self, line: str) -> None:
-        """Dispatch one SSE line; keepalive comments (":") count as activity so the health monitor stays quiet."""
-        if line.startswith(":"):
-            self._last_sse_activity = time.time()
-        elif line.startswith("data:") and (data_str := line[5:].strip()):
-            self._last_sse_activity = time.time()
-            try:
-                await self._handle_envelope(json.loads(data_str))
-            except json.JSONDecodeError:
-                logger.debug("Signal SSE: invalid JSON: %s", data_str[:100])
-            except Exception:
-                logger.exception("Signal SSE: error handling event")
+    def _new_sidecar(self) -> SignalTsSidecar:
+        assert self.node_executable and self.state_path and self.sdk_path
+        return SignalTsSidecar(
+            node_executable=self.node_executable, sdk_path=self.sdk_path, state_path=self.state_path,
+            cache_dir=self._signal_cache_dir, expected_account=self.account or None,
+            on_envelope=self._enqueue_envelope, startup_timeout=self.startup_timeout,
+            call_timeout=self.call_timeout)
 
-    async def _sse_listener(self) -> None:
-        """Listen for SSE events from signal-cli daemon, reconnecting with jittered backoff."""
-        url = f"{self.http_url}/api/v1/events?account={quote(self.account, safe='')}"
-        backoff = SSE_RETRY_DELAY_INITIAL
+    async def _supervise_sidecar(self, sidecar: SignalTsSidecar) -> None:
+        """Replace a lost sidecar (dead socket, ConnectedElsewhere, crash) with bounded backoff."""
+        backoff, current = SIGNAL_TS_RETRY_DELAY_INITIAL, sidecar
         while self._running:
-            try:
-                logger.debug("Signal SSE: connecting to %s", url)
-                async with self.client.stream("GET", url, headers={"Accept": "text/event-stream"},
-                                              timeout=None) as response:
-                    self._sse_response = response
-                    backoff = SSE_RETRY_DELAY_INITIAL  # Reset on successful connection
-                    self._last_sse_activity = time.time()
-                    logger.info("Signal SSE: connected")
-                    buffer = ""
-                    async for chunk in response.aiter_text():
-                        if not self._running:
-                            break
-                        buffer += chunk
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            if line := line.strip():
-                                await self._handle_sse_line(line)
-            except asyncio.CancelledError:
-                break
-            except httpx.HTTPError as e:
-                if self._running:
-                    logger.warning("Signal SSE: HTTP error: %s (reconnecting in %.0fs)", e, backoff)
-            except Exception as e:
-                if self._running:
-                    logger.warning("Signal SSE: error: %s (reconnecting in %.0fs)", e, backoff)
-            if self._running:
-                await asyncio.sleep(backoff + backoff * 0.2 * random.random())  # 20% jitter vs thundering herd
-                backoff = min(backoff * 2, SSE_RETRY_DELAY_MAX)
-        self._sse_response = None
-
-    async def _health_monitor(self) -> None:
-        """Monitor SSE connection health and force reconnect if stale."""
-        while self._running:
-            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+            await current.wait_closed()
             if not self._running:
-                break
-            if (elapsed := time.time() - self._last_sse_activity) <= HEALTH_CHECK_STALE_THRESHOLD:
-                continue
-            logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
+                return
+            if self._sidecar is current:
+                self._sidecar = None
+            logger.warning("Signal: signal-ts connection lost; reconnecting in %.1fs", backoff)
             try:
-                resp = await self.client.get(f"{self.http_url}/api/v1/check", timeout=10.0)
-            except Exception as e:
-                logger.warning("Signal: health check error: %s, forcing reconnect", e)
-                self._force_reconnect()
+                await asyncio.sleep(backoff)
+                if not self._running:
+                    return
+                replacement = self._new_sidecar()
+                await replacement.start()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning("Signal: signal-ts reconnect failed: %s", exc)
+                backoff = min(backoff * 2, SIGNAL_TS_RETRY_DELAY_MAX)
                 continue
-            if resp.status_code == 200:  # daemon alive but SSE quiet — reset activity to avoid repeated warnings
-                self._last_sse_activity = time.time()
-                logger.debug("Signal: daemon healthy, SSE idle")
-            else:
-                logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)
-                self._force_reconnect()
+            if not self._running:
+                await replacement.close()
+                return
+            self._sidecar = current = replacement
+            backoff = SIGNAL_TS_RETRY_DELAY_INITIAL
+            logger.info("Signal: signal-ts reconnected")
 
-    def _force_reconnect(self) -> None:
-        """Force SSE reconnection by closing the current response."""
-        if self._sse_response and not self._sse_response.is_stream_consumed:
-            with suppress(Exception):
-                task = asyncio.create_task(self._sse_response.aclose())
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-            self._sse_response = None
+    def _enqueue_envelope(self, envelope: dict) -> None:
+        """Sidecar callback (sync, on the stdout reader): queue for the serial dispatcher."""
+        if self._inbound is not None:
+            self._inbound.put_nowait(envelope)
+
+    async def _inbound_loop(self, queue: asyncio.Queue) -> None:
+        """Handle envelopes strictly in arrival order; a failure never stops the loop."""
+        while True:
+            envelope = await queue.get()
+            if envelope is _INBOUND_STOP:
+                return
+            try:
+                await self._handle_envelope(envelope)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Signal: error handling signal-ts envelope")
+
+    async def _stop_inbound(self, *, drain: bool) -> None:
+        """Stop the dispatcher; ``drain`` first finishes envelopes the sidecar already acknowledged."""
+        queue, task = self._inbound, self._inbound_task
+        self._inbound = self._inbound_task = None
+        if task is None:
+            return
+        if drain and queue is not None and task is not asyncio.current_task():
+            queue.put_nowait(_INBOUND_STOP)
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=_INBOUND_DRAIN_TIMEOUT)
+                return
+            except (asyncio.TimeoutError, Exception):
+                logger.warning("Signal: inbound queue did not drain within %.0fs", _INBOUND_DRAIN_TIMEOUT)
+        if task is not asyncio.current_task():
+            await cancel_task(task)
 
     def _unwrap_sync_message(self, envelope_data: dict) -> Optional[dict]:
         """Promote a "Note to Self" / group sync-sent to a dataMessage envelope; None for other
@@ -413,7 +460,7 @@ class SignalAdapter(BasePlatformAdapter):
         return media_urls, media_types
 
     async def _handle_envelope(self, envelope: dict) -> None:
-        """Process an incoming signal-cli envelope."""
+        """Process one signal-ts envelope (normalized to the signal-cli envelope shape)."""
         envelope_data = envelope.get("envelope", envelope)
         is_note_to_self = "syncMessage" in envelope_data
         if is_note_to_self:
@@ -427,6 +474,11 @@ class SignalAdapter(BasePlatformAdapter):
         self._remember_recipient_identifiers(sender, sender_uuid)
         if not sender:
             logger.debug("Signal: ignoring envelope with no sender")
+            return
+        # Config-owned intake: an explicit allowlist drops other senders before any reaction or
+        # agent work; pairing mode forwards DMs so the gateway can run the pairing handshake.
+        if self._dm_policy == "allowlist" and not self._ids_allowed({sender, sender_uuid}):
+            logger.debug("Signal: ignoring %s (not in allow_from)", redact_phone(str(sender)))
             return
         # Self-message filtering prevents reply loops (Note to Self is allowed)
         if self._account_normalized and sender == self._account_normalized and not is_note_to_self:
@@ -495,10 +547,10 @@ class SignalAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     def _group_allowed(self, group_id: str) -> bool:
-        """Group policy from SIGNAL_GROUP_ALLOWED_USERS: unset → groups disabled; IDs → only those
-        groups; "*" → all. DM auth is run.py's (_is_user_authorized)."""
+        """Group policy from ``group_allow_from``: empty → groups disabled; IDs → only those groups;
+        "*" → all."""
         if not self.group_allow_from:
-            logger.debug("Signal: ignoring group message (no SIGNAL_GROUP_ALLOWED_USERS)")
+            logger.debug("Signal: ignoring group message (group_allow_from is empty)")
             return False
         if "*" not in self.group_allow_from and group_id not in self.group_allow_from:
             logger.debug("Signal: group %s not in allowlist", group_id[:8] if group_id else "?")
@@ -577,16 +629,22 @@ class SignalAdapter(BasePlatformAdapter):
         return params
 
     async def _fetch_attachment(self, attachment_id: str) -> tuple:
-        """Fetch an attachment via JSON-RPC and cache it. Returns (path, ext)."""
+        """Download an attachment through the live sidecar and cache it. Returns (path, ext). The
+        sidecar stages the bytes in its cache dir; anything outside that dir is refused."""
         result = await self._rpc("getAttachment", {"account": self.account, "id": attachment_id})
         if not result:
             return None, ""
-        if isinstance(result, dict):  # signal-cli returns {"data": "base64..."}
-            result = result.get("data")
-            if not result:
-                logger.warning("Signal: attachment response missing 'data' key")
-                return None, ""
-        raw_data = base64.b64decode(result)
+        if not isinstance(result, dict) or not result.get("path"):
+            logger.warning("Signal: signal-ts attachment response missing path")
+            return None, ""
+        staged_path = Path(str(result["path"])).resolve()
+        if not staged_path.is_relative_to(self._signal_cache_dir.resolve()):
+            raise SignalTsProcessError("signal-ts returned an attachment outside its cache")
+        try:
+            raw_data = await asyncio.to_thread(staged_path.read_bytes)
+        finally:
+            with suppress(OSError):
+                staged_path.unlink()
         ext = _guess_extension(raw_data)
         # Android voice notes are raw ADTS AAC, which Whisper-style STT rejects; remux losslessly
         # to .m4a. Without ffmpeg the raw file is cached as-is (no downstream remux fallback).
@@ -598,37 +656,25 @@ class SignalAdapter(BasePlatformAdapter):
 
     async def _rpc(self, method: str, params: dict, rpc_id: str | None = None, *, log_failures: bool = True,
                    raise_on_rate_limit: bool = False, timeout: float = 30.0) -> Any:
-        """Send a JSON-RPC 2.0 request to signal-cli. ``log_failures=False`` logs failures at DEBUG (typing
-        path: silence NETWORK_FAILURE spam); ``raise_on_rate_limit=True`` raises ``SignalRateLimitError``
-        on a 429 / RateLimitException instead of swallowing it."""
-        if not self.client:
-            logger.warning("Signal: RPC called but client not connected")
+        """Invoke one operation on the live sidecar; None on failure. ``log_failures=False`` logs failures
+        at DEBUG (typing path: silence NETWORK_FAILURE spam); ``raise_on_rate_limit=True`` raises
+        ``SignalRateLimitError`` on a rate-limit failure instead of swallowing it. ``rpc_id`` is accepted
+        for call-site compatibility; the sidecar correlates requests itself."""
+        sidecar = self._sidecar
+        if sidecar is None or not sidecar.running:
+            logger.warning("Signal: %s attempted while signal-ts is disconnected", method)
             return None
-        payload = {"jsonrpc": "2.0", "method": method, "params": params,
-                   "id": rpc_id if rpc_id is not None else f"{method}_{int(time.time() * 1000)}"}
         fail_level = logging.WARNING if log_failures else logging.DEBUG
         try:
-            resp = await self.client.post(f"{self.http_url}/api/v1/rpc", json=payload, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            if "error" in data:
-                err = data["error"]
-                if raise_on_rate_limit and _is_signal_rate_limit_error(err):
-                    err_msg = str(err.get("message", "")) if isinstance(err, dict) else str(err)
-                    raise SignalRateLimitError(err_msg, retry_after=_extract_retry_after_seconds(err))
-                logger.log(fail_level, "Signal RPC error (%s): %s", method, err)
-                return None
-            result = data.get("result")
-            if isinstance(result, dict) and raise_on_rate_limit:
-                for r in result.get("results") if isinstance(result.get("results"), list) else ():
-                    if isinstance(r, dict) and r.get("type") == "RATE_LIMIT_FAILURE":
-                        raise SignalRateLimitError("Rate limit exceeded for recipient",
-                                                   retry_after=r.get("retryAfterSeconds"))
-            return result
-        except SignalRateLimitError:
-            raise
-        except Exception as e:
-            logger.log(fail_level, "Signal RPC %s failed: %s", method, e)
+            return await sidecar.call(method, params, timeout=timeout)
+        except SignalTsCallError as e:
+            details = e.details or {"message": str(e)}
+            if raise_on_rate_limit and _is_signal_rate_limit_error(details):
+                raise SignalRateLimitError(str(e), retry_after=_extract_retry_after_seconds(details)) from e
+            logger.log(fail_level, "Signal signal-ts %s failed: %s", method, e)
+            return None
+        except SignalTsProcessError as e:
+            logger.log(fail_level, "Signal signal-ts process failure during %s: %s", method, e)
             return None
 
     def format_message(self, content: str) -> str:
@@ -636,7 +682,7 @@ class SignalAdapter(BasePlatformAdapter):
         return content
 
     def _validate_send_result(self, result: Any) -> tuple[bool, Optional[str]]:
-        """Validate signal-cli send response results. Returns (success, error_message)."""
+        """Validate a ``send`` result (``results[*].type`` per recipient). Returns (success, error_message)."""
         results = result.get("results") if isinstance(result, dict) else None
         for r in results if isinstance(results, list) else ():
             if not isinstance(r, dict):
@@ -865,6 +911,44 @@ class SignalAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("Signal: failed to send pacing notice: %s", e)
 
+    async def send_files(self, chat_id: str, file_paths: list[str], caption: str = "") -> SendResult:
+        """Send local files as native attachments over the live connection: one message per
+        SIGNAL_MAX_ATTACHMENTS_PER_MSG batch, the formatted caption on the first, paced by the shared
+        rate-limit scheduler. Missing/oversized files are skipped; fails when none are valid or a
+        batch is not delivered."""
+        await self._stop_typing_indicator(chat_id)
+        attachments: list[str] = []
+        for raw_path in file_paths:
+            path = Path(raw_path).expanduser()
+            try:
+                size = path.stat().st_size
+            except OSError:
+                logger.warning("Signal: attachment does not exist: %s", path)
+                continue
+            if size > SIGNAL_MAX_ATTACHMENT_SIZE:
+                logger.warning("Signal: attachment too large (%d bytes): %s", size, path)
+                continue
+            attachments.append(str(path.resolve()))
+        if not attachments:
+            return SendResult(success=False, error="No valid Signal attachments")
+        plain_text, text_styles = markdown_to_signal(caption or "")
+        base_params = await self._with_target({"account": self.account}, chat_id)
+        scheduler, per = get_scheduler(), SIGNAL_MAX_ATTACHMENTS_PER_MSG
+        batches = [attachments[i:i + per] for i in range(0, len(attachments), per)]
+        for idx, batch in enumerate(batches, start=1):
+            estimated = scheduler.estimate_wait(len(batch))
+            if estimated >= SIGNAL_BATCH_PACING_NOTICE_THRESHOLD:
+                await self._notify_batch_pacing(chat_id, idx, len(batches), estimated)
+            params: dict[str, Any] = dict(base_params, message=plain_text if idx == 1 else "", attachments=batch)
+            if idx == 1 and plain_text and text_styles:
+                if len(text_styles) == 1:
+                    params["textStyle"] = text_styles[0]
+                else:
+                    params["textStyles"] = text_styles
+            if not await self._send_attachment_batch(scheduler, params, len(batch), f"{idx}/{len(batches)}"):
+                return SendResult(success=False, error=f"Signal attachment batch {idx}/{len(batches)} was not delivered")
+        return SendResult(success=True, message_id=None)
+
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None, **kwargs) -> SendResult:
         """Send an image. Supports http(s):// and file:// URLs."""
         await self._stop_typing_indicator(chat_id)
@@ -932,7 +1016,7 @@ class SignalAdapter(BasePlatformAdapter):
         return await self._rpc("sendReaction", params) is not None
 
     async def send_reaction(self, chat_id: str, emoji: str, target_author: str, target_timestamp: int) -> bool:
-        """React to the message (author number/UUID, Signal ms timestamp) via signal-cli RPC."""
+        """React to the message (author number/UUID, Signal ms timestamp) over the live connection."""
         ok = await self._send_reaction_rpc(chat_id, {
             "account": self.account, "emoji": emoji, "targetAuthor": target_author,
             "targetTimestamp": target_timestamp})
@@ -940,11 +1024,13 @@ class SignalAdapter(BasePlatformAdapter):
             logger.debug("Signal: sendReaction failed (chat=%s, emoji=%s)", chat_id[:20], emoji)
         return ok
 
-    async def remove_reaction(self, chat_id: str, target_author: str, target_timestamp: int) -> bool:
-        """Remove a reaction by sending an empty-string emoji."""
+    async def remove_reaction(self, chat_id: str, target_author: str, target_timestamp: int,
+                              emoji: str = "👀") -> bool:
+        """Remove our reaction. Signal's protocol names the emoji being removed; the adapter's only
+        transient lifecycle reaction is 👀."""
         return await self._send_reaction_rpc(chat_id, {
-            "account": self.account, "emoji": "", "targetAuthor": target_author, "targetTimestamp": target_timestamp,
-            "remove": True})
+            "account": self.account, "emoji": emoji, "targetAuthor": target_author,
+            "targetTimestamp": target_timestamp, "remove": True})
 
     def _extract_reaction_target(self, event: MessageEvent) -> Optional[tuple]:
         """Extract (target_author, target_timestamp) from a MessageEvent, or None."""
@@ -953,12 +1039,20 @@ class SignalAdapter(BasePlatformAdapter):
         return (raw["sender"], raw["timestamp_ms"]) if ok else None
 
     def _reactions_enabled(self, event: MessageEvent = None) -> bool:
-        """SIGNAL_REACTIONS env gate, then the DM allowlist: reactions fire before run.py's auth gate,
-        so an unauthorized contact's 👀 would otherwise reveal a listening bot."""
-        if str(_sig_secret("SIGNAL_REACTIONS", "true")).lower() in {"false", "0", "no"}:
+        """``extra.reactions`` gate, then the access policy: reactions fire before the gateway's auth
+        gate, so a 👀 for an unknown (pairing-mode) DM would reveal a listening bot. Allowed groups and
+        allowlisted senders get reactions."""
+        if not self.reactions_enabled:
             return False
-        sender = getattr(getattr(event, "source", None), "user_id", None) if event is not None else None
-        return not (sender and "*" not in self.dm_allow_from and sender not in self.dm_allow_from)
+        source = getattr(event, "source", None) if event is not None else None
+        if source is None:
+            return True
+        if getattr(source, "chat_type", None) == "group":
+            group_id = str(getattr(source, "chat_id", "") or "").removeprefix("group:")
+            return self._group_allowed(group_id) and (
+                self._dm_policy != "allowlist"
+                or self._ids_allowed({source.user_id, getattr(source, "user_id_alt", None)}))
+        return self._ids_allowed({getattr(source, "user_id", None), getattr(source, "user_id_alt", None)})
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """React with 👀 when processing begins."""

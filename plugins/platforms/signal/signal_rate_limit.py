@@ -1,8 +1,9 @@
 """Signal attachment rate-limit scheduler: process-wide token-bucket simulator mirroring the per-account
-attachment rate limit signal-cli/Signal-Server enforce. Producers (``SignalAdapter.send_multiple_images``
+attachment rate limit Signal-Server enforces. Producers (``SignalAdapter.send_multiple_images``
 and the ``send_message`` tool's Signal path) call ``acquire(n)`` before an attachment send; on a 429 they
 call ``feedback(retry_after, n)`` so the model recalibrates from the server's authoritative hint.
-Concurrent calls serialize through an ``asyncio.Lock`` — FIFO fairness across sessions sharing one daemon."""
+Concurrent calls serialize through an ``asyncio.Lock`` — FIFO fairness across sessions sharing one
+signal-ts connection."""
 
 from __future__ import annotations
 
@@ -19,15 +20,15 @@ logger = logging.getLogger(__name__)
 
 SIGNAL_MAX_ATTACHMENTS_PER_MSG = 32  # per-message attachment cap (Signal-{Android,Desktop} source)
 SIGNAL_RATE_LIMIT_BUCKET_CAPACITY = 50  # server-side token-bucket capacity for attachments
-SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER = 4  # fallback token refill interval for signal-cli < v0.14.3
+SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER = 4  # fallback token refill interval when the server gives no hint
 SIGNAL_RATE_LIMIT_MAX_ATTEMPTS = 2  # initial attempt + 1 retry
 SIGNAL_BATCH_PACING_NOTICE_THRESHOLD = 10.0  # estimated wait above this → notify the user
-SIGNAL_RPC_ERROR_RATELIMIT = -5  # signal-cli (v0.14.3+) JSON-RPC error code for RateLimitException
+SIGNAL_RPC_ERROR_RATELIMIT = -5  # legacy signal-cli JSON-RPC RateLimitException code, still recognised
 
 
 class SignalRateLimitError(Exception):
     """Raised by ``SignalAdapter._rpc`` for rate-limit responses when ``raise_on_rate_limit=True``.
-    ``retry_after`` is the server's per-token Retry-After in seconds (signal-cli ≥ v0.14.3) or None."""
+    ``retry_after`` is the server's per-token Retry-After in seconds, or None when it gave none."""
 
     def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
         super().__init__(message)
@@ -39,7 +40,7 @@ class SignalSchedulerError(Exception):
 
 
 # "Retry after 4 seconds" — libsignal-net's RetryLaterException string form, surfaced when 429s hit during
-# attachment upload (signal-cli wraps these as AttachmentInvalidException, so the typed path doesn't fire).
+# attachment upload, where no typed rate-limit field is attached.
 _RETRY_AFTER_RE = re.compile(r"Retry after (\d+(?:\.\d+)?)\s*second", re.IGNORECASE)
 
 
@@ -48,9 +49,12 @@ def _error_message(err: Any) -> str:
 
 
 def _extract_retry_after_seconds(err: Any) -> Optional[float]:
-    """Per-token Retry-After from a signal-cli rate-limit error, or None. Sources, in order:
-    ``error.data.response.results[*].retryAfterSeconds`` (signal-cli ≥ v0.14.3), then "Retry after N
-    seconds" parsed from the message (RetryLaterException wrapped as AttachmentInvalidException)."""
+    """Per-token Retry-After from a Signal rate-limit error, or None. Sources, in order: the sidecar's
+    ``retryAfterSeconds`` (libsignal ``RateLimitedError.retryAfterSecs``), the legacy
+    ``error.data.response.results[*].retryAfterSeconds`` shape, then "Retry after N seconds" parsed
+    from the message (RetryLaterException text)."""
+    if isinstance(err, dict) and (direct := parse_retry_after_seconds(err.get("retryAfterSeconds"))) is not None:
+        return direct
     if isinstance(err, dict):
         results = ((err.get("data") or {}).get("response") or {}).get("results") or []
         candidates = [parse_retry_after_seconds(r.get("retryAfterSeconds")) for r in results
@@ -62,10 +66,10 @@ def _extract_retry_after_seconds(err: Any) -> Optional[float]:
 
 
 def _is_signal_rate_limit_error(err: Any) -> bool:
-    """True if a signal-cli RPC error reflects a rate-limit failure: the typed ``RATELIMIT_ERROR`` code
-    (≥ v0.14.3), legacy ``[429]`` / ``RateLimitException`` substrings, or libsignal-net's
-    ``RetryLaterException`` / "Retry after N seconds" leaked through AttachmentInvalidException."""
-    if isinstance(err, dict) and err.get("code") == SIGNAL_RPC_ERROR_RATELIMIT:
+    """True if a Signal error reflects a rate-limit failure: the sidecar's ``rateLimited`` flag, the
+    legacy typed ``RATELIMIT_ERROR`` code, ``[429]`` / ``RateLimit*`` substrings, or libsignal-net's
+    ``RetryLaterException`` / "Retry after N seconds" text."""
+    if isinstance(err, dict) and (err.get("rateLimited") is True or err.get("code") == SIGNAL_RPC_ERROR_RATELIMIT):
         return True
     message = _error_message(err)
     msg_lower = message.lower()
@@ -79,7 +83,7 @@ def _format_wait(seconds: float) -> str:
 
 
 def _signal_send_timeout(num_attachments: int) -> float:
-    """HTTP timeout for a Signal ``send`` RPC: signal-cli uploads attachments serially inside the call, so
+    """Timeout for one Signal ``send`` call: the sidecar uploads attachments serially inside the call, so
     the default 30s truncates large batches mid-upload (phantom failure). 5s/attachment, 60s floor."""
     return 30.0 if num_attachments <= 0 else max(60.0, 5.0 * num_attachments)
 
