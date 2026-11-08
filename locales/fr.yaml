@@ -960,6 +960,7 @@ gateway:
 
 
       🔄 Session réinitialisée automatiquement — la conversation a dépassé la taille maximale du contexte et n'a pas pu être compressée davantage. Votre prochain message démarrera une nouvelle session.
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ Modèle : `{model}`"
     info_provider: "◆ Fournisseur : {provider}"
     info_context: "◆ Contexte : {tokens} tokens ({source})"

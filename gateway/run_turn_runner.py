@@ -1418,6 +1418,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             **{key: result[key] for key in _FAILURE_DESCRIPTOR_KEYS if key in result},
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
+            # A turn runtime's native thread survives a context limit (it compacts natively): the
+            # gateway must keep the session instead of auto-resetting it.
+            "native_history_preserved": bool(result.get("native_history_preserved", False)),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             # Same rule as the direct API path (``_finish_turn_result``): the returned `messages` replaced the

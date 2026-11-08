@@ -813,6 +813,7 @@ gateway:
   session:
     auto_reset_notice: "◐ Sessie herstel nadat dit gestop is. Gesprekgeskiedenis uitgevee.\nGebruik /resume om 'n vorige sessie te blaai en te herstel.\n"
     auto_reset_context_exhausted: "\n\n🔄 Sessie outomaties herstel — die gesprek het die maksimum konteksgrootte oorskry en kon nie verder saamgepers word nie. Jou volgende boodskap sal 'n vars sessie begin."
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ Model: `{model}`"
     info_provider: "◆ Verskaffer: {provider}"
     info_context: "◆ Konteks: {tokens} tokens ({source})"

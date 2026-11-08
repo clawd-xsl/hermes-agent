@@ -813,6 +813,7 @@ gateway:
   session:
     auto_reset_notice: "◐ Sitzung nach dem Stopp zurückgesetzt. Konversationsverlauf gelöscht.\nVerwenden Sie /resume, um eine frühere Sitzung zu durchsuchen und wiederherzustellen.\n"
     auto_reset_context_exhausted: "\n\n🔄 Sitzung automatisch zurückgesetzt — die Konversation hat die maximale Kontextgröße überschritten und konnte nicht weiter komprimiert werden. Ihre nächste Nachricht startet eine neue Sitzung."
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ Modell: `{model}`"
     info_provider: "◆ Anbieter: {provider}"
     info_context: "◆ Kontext: {tokens} Tokens ({source})"

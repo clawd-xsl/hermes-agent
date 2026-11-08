@@ -813,6 +813,7 @@ gateway:
   session:
     auto_reset_notice: "◐ 会话在停止后已重置。对话历史已清空。\n用 /resume 浏览并恢复之前的会话。\n"
     auto_reset_context_exhausted: "\n\n🔄 会话已自动重置——对话超出了最大上下文大小，且无法进一步压缩。你的下一条消息将开始一个新会话。"
+    native_context_exhausted: "⚠️ 已达到上下文上限。原生会话已保留：用 /compress 进行原生压缩，或用 /reset 开始新会话。"
     info_model: "◆ 模型：`{model}`"
     info_provider: "◆ 提供方：{provider}"
     info_context: "◆ 上下文：{tokens} tokens（{source}）"

@@ -813,6 +813,7 @@ gateway:
   session:
     auto_reset_notice: "◐ Oturum durdurulduktan sonra sıfırlandı. Konuşma geçmişi temizlendi.\nÖnceki bir oturuma göz atıp geri yüklemek için /resume kullanın.\n"
     auto_reset_context_exhausted: "\n\n🔄 Oturum otomatik sıfırlandı — konuşma en büyük bağlam boyutunu aştı ve daha fazla sıkıştırılamadı. Bir sonraki mesajınız yeni bir oturum başlatacak."
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ Model: `{model}`"
     info_provider: "◆ Sağlayıcı: {provider}"
     info_context: "◆ Bağlam: {tokens} token ({source})"

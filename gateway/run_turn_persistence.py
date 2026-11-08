@@ -414,6 +414,14 @@ class GatewayTurnPersistenceMixin:
             guidance = _context_overflow_reply() if detached_route_of(source) else ""
             if guidance not in (response or ""):
                 response = f"{response}\n\n{guidance}" if response else guidance
+        elif agent_result.get("compression_exhausted") and agent_result.get("native_history_preserved"):
+            # A turn runtime owns the authoritative native thread and compacts it itself: a rotation
+            # here would only drop that binding. Keep the session and say how to proceed.
+            logger.warning("Context limit reached for session %s; preserving the native session and route.",
+                           session_entry.session_id if session_entry else "?")
+            guidance = t("gateway.session.native_context_exhausted")
+            if guidance not in (response or ""):
+                response = f"{response}\n\n{guidance}" if response else guidance
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
             if not self._hmwa_defer_exhaustion_reset(session_entry, session_key, source):
                 session_entry = await self._hmwa_rotate_exhausted_session(session_entry, session_key, source)

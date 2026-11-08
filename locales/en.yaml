@@ -834,6 +834,7 @@ gateway:
   session:
     auto_reset_notice: "◐ Session reset after being stopped. Conversation history cleared.\nUse /resume to browse and restore a previous session.\n"
     auto_reset_context_exhausted: "\n\n🔄 Session auto-reset — the conversation exceeded the maximum context size and could not be compressed further. Your next message will start a fresh session."
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ Model: `{model}`"
     info_provider: "◆ Provider: {provider}"
     info_context: "◆ Context: {tokens} tokens ({source})"

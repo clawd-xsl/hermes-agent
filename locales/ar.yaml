@@ -813,6 +813,7 @@ gateway:
   session:
     auto_reset_notice: "◐ أُعيد تعيين الجلسة بعد إيقافها. تم مسح سجل المحادثة.\nاستخدم /resume لاستعراض جلسة سابقة واستعادتها.\n"
     auto_reset_context_exhausted: "\n\n🔄 أُعيد تعيين الجلسة تلقائيًا — تجاوزت المحادثة الحد الأقصى لحجم السياق ولم يكن بالإمكان ضغطها أكثر. ستبدأ رسالتك التالية جلسة جديدة."
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ النموذج: `{model}`"
     info_provider: "◆ المزوّد: {provider}"
     info_context: "◆ السياق: {tokens} رمزًا ({source})"

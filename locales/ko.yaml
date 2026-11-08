@@ -813,6 +813,7 @@ gateway:
   session:
     auto_reset_notice: "◐ 중지 후 세션이 초기화되었어요. 대화 기록이 지워졌어요.\n이전 세션을 찾아 복원하려면 /resume을 사용하세요.\n"
     auto_reset_context_exhausted: "\n\n🔄 세션 자동 초기화 — 대화가 최대 컨텍스트 크기를 초과했고 더 압축할 수 없었어요. 다음 메시지부터 새 세션이 시작돼요."
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ 모델: `{model}`"
     info_provider: "◆ 제공자: {provider}"
     info_context: "◆ 컨텍스트: {tokens} 토큰 ({source})"

@@ -813,6 +813,7 @@ gateway:
   session:
     auto_reset_notice: "◐ 停止後にセッションをリセットしました。会話履歴はクリアされました。\n/resume で以前のセッションを閲覧・復元できます。\n"
     auto_reset_context_exhausted: "\n\n🔄 セッションを自動リセットしました — 会話が最大コンテキストサイズを超え、これ以上圧縮できませんでした。次のメッセージから新しいセッションが始まります。"
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ モデル: `{model}`"
     info_provider: "◆ プロバイダー: {provider}"
     info_context: "◆ コンテキスト: {tokens} トークン ({source})"

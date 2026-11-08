@@ -813,6 +813,7 @@ gateway:
   session:
     auto_reset_notice: "◐ Сеанс скинуто після зупинки. Історію розмови очищено.\nВикористайте /resume, щоб переглянути й відновити попередній сеанс.\n"
     auto_reset_context_exhausted: "\n\n🔄 Сеанс автоматично скинуто — розмова перевищила максимальний розмір контексту, і стиснути її далі не вдалося. Ваше наступне повідомлення почне новий сеанс."
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ Модель: `{model}`"
     info_provider: "◆ Провайдер: {provider}"
     info_context: "◆ Контекст: {tokens} токенів ({source})"

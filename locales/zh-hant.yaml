@@ -813,6 +813,7 @@ gateway:
   session:
     auto_reset_notice: "◐ 工作階段在停止後已重設。對話記錄已清除。\n使用 /resume 可瀏覽並還原先前的工作階段。\n"
     auto_reset_context_exhausted: "\n\n🔄 工作階段已自動重設 — 對話超出上下文大小上限，且無法再進一步壓縮。你的下一則訊息將開始新的工作階段。"
+    native_context_exhausted: "⚠️ 已達到上下文上限。原生工作階段已保留：用 /compress 進行原生壓縮，或用 /reset 開始新工作階段。"
     info_model: "◆ 模型：`{model}`"
     info_provider: "◆ 提供方：{provider}"
     info_context: "◆ 上下文：{tokens} tokens（{source}）"

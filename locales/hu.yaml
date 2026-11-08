@@ -825,6 +825,7 @@ gateway:
       ◐ A munkamenet a leállítás után visszaállt. A beszélgetési előzmények törölve.
       A /resume paranccsal böngészhetsz és visszaállíthatsz egy korábbi munkamenetet.
     auto_reset_context_exhausted: "\n\n🔄 A munkamenet automatikusan visszaállt — a beszélgetés túllépte a maximális kontextusméretet, és nem lehetett tovább tömöríteni. A következő üzeneted új munkamenetet indít."
+    native_context_exhausted: "⚠️ The context limit was reached. The native session is preserved: use /compress to compact it natively, or /reset to start a new session."
     info_model: "◆ Modell: `{model}`"
     info_provider: "◆ Szolgáltató: {provider}"
     info_context: "◆ Kontextus: {tokens} token ({source})"
