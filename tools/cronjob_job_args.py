@@ -99,8 +99,14 @@ def _origin_from_env(
     return {
         "platform": origin_platform, "chat_id": origin_chat_id,
         "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None, "thread_id": thread_id,
+        "chat_type": get_session_env("HERMES_SESSION_CHAT_TYPE") or None,
         # Lets a delivery mirror resolve the participant's session in per-user-isolated groups.
         "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+        "user_name": get_session_env("HERMES_SESSION_USER_NAME") or None,
+        # The durable routing identity: ``session: main`` recovers the exact live/persisted home
+        # source from it instead of reconstructing a lookalike key after a gateway restart.
+        "session_key": get_session_env("HERMES_SESSION_KEY") or None,
+        "profile": get_session_env("HERMES_SESSION_PROFILE") or None,
         # Workspace/server scope (Slack team, Discord guild...): Slack session keys embed it,
         # so a continuable cron seed built without it would never resolve a scoped reply.
         "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
@@ -470,7 +476,7 @@ def _validate_context_from_refs(refs: list[Any]) -> Optional[str]:
 # Optional fields echoed by _format_job only when truthy (order = JSON key order).
 _FORMAT_JOB_OPTIONAL_KEYS = (
     "script", "reasoning_effort", "monitor_script", "monitor_url",
-    "monitor_state", "no_agent", "enabled_toolsets", "workdir", "interpreter")
+    "monitor_state", "no_agent", "enabled_toolsets", "workdir", "interpreter", "session")
 
 
 def _format_job(job: dict[str, Any]) -> dict[str, Any]:

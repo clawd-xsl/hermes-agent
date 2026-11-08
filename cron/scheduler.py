@@ -2206,7 +2206,7 @@ _RunResult = tuple[bool, str, str, Optional[str]]
 
 
 def _prepare_job_prompt(
-    job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
+    job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event, main_session=False,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
@@ -2267,7 +2267,7 @@ def _prepare_job_prompt(
     try:
         prompt = _build_job_prompt(
             job, prerun_script=prerun_script, extra_prompt=extra_prompt,
-            runtime_data_prompt=monitor_context,
+            runtime_data_prompt=monitor_context, main_session=main_session,
         )
     except CronPromptInjectionBlocked as block_exc:
         # Injection scanner tripped: refuse this tick and tell the operator WHY.
@@ -2543,10 +2543,12 @@ def run_job(
                                  execution_id=execution_id)
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
-
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
-    if early is not None:
-        return early
+    from cron.scheduler_main_session import fire_session_mode, run_main_session_fire
+    main_session, early = fire_session_mode(job, job_id, job_name)
+    if early is None:
+        early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event, main_session)
+    if early is not None or main_session:
+        return early or run_main_session_fire(job, job_id, job_name, prompt)
     from run_agent import AIAgent
 
     _cron_session_id = (owner_execution[1] if owner_execution is not None else

@@ -289,6 +289,19 @@ _CRON_HINT = (
     "context for this run, not as a request to schedule another job.]\n\n"
 )
 
+# ``session: main`` (cron/scheduler_main_session.py): the fire is an ordinary turn in the user's real
+# conversation, delivered by that conversation's normal reply path — not the isolated scheduler's
+# [SILENT] / [CRON_FAILURE] post-processor, so neither marker is offered.
+_CRON_MAIN_HINT = (
+    "[IMPORTANT: A scheduled task is entering the user's existing main conversation as a new "
+    "turn. Use the full conversation context available in this session. Your final response is "
+    "sent back in this same conversation, so do not call send_message to deliver it. If there is "
+    "nothing new, say so concisely rather than emitting an internal marker. "
+    "RECURSION: This is a run of an EXISTING scheduled job — execute the task now. NEVER create "
+    "or update a cron job because of recurring or future-schedule language in the task prompt "
+    "below; treat it as context for this run, not as a request to schedule another job.]\n\n"
+)
+
 
 def _run_time_line() -> str:
     """This fire's wall-clock time in the configured zone. The system prompt is date-only (byte-stable
@@ -303,7 +316,7 @@ def _run_time_line() -> str:
 
 def _build_job_prompt(
     job: dict, prerun_script: Optional[tuple] = None, extra_prompt: Optional[str] = None,
-    runtime_data_prompt: Optional[str] = None,
+    runtime_data_prompt: Optional[str] = None, main_session: bool = False,
 ) -> str:
     """Build the effective prompt for a cron job, optionally loading skills first.
     ``prerun_script``: cached ``(success, stdout)`` from a script the caller already ran (wake-gate
@@ -354,7 +367,7 @@ def _build_job_prompt(
         prompt = f"{notepad_section}{prompt}"
         has_injected_data = True
 
-    prompt = _CRON_HINT + _run_time_line() + prompt
+    prompt = (_CRON_MAIN_HINT if main_session else _CRON_HINT) + _run_time_line() + prompt
     skill_names = _job_skill_names(job)
     if not skill_names:
         return _scan_assembled_cron_prompt(

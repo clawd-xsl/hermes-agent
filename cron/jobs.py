@@ -34,7 +34,8 @@ from agent.deadline import poll_until
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
-from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedule_knobs
+from cron.jobs_invariants import (
+    _normalize_catch_up, _validate_job_mode_invariants, normalize_job_session, validate_schedule_knobs)
 from cron.jobs_model_pin import _main_model_pin
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
@@ -1744,13 +1745,6 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
 
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
-def _normalize_catch_up(value: Any) -> Optional[bool]:
-    """``catch_up``: True runs one catch-up for missed slots, False skips them, None = default."""
-    if value is None or isinstance(value, bool):
-        return value
-    raise ValueError("catch_up must be true, false, or null (use the default).")
-
-
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "model": _normalize_job_optional_text,
     "provider": _normalize_job_optional_text,
@@ -1767,6 +1761,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "session": normalize_job_session,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1781,6 +1776,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "session": normalize_job_session,  # blank clears it back to cron.session
 }
 
 
@@ -1835,6 +1831,7 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    session: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1847,7 +1844,8 @@ def create_job(
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
-    (0 = never catch up)."""
+    (0 = never catch up). session: ``main`` runs each fire as a turn in the gateway home
+    conversation, ``isolated`` in its own session (None = ``cron.session``, default isolated)."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1872,7 +1870,7 @@ def create_job(
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
 
-    _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
+    _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"], f["session"])
     validate_schedule_knobs(parsed_schedule, f["timezone"], f["grace_minutes"])
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
@@ -1938,7 +1936,7 @@ def create_job(
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
-        ("catch_up", f["catch_up"]),
+        ("catch_up", f["catch_up"]), ("session", f["session"]),
     ):
         if value is not None:
             job[key] = value
@@ -2128,14 +2126,16 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        if updated.get("session") is None:  # cleared: follow cron.session, like a job that never set it
+            updated.pop("session", None)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
-        if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+        if {"monitor_script", "monitor_url", "no_agent", "script", "session"}.intersection(updates):
             _validate_job_mode_invariants(
                 updated.get("monitor_script") or None,
                 updated.get("monitor_url") or None,
                 bool(updated.get("no_agent")),
-                _normalize_job_optional_text(updated.get("script")))
+                _normalize_job_optional_text(updated.get("script")), updated.get("session"))
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
         if {"timezone", "grace_minutes"}.intersection(updates):

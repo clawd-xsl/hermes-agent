@@ -3,13 +3,18 @@
 ``create_job`` and ``update_job`` (``cron/jobs.py``) both run these, so an update cannot
 bypass a rule the create door enforces.
 """
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_constants import display_hermes_home
 
 NO_AGENT_WITHOUT_SCRIPT_ERROR = (
     "no_agent=True requires a script — with no agent and no script "
     "there is nothing for the job to run."
+)
+
+MAIN_SESSION_NO_AGENT_ERROR = (
+    "session='main' runs an agent turn in the gateway home conversation and cannot be "
+    "combined with no_agent=True."
 )
 
 SCRIPT_IS_COMMAND_LINE_ERROR = (
@@ -23,9 +28,12 @@ def _validate_job_mode_invariants(
     monitor_url: Optional[str],
     no_agent: bool,
     script: Optional[str],
+    session: Optional[str] = None,
 ) -> None:
     """Execution-mode invariants shared by create_job and update_job (no bypass via the update
     door)."""
+    if no_agent and session == "main":
+        raise ValueError(MAIN_SESSION_NO_AGENT_ERROR)
     if monitor_script and monitor_url:
         raise ValueError(
             "monitor_script and monitor_url are mutually exclusive — a job "
@@ -40,6 +48,21 @@ def _validate_job_mode_invariants(
     if script and _script_is_command_line(script):
         raise ValueError(SCRIPT_IS_COMMAND_LINE_ERROR.format(
             scripts_dir=display_hermes_home() + "/scripts/", script=script))
+
+
+def normalize_job_session(value: Any) -> Optional[str]:
+    """Per-job ``session``: ``main`` | ``isolated``; blank/None = inherit ``cron.session``."""
+    if value is None or str(value).strip() == "":
+        return None
+    from gateway.main_session import normalize_session_mode
+    return normalize_session_mode(value)
+
+
+def _normalize_catch_up(value: Any) -> Optional[bool]:
+    """``catch_up``: True runs one catch-up for missed slots, False skips them, None = default."""
+    if value is None or isinstance(value, bool):
+        return value
+    raise ValueError("catch_up must be true, false, or null (use the default).")
 
 
 def validate_schedule_knobs(

@@ -734,7 +734,7 @@ def _action_create(a: dict[str, Any]) -> str:
             grace_minutes=a["grace_minutes"],
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
-            catch_up=a["catch_up"],
+            catch_up=a["catch_up"], session=a["session"],
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
@@ -947,6 +947,8 @@ def _update_run_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str
         updates["enabled_toolsets"] = a["enabled_toolsets"]
     if a["attach_to_session"] is not None:
         updates["attach_to_session"] = bool(a["attach_to_session"])
+    if a["session"] is not None:
+        updates["session"] = a["session"]  # '' clears back to cron.session; update_job validates
     if a["workdir"] is not None:
         # Empty string clears; otherwise update_job() validates/normalizes.
         updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
@@ -1072,6 +1074,7 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str | list[str]] = None,
     catch_up: Optional[bool] = None,
+    session: Optional[str] = None,
     task_id: str | None = None,
     session_id: Optional[str] = None,
     paused: bool = False,
@@ -1122,7 +1125,7 @@ CRONJOB_SCHEMA = {
     "name": "cronjob_manage",
     "description": """Schedule recurring or one-off agent tasks (cron jobs): create, list, edit, run. action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only); 'cancel' stops a job's LIVE run without touching its schedule (a no-op when nothing is in flight).
 
-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
+By default jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates. Set session='main' only when the task should be a real turn in the gateway home conversation, using that conversation's full context.""",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1209,6 +1212,11 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": "Optional IANA zone (e.g. 'America/New_York') the cron expression is read in, instead of the profile's. On update, '' clears."
             },
+            "session": {
+                "type": "string",
+                "enum": ["isolated", "main"],
+                "description": "Conversation each fire runs in. 'isolated' = its own fresh session (the default unless config cron.session says otherwise). 'main' = a FIFO turn queued into the live gateway home conversation, reusing its agent, full history, memory, tools and provider session; that conversation's normal reply delivers the answer, so deliver/attach_to_session do not apply. Requires a running gateway with a home channel; incompatible with no_agent. On update, '' clears back to the config default."
+            },
             "attach_to_session": {
                 "type": "boolean",
                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), a user-written bare platform target (deliver='slack' — that platform's home channel), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
@@ -1241,7 +1249,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned", "timezone", "grace_minutes", "catch_up")
+    "paused_reason", "pinned", "timezone", "grace_minutes", "catch_up", "session")
 
 
 def _cronjob_handler(args, **kw):
