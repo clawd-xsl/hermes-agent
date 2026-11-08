@@ -913,6 +913,10 @@ class WebhookAdapter(BasePlatformAdapter):
         if binding is not None:
             authority, receipt = binding
             finalize_webhook(authority, receipt)
+            try:
+                webhook_main.release_one_shot_session(authority, receipt)
+            except Exception:
+                logger.exception("[webhook] Could not release the one-shot session of %s", session_chat_id)
 
     # --- Signature validation ---
 

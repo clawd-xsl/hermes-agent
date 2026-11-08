@@ -165,3 +165,15 @@ async def handoff_to_main(adapter, chat_id: str, content: str, delivery: dict, m
                 accepted.session_key, accepted.queued)
     return SendResult(success=True)
 
+
+def release_one_shot_session(authority, receipt) -> None:
+    """After a delivery's admission settled and its session was ended: release what a turn runtime
+    pooled for the one-shot session (both sides of a mid-run compression rotation)."""
+    from agent.turn_runtime_registry import release_runtime_sessions
+    sid = receipt.ref.session_id
+    tip = None
+    try:
+        tip = authority.db.get_compression_tip(sid)
+    except Exception:
+        logger.debug("[webhook] Compression tip lookup failed for %s", sid, exc_info=True)
+    release_runtime_sessions(tip, sid)
