@@ -60,11 +60,15 @@ def prepare_fire(job: dict, job_id: str, job_name: str, extra_prompt, cancel_eve
     """``run_job``'s ``(early_result, prompt)``: ``prepare`` is ``_prepare_job_prompt`` (every pre-agent
     gate) told which conversation the fire runs in. A main fire's result is its commit to the home
     conversation, so ``run_job`` builds no agent; an unknown hand-edited mode fails the fire."""
+    from hermes_cli.config_backend import ConfigBackendUnavailable
     try:
         main = cron_session_mode(job) == "main"
-    except ValueError as exc:
-        logger.error("Job '%s': %s", job_id, exc)
-        return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
+    except (ValueError, ConfigBackendUnavailable) as exc:
+        # An unknown hand-edited mode, or the config plane being down (a SystemExit on purpose,
+        # never served as defaults): this fire fails, exactly like run_job's own config read.
+        error = f"{type(exc).__name__}: {exc!s}"
+        logger.error("Job '%s': %s", job_id, error)
+        return (False, f"# Cron Job: {job_name} (FAILED)\n\n{error}\n", "", error), None
     early, prompt = prepare(job, job_id, job_name, extra_prompt, cancel_event, main)
     if early is None and main:
         early = run_main_session_fire(job, job_id, job_name, prompt)
