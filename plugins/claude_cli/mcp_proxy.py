@@ -169,75 +169,100 @@ def _mcp_execution_id(proxy_instance_id: str, request_id: Any) -> str:
     return f"{proxy_instance_id}:{encoded}"
 
 
+def _tool_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tool listings exactly as the live agent declared them (the exact JSON schema, not a
+    signature-derived approximation)."""
+    return [
+        {
+            "name": row["name"],
+            "description": row.get("description") or "",
+            "inputSchema": row.get("inputSchema") or {"type": "object", "properties": {}},
+        }
+        for row in rows
+    ]
+
+
+def _content_rows(result: Any) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = []
+    for part in _normalized_mcp_content(result):
+        if part["type"] == "image":
+            content.append({"type": "image", "data": part["data"], "mimeType": part["mimeType"]})
+        else:
+            content.append({"type": "text", "text": part["text"]})
+    return content
+
+
 async def run() -> None:
     try:
         import mcp.server.stdio
         import mcp.types as types
-        from mcp.server.lowlevel import NotificationOptions, Server
-        from mcp.server.models import InitializationOptions
+        from mcp.server.lowlevel import Server
     except ImportError as exc:
         raise RuntimeError(
             "Claude CLI runtime requires the Hermes MCP extra: pip install 'hermes-agent[mcp]'"
         ) from exc
 
     client = LoopbackClient()
-    server = Server("hermes-agent-loopback")
     proxy_instance_id = uuid.uuid4().hex
 
-    @server.list_tools()
-    async def list_tools() -> list[Any]:
-        rows = await asyncio.to_thread(client.request, "list_tools")
-        return [
-            types.Tool(
-                name=row["name"],
-                description=row.get("description") or "",
-                inputSchema=row.get("inputSchema")
-                or {"type": "object", "properties": {}},
-            )
-            for row in rows
-        ]
+    async def list_rows() -> list[dict[str, Any]]:
+        return _tool_rows(await asyncio.to_thread(client.request, "list_tools"))
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[Any]:
-        execution_id = _mcp_execution_id(
-            proxy_instance_id,
-            server.request_context.request_id,
-        )
+    async def call_rows(name: str, arguments: Any, request_id: Any) -> list[dict[str, Any]]:
         result = await asyncio.to_thread(
             client.request,
             "call_tool",
             {"name": name, "arguments": arguments or {}},
-            execution_id=execution_id,
+            execution_id=_mcp_execution_id(proxy_instance_id, request_id),
         )
-        content: list[Any] = []
-        for part in _normalized_mcp_content(result):
-            if part["type"] == "image":
-                content.append(
-                    types.ImageContent(
-                        type="image",
-                        data=part["data"],
-                        mimeType=part["mimeType"],
-                    )
-                )
-            else:
-                content.append(
-                    types.TextContent(type="text", text=part["text"])
-                )
-        return content
+        return _content_rows(result)
 
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="hermes-agent-loopback",
-                server_version="1.0.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
+    try:
+        # mcp >= 2: handlers are registered through the constructor and receive the request
+        # context (which carries the JSON-RPC request id the tool journal correlates on).
+        async def on_list_tools(ctx: Any, params: Any) -> Any:
+            return types.ListToolsResult.model_validate({"tools": await list_rows()})
+
+        async def on_call_tool(ctx: Any, params: Any) -> Any:
+            content = await call_rows(params.name, params.arguments, ctx.request_id)
+            return types.CallToolResult.model_validate({"content": content})
+
+        server = Server(
+            "hermes-agent-loopback", version="1.0.0",
+            on_list_tools=on_list_tools, on_call_tool=on_call_tool,
+        )
+        init_options = server.create_initialization_options()
+    except TypeError:
+        # mcp 1.x: decorator registration, request id on ``server.request_context``.
+        from mcp.server.lowlevel import NotificationOptions
+        from mcp.server.models import InitializationOptions
+
+        server = Server("hermes-agent-loopback")
+
+        @server.list_tools()
+        async def list_tools() -> list[Any]:
+            return [types.Tool.model_validate(row) for row in await list_rows()]
+
+        @server.call_tool()
+        async def call_tool(name: str, arguments: dict[str, Any]) -> list[Any]:
+            rows = await call_rows(name, arguments, server.request_context.request_id)
+            return [
+                types.ImageContent.model_validate(row) if row["type"] == "image"
+                else types.TextContent.model_validate(row)
+                for row in rows
+            ]
+
+        init_options = InitializationOptions(
+            server_name="hermes-agent-loopback",
+            server_version="1.0.0",
+            capabilities=server.get_capabilities(
+                notification_options=NotificationOptions(),
+                experimental_capabilities={},
             ),
         )
+
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        await server.run(read_stream, write_stream, init_options)
 
 
 def main() -> None:
