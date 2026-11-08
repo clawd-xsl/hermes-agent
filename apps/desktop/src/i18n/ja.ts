@@ -1777,16 +1777,6 @@ export const jaOverrides = {
         label: '許可する Matrix ユーザー ID',
         help: '推奨。@user:server 形式のユーザー ID（1 欄に 1 件）。'
       },
-      SIGNAL_HTTP_URL: {
-        label: 'Signal ブリッジ URL',
-        placeholder: 'http://127.0.0.1:8080',
-        help: '実行中の signal-cli REST ブリッジの URL。'
-      },
-      SIGNAL_ACCOUNT: { label: '電話番号', help: 'signal-cli ブリッジに登録した番号。' },
-      SIGNAL_ALLOWED_USERS: {
-        label: '許可する Signal ユーザー',
-        help: '推奨。Signal 識別子（1 欄に 1 件）。'
-      },
       WHATSAPP_ENABLED: {
         label: 'WhatsApp ブリッジを有効にする',
         help: '以下のトグルで自動的に設定されます。必要な場合を除いてそのままにしてください。'

@@ -3131,19 +3131,6 @@ export const esOverrides = {
         label: 'IDs de usuarios de Matrix permitidos',
         help: 'Recomendado. IDs (uno por casilla) en formato @usuario:servidor.'
       },
-      SIGNAL_HTTP_URL: {
-        label: 'URL del puente Signal',
-        placeholder: 'http://127.0.0.1:8080',
-        help: 'URL de un puente REST signal-cli en ejecución.'
-      },
-      SIGNAL_ACCOUNT: {
-        label: 'Número de teléfono',
-        help: 'El número registrado con tu puente signal-cli.'
-      },
-      SIGNAL_ALLOWED_USERS: {
-        label: 'Usuarios de Signal permitidos',
-        help: 'Recomendado. Identificadores de Signal (uno por casilla).'
-      },
       WHATSAPP_ENABLED: {
         label: 'Activar puente de WhatsApp',
         help: 'Se define automáticamente con el interruptor de abajo. No lo toques salvo que sepas que lo necesitas.'

@@ -3141,19 +3141,6 @@ export const deOverrides = {
         label: 'Erlaubte Matrix-Benutzer-IDs',
         help: 'Empfohlen. Benutzer-IDs im Format @benutzer:server, eine pro Feld.'
       },
-      SIGNAL_HTTP_URL: {
-        label: 'Signal-Bridge-URL',
-        placeholder: 'http://127.0.0.1:8080',
-        help: 'URL einer laufenden signal-cli-REST-Bridge.'
-      },
-      SIGNAL_ACCOUNT: {
-        label: 'Telefonnummer',
-        help: 'Die Nummer, die bei Ihrer signal-cli-Bridge registriert ist.'
-      },
-      SIGNAL_ALLOWED_USERS: {
-        label: 'Erlaubte Signal-Benutzer',
-        help: 'Empfohlen. Signal-Kennungen, eine pro Feld.'
-      },
       WHATSAPP_ENABLED: {
         label: 'WhatsApp-Bridge aktivieren',
         help: 'Wird automatisch über den Schalter unten gesetzt. Lassen Sie es unverändert, sofern Sie es nicht ausdrücklich benötigen.'

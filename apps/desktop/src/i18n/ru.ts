@@ -2002,16 +2002,6 @@ export const ruOverrides = {
         label: 'Разрешённые ID пользователей Matrix',
         help: 'Рекомендуется. ID пользователей (по одному в поле) в формате @user:server.'
       },
-      SIGNAL_HTTP_URL: {
-        label: 'URL моста Signal',
-        placeholder: 'http://127.0.0.1:8080',
-        help: 'URL работающего REST-моста signal-cli.'
-      },
-      SIGNAL_ACCOUNT: { label: 'Номер телефона', help: 'Номер, зарегистрированный в вашем мосте signal-cli.' },
-      SIGNAL_ALLOWED_USERS: {
-        label: 'Разрешённые пользователи Signal',
-        help: 'Рекомендуется. Идентификаторы Signal (по одному в поле).'
-      },
       WHATSAPP_ENABLED: {
         label: 'Включить мост WhatsApp',
         help: 'Устанавливается автоматически переключателем ниже. Не меняйте, если точно не нужно.'

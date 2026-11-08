@@ -383,19 +383,6 @@ export const arCommandCenter = {
         label: 'معرّفات مستخدمي Matrix المسموح بهم',
         help: 'موصى به. معرّفات مستخدمين (واحد في كل حقل) بصيغة @user:server.'
       },
-      SIGNAL_HTTP_URL: {
-        label: 'رابط جسر Signal',
-        placeholder: 'http://127.0.0.1:8080',
-        help: 'رابط جسر signal-cli REST قيد التشغيل.'
-      },
-      SIGNAL_ACCOUNT: {
-        label: 'رقم الهاتف',
-        help: 'الرقم المسجّل مع جسر signal-cli الخاص بك.'
-      },
-      SIGNAL_ALLOWED_USERS: {
-        label: 'مستخدمو Signal المسموح بهم',
-        help: 'موصى به. معرّفات Signal (واحد في كل حقل).'
-      },
       WHATSAPP_ENABLED: {
         label: 'تفعيل جسر WhatsApp',
         help: 'يُضبط تلقائيا عبر المفتاح أدناه. اتركه دون تغيير ما لم تكن متأكدا من حاجتك إليه.'

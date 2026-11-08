@@ -313,13 +313,6 @@ export const zhHantCommandCenter = {
         label: '允許的 Matrix 使用者 ID',
         help: '建議設定。@user:server 格式的使用者 ID（每格一個）。'
       },
-      SIGNAL_HTTP_URL: {
-        label: 'Signal 橋接 URL',
-        placeholder: 'http://127.0.0.1:8080',
-        help: '執行中的 signal-cli REST 橋接的 URL。'
-      },
-      SIGNAL_ACCOUNT: { label: '電話號碼', help: '在 signal-cli 橋接中註冊的號碼。' },
-      SIGNAL_ALLOWED_USERS: { label: '允許的 Signal 使用者', help: '建議設定。Signal 識別碼（每格一個）。' },
       WHATSAPP_ENABLED: {
         label: '啟用 WhatsApp 橋接',
         help: '由下方切換開關自動設定。除非確知需要，否則請勿變更。'
