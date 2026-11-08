@@ -90,7 +90,6 @@ function isUnlinkedError(error) {
 
 /** Report a startup failure and exit once stdout is flushed (pipes are async on macOS). */
 function fatal(code, message, retryable) {
-  process.stderr.write(`[error] ${message}\n`);
   process.stdout.write(`${JSON.stringify({ event: "fatal", code, message, retryable })}\n`, () => {
     process.exit(retryable ? 1 : EXIT_CONFIG);
   });
