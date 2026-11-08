@@ -777,11 +777,12 @@ def finalize_turn(
     # ``None`` on turns that never reached a provider response — by contract.
     try:
         from agent.conversation_loop import _notify_context_engine_turn_complete
-        _notify_context_engine_turn_complete(
-            agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
-            turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
-            interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
-        )
+        if not getattr(agent, "skip_memory_sync", False):  # a read-only turn is never observed
+            _notify_context_engine_turn_complete(
+                agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
+                turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
+                interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
+            )
     except Exception as exc:
         logger.warning("on_turn_complete notification failed: %s", exc)
 

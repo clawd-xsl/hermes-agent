@@ -13,6 +13,9 @@ _PASSTHROUGH_PARAMS = (
     # Model response configuration (None = provider/model default)
     "max_tokens", "reasoning_config", "service_tier",
     "side_agent",
+    # Read-only memory: recall stays in the prompt, but the turn is never fed back into external
+    # memory / context providers (one-shot classifiers over untrusted external events).
+    "skip_memory_sync",
 )
 # Gateway identity params stored as ``agent._<name>``. gateway_session_key is the stable
 # per-chat key (e.g. agent:main:telegram:dm:123).

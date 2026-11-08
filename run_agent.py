@@ -268,7 +268,7 @@ class AIAgent(
         chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
         gateway_session_key: str | None = None,
         skip_context_files: bool = False, load_soul_identity: bool = False,
-        skip_memory: bool = False, skip_background_review: bool = False,
+        skip_memory: bool = False, skip_background_review: bool = False, skip_memory_sync: bool = False,
         session_db=None, parent_session_id: str | None = None,
         iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
         fallback_model: dict[str, Any] | None = None, credential_pool=None,
@@ -898,7 +898,9 @@ class AIAgent(
         is almost certainly a retry of the same intent, and a prefetch keyed on the interrupted turn would
         fire against stale context. See #15218.
         """
-        if interrupted or not (self._memory_manager and final_response and original_user_message):
+        if interrupted or getattr(self, "skip_memory_sync", False):
+            return  # skip_memory_sync: a read-only turn (recall yes, write-back no)
+        if not (self._memory_manager and final_response and original_user_message):
             return
         # Flatten multimodal parts to text (newline-joined for memory).
         user_text = _summarize_user_message_for_log(original_user_message, sep="\n")
