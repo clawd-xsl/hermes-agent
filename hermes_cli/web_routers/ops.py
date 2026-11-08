@@ -144,6 +144,8 @@ def _webhook_route_summary(name: str, route: dict[str, Any], base_url: str) -> d
         "events": list(route.get("events") or []),
         "deliver": route.get("deliver", "log"),
         "deliver_only": bool(route.get("deliver_only")),
+        "session": route.get("session"),
+        "filter_before_main": route.get("filter_before_main", True) is not False,
         "prompt": route.get("prompt", ""),
         "script": route.get("script", ""),
         "skills": list(route.get("skills") or []),
@@ -211,6 +213,12 @@ async def create_webhook(body: WebhookCreate, profile: Optional[str] = None):
         raise HTTPException(
             status_code=400, detail="Direct delivery requires a real target (telegram, discord, …), not 'log'.",
         )
+    if body.session is not None:
+        from gateway.main_session import normalize_session_mode
+        try:
+            normalize_session_mode(body.session)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     def _snapshot():
         subscriptions = wh._load_subscriptions()
@@ -232,6 +240,10 @@ async def create_webhook(body: WebhookCreate, profile: Optional[str] = None):
         route["script"] = body.script.strip()
     if body.deliver_only:
         route["deliver_only"] = True
+    if body.session:
+        route["session"] = body.session.strip().lower()
+    if body.filter_before_main is not None:
+        route["filter_before_main"] = bool(body.filter_before_main)
     if body.deliver_chat_id:
         route["deliver_extra"] = {"chat_id": body.deliver_chat_id}
 

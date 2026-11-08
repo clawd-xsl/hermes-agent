@@ -237,6 +237,10 @@ def _cmd_subscribe(args):
         route["deliver_only"] = True
     if getattr(args, "mirror_to_session", False):
         route["mirror_to_session"] = True
+    if getattr(args, "session", None):
+        route["session"] = args.session
+    if getattr(args, "filter_before_main", None) is not None:
+        route["filter_before_main"] = bool(args.filter_before_main)
     cron_job = (getattr(args, "cron_job", "") or "").strip()
     if cron_job:
         # Validate the reference up-front so a typo surfaces here, not on the first inbound event.
@@ -271,6 +275,7 @@ def _cmd_subscribe(args):
         print("  Mode: direct delivery (no agent, zero LLM cost)")
     if route.get("mirror_to_session"):
         print("  Replies: each delivery is mirrored into the target chat's session")
+    _print_session_line(route, "  ")
     if route.get("cron_job"):
         print(f"  Mode: cron-job trigger — fires job '{route['cron_job']}' on each event")
     if route.get("prompt"):
@@ -281,6 +286,14 @@ def _cmd_subscribe(args):
     print("\n  Configure your service to POST to the URL above.")
     print("  Use the secret for HMAC-SHA256 signature validation.")
     print("  The gateway must be running to receive events (hermes gateway run).\n")
+
+
+def _print_session_line(route: dict, indent: str) -> None:
+    """The route's conversation: default/isolated, or main reviewed (default) vs direct."""
+    session = route.get("session") or "default"
+    if session == "main":
+        session += " (reviewed)" if route.get("filter_before_main", True) is not False else " (direct)"
+    print(f"{indent}Session: {session}")
 
 
 def _resolve_route_cron_job(profile: str, reference: str):
@@ -319,6 +332,7 @@ def _cmd_list(args):
         print(f"    Profile: {profile}")
         print(f"    Events:  {events}")
         print(f"    Deliver: {deliver}")
+        _print_session_line(route, "    ")
         if route.get("script"):
             print(f"    Script:  {route['script']}")
         print()

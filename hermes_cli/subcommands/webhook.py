@@ -54,6 +54,20 @@ def build_webhook_parser(subparsers, *, cmd_webhook: Callable) -> None:
         "per-run context; the job's own prompt, skills, and delivery settings apply. Mutually exclusive "
         "with --deliver-only.")
 
+    wh_sub.add_argument(
+        "--session", choices=("isolated", "main"), default=None,
+        help="Agent conversation: an isolated run per event, or the live main gateway home "
+        "conversation (by default through a one-shot review that wakes main only when it matters). "
+        "Omit to follow platforms.webhook.extra.session.")
+    wh_filter = wh_sub.add_mutually_exclusive_group()
+    wh_filter.add_argument(
+        "--filter-before-main", dest="filter_before_main", action="store_true",
+        help="Review a main-session event in isolation before waking main (default)")
+    wh_filter.add_argument(
+        "--no-filter-before-main", dest="filter_before_main", action="store_false",
+        help="Trusted sources only: inject the rendered event directly into main")
+    wh_sub.set_defaults(filter_before_main=None)
+
     webhook_subparsers.add_parser("list", aliases=["ls"], help="List all dynamic subscriptions")
 
     wh_rm = webhook_subparsers.add_parser("remove", aliases=["rm"], help="Remove a subscription")

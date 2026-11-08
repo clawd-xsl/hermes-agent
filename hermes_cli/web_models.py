@@ -406,6 +406,8 @@ class WebhookCreate(BaseModel):
     deliver_only: bool = False
     deliver_chat_id: Optional[str] = None
     secret: Optional[str] = None  # omit to auto-generate
+    session: Optional[str] = None  # "isolated" | "main"; omitted follows platforms.webhook.extra.session
+    filter_before_main: Optional[bool] = None  # main routes: review before waking main (default true)
 
 class WebhookEnabledToggle(BaseModel):
     enabled: bool
