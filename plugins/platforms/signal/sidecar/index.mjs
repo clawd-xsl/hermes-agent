@@ -18,6 +18,8 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+import { installAuthenticatedPreKeys } from "./prekeys.mjs";
 
 const MIN_NODE = [22, 19];
 const MAX_ATTACHMENTS = 1024;
@@ -288,6 +290,13 @@ async function openRuntime(args) {
     receiveStories: accountState.receiveStories ?? false,
     logger,
   });
+  // signal-ts's anonymous key lookup fails for recipients who restrict sealed sender access.
+  // Ordinary authenticated sends must fetch keys with our own login.
+  if (typeof client.fetchPreKeyBundles === "function") {
+    const sdkRequire = createRequire(sdkEntry);
+    const libsignal = await import(pathToFileURL(sdkRequire.resolve("@signalapp/libsignal-client")).href);
+    installAuthenticatedPreKeys(client, libsignal);
+  }
   return { sdk, repository, accountState, account, accountNumber, client, cacheDir };
 }
 
