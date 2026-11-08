@@ -580,6 +580,9 @@ def _run_agent(
             provider=runtime.get("provider"),
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
+            # External-process routes (ACP providers, a turn runtime's CLI child) carry their executable here.
+            acp_command=runtime.get("command"),
+            acp_args=list(runtime.get("args") or []),
             model=choice.model,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
