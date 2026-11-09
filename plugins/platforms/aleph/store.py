@@ -257,6 +257,14 @@ class AlephStore:
             self._db.execute("INSERT INTO files (id, description, path, agent_path) VALUES (?, ?, ?, ?)",
                              (description["id"], json.dumps(description, ensure_ascii=False), path, agent_path))
 
+    def delete_file(self, file_id: str) -> None:
+        """Forget a stored file and remove its ciphertext (a replaced avatar)."""
+        with self._lock:
+            row = self._db.execute("SELECT path FROM files WHERE id = ?", (file_id,)).fetchone()
+            self._db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        if row is not None:
+            Path(row[0]).unlink(missing_ok=True)
+
     def file(self, file_id: str) -> Optional[StoredFile]:
         with self._lock:
             row = self._db.execute("SELECT id, description, path, agent_path FROM files WHERE id = ?",

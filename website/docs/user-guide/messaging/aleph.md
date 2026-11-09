@@ -18,6 +18,7 @@ What the channel gives the phone:
   the network, the tunnel and Cloudflare;
 - push notifications through APNs that carry no content: the app's notification extension fetches the
   real text over the channel itself.
+- the agent's own name and avatar, which only the agent changes, with the `aleph` tools.
 
 The wire protocol is specified in the Aleph repository (`docs/protocol.md`).
 
@@ -199,6 +200,29 @@ Without all four, the channel works and pushes nothing; the gateway log says `pu
   machine, not through the tunnel.
 - A token Apple rejects (`410`, or `400 BadDeviceToken`) is dropped. Pushing never delays delivery over the
   WebSocket.
+
+## The agent's name and avatar
+
+On Aleph the agent has a name (`Aleph` until it picks one) and an avatar (none until it sets one; the
+app then draws its mark). Only the agent changes them: the app has no editor, so the person asks in the
+conversation, and the agent uses its `aleph` tools. The server keeps the profile and is the one truth for
+every device; `hello` carries it, and each change is logged as an `agent.profile` event (not pushed), so
+every device updates at once and one that was away catches up.
+
+The `aleph` toolset is on by default and offered only where the gateway runs a connected Aleph channel:
+
+- `aleph_get_profile` reads the name and avatar.
+- `aleph_set_profile` changes the name (1 to 32 characters, one line), the avatar, or both; or goes back to
+  the default avatar with `reset_avatar`. `avatar` is an absolute path on this machine or an `https` URL,
+  such as what an image-generation tool returned, to a PNG, JPEG, HEIC, WebP or GIF of at most 20 MB.
+
+The avatar is turned upright, cropped to its centered square, scaled down to 512 pixels, flattened onto
+white and stored as a JPEG without metadata, encrypted like any file. URLs are fetched only over `https`
+(redirects included) and never from a private or internal address. Setting what is already there changes
+nothing; an invalid request changes nothing and tells the agent what to fix.
+
+The tools are defined as MCP tools (revision 2025-06-18, with title, output schema and annotations) and
+answer with an MCP `CallToolResult` as JSON; in Hermes the input schema is the tool's parameters.
 
 ## Home channel
 

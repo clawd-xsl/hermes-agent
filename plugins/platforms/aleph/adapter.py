@@ -44,6 +44,7 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import MessageDeduplicator
 
 from plugins.platforms.aleph import noise
+from plugins.platforms.aleph.profile import DEFAULT_NAME, Avatar
 from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file, file_url
 from plugins.platforms.aleph.noise import b64url, from_b64url
 from plugins.platforms.aleph.push import (
@@ -59,9 +60,8 @@ CHAT_ID = "main"
 CHAT_NAME = "Aleph"
 # Every paired device is the owner's: every inbound message is from this one sender.
 OWNER_ID = "owner"
-# The app's default name for the agent (hello and the pairing answer); the person may rename it
-# on the phone, which then shows that name.
-AGENT_NAME = "Aleph"
+# The agent's name until it picks its own with the ``aleph_set_profile`` tool (protocol "Agent profile").
+AGENT_NAME = DEFAULT_NAME
 OWNER_NAME = "Owner"
 DEFAULT_PORT = 8650
 DEFAULT_HOST = "127.0.0.1"
@@ -178,6 +178,12 @@ class AlephAdapter(BasePlatformAdapter):
         self._device_keys: dict[bytes, Device] = {}
         self._pending: Optional[tuple[bytes, float]] = None
         self._tickets: Optional[TicketBook] = None
+        # The agent's profile (name and avatar), loaded at connect; only the aleph tools change it.
+        self._profile_name = AGENT_NAME
+        self._avatar: Optional[dict[str, Any]] = None  # the avatar's file description, without a url
+        self._avatar_digest = ""
+        self._avatar_updated_at = ""
+        self._profile_lock = asyncio.Lock()
         self._dedup = MessageDeduplicator(max_size=5000, ttl_seconds=3600)
         self._store: Optional[AlephStore] = None
         self._server: Optional[AlephServer] = None
@@ -228,6 +234,7 @@ class AlephAdapter(BasePlatformAdapter):
         await self._reload_devices()
         self._last_user_message = await asyncio.to_thread(self._store.meta, "last_user_message")
         self._last_receipt = await asyncio.to_thread(self._store.meta, "last_receipt")
+        await self._load_profile()
         self._server = AlephServer(self, host=self.host, port=self.port, static=self.static)
         try:
             await self._server.start()
@@ -327,7 +334,7 @@ class AlephAdapter(BasePlatformAdapter):
                         message={"id": message_id, "sender": "agent", "kind": "system", "text": text,
                                  "attachments": []},
                         push_body=BODY_MESSAGE)
-        return {"device_id": device.id, "agent": {"name": self.agent_info()["name"]}}
+        return {"device_id": device.id, "agent": {"name": self._profile_name}}
 
     async def _watch_devices(self) -> None:
         """Pick up what the CLI (another process) changed: revoked devices lose their connections,
@@ -456,11 +463,79 @@ class AlephAdapter(BasePlatformAdapter):
         return ReplaySnapshot(latest, reset, events)
 
     def agent_info(self) -> dict[str, Any]:
-        info: dict[str, Any] = {"name": AGENT_NAME}
+        """``hello``'s ``agent``: the profile as it is now, the avatar with a fresh download link."""
+        info: dict[str, Any] = {"name": self._profile_name}
         model = self._configured_model()
         if model:
             info["model"] = model
+        info["avatar"] = self._avatar_with_link()
         return info
+
+    # ── the agent's profile ────────────────────────────────────────────────────────────────────
+
+    async def _load_profile(self) -> None:
+        store = self.store
+        self._profile_name = await asyncio.to_thread(store.meta, "profile_name") or AGENT_NAME
+        avatar_id = await asyncio.to_thread(store.meta, "profile_avatar")
+        stored = await asyncio.to_thread(store.file, avatar_id) if avatar_id else None
+        if stored is not None and os.path.isfile(stored.path):
+            self._avatar = stored.description
+            self._avatar_digest = await asyncio.to_thread(store.meta, "profile_avatar_digest") or ""
+            self._avatar_updated_at = await asyncio.to_thread(store.meta, "profile_avatar_updated_at") or ""
+        else:
+            self._avatar, self._avatar_digest, self._avatar_updated_at = None, "", ""
+
+    def _avatar_with_link(self) -> Optional[dict[str, Any]]:
+        return self._with_links([self._avatar])[0] if self._avatar is not None else None
+
+    def profile_view(self) -> dict[str, Any]:
+        """What the agent sees of its profile (``aleph_get_profile``)."""
+        avatar = None
+        if self._avatar is not None:
+            avatar = {"width": self._avatar.get("width"), "height": self._avatar.get("height"),
+                      "updated_at": self._avatar_updated_at}
+        return {"name": self._profile_name, "avatar": avatar}
+
+    async def update_profile(self, *, name: Optional[str] = None, avatar: Optional[Avatar] = None,
+                             reset_avatar: bool = False) -> dict[str, Any]:
+        """Apply a validated change (on the gateway's loop) and log ``agent.profile`` if anything
+        changed. Returns the profile view plus ``changed``."""
+        async with self._profile_lock:
+            store = self.store
+            changed: list[str] = []
+            old_avatar_id = self._avatar.get("id") if self._avatar is not None else None
+            if name is not None and name != self._profile_name:
+                await asyncio.to_thread(store.set_meta, "profile_name", name)
+                self._profile_name = name
+                changed.append("name")
+            if avatar is not None and avatar.digest != self._avatar_digest:
+                file_id = f"f_{uuid.uuid4().hex}"
+                key, ciphertext = encrypt_file(avatar.jpeg)
+                dest = store.files_dir / f"{file_id}.bin"
+                await asyncio.to_thread(dest.write_bytes, ciphertext)
+                description = {"id": file_id, "name": "avatar.jpg", "mime": "image/jpeg", "kind": "image",
+                               "size": len(avatar.jpeg), "width": avatar.width, "height": avatar.height,
+                               "key": b64url(key)}
+                await asyncio.to_thread(store.add_file, description, str(dest), None)
+                updated_at = now_iso()
+                for key_name, value in (("profile_avatar", file_id), ("profile_avatar_digest", avatar.digest),
+                                        ("profile_avatar_updated_at", updated_at)):
+                    await asyncio.to_thread(store.set_meta, key_name, value)
+                self._avatar, self._avatar_digest, self._avatar_updated_at = description, avatar.digest, updated_at
+                changed.append("avatar")
+            elif reset_avatar and self._avatar is not None:
+                for key_name in ("profile_avatar", "profile_avatar_digest", "profile_avatar_updated_at"):
+                    await asyncio.to_thread(store.set_meta, key_name, "")
+                self._avatar, self._avatar_digest, self._avatar_updated_at = None, "", ""
+                changed.append("avatar")
+            if "avatar" in changed and old_avatar_id:
+                await asyncio.to_thread(store.delete_file, old_avatar_id)
+            if changed:
+                # Not a message: logged so every device catches up, never pushed.
+                await self._log("agent.profile", {"name": self._profile_name, "avatar": self._avatar_with_link(),
+                                                  "changed": changed, "at": now_iso()})
+                logger.info("Aleph: the agent changed its %s", " and ".join(changed))
+            return {**self.profile_view(), "changed": changed}
 
     @staticmethod
     def _configured_model() -> str:

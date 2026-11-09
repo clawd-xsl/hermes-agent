@@ -17,8 +17,11 @@ from tests.gateway.aleph_phone import connect, mac_headers, pair_device, url as 
 def _register():
     from plugins.platforms.aleph.register import register
     captured = {}
+    tools = []
     register(SimpleNamespace(register_platform=lambda **kw: captured.update(kw),
-                             register_cli_command=lambda **kw: captured.setdefault("cli", kw)))
+                             register_cli_command=lambda **kw: captured.setdefault("cli", kw),
+                             register_tool=lambda **kw: tools.append(kw)))
+    _register.tools = tools
     return captured
 
 
@@ -56,6 +59,8 @@ def test_register_declares_the_channel(monkeypatch):
     assert captured["standalone_send"].media and callable(captured["standalone_sender_fn"])
     assert not captured.get("trusted_inbound")
     assert captured["cli"]["name"] == "aleph"
+    assert [t["name"] for t in _register.tools] == ["aleph_get_profile", "aleph_set_profile"]
+    assert {t["toolset"] for t in _register.tools} == {"aleph"} and all(t["is_async"] for t in _register.tools)
     # No shared secret: an enabled config is a connected one; the env probe needs ALEPH_ENABLED.
     assert captured["config_connected_fn"](PlatformConfig(enabled=True))
     assert not captured["config_connected_fn"](PlatformConfig(enabled=False))

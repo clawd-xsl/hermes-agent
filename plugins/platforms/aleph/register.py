@@ -12,6 +12,7 @@ from plugins.platforms.aleph import cli as _cli
 from plugins.platforms.aleph.adapter import (
     CHAT_ID, CHAT_NAME, MAX_MESSAGE_LENGTH, OWNER_ID, AlephAdapter, check_aleph_requirements)
 from plugins.platforms.aleph.standalone import standalone_send
+from plugins.platforms.aleph.tools import register_tools
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,10 @@ _PLATFORM_HINT = (
     "You are on Aleph, the person's own iOS app for talking to you. It renders full Markdown "
     "(headings, lists, tables, code blocks, links) and shows your reply as it is written. "
     "You can send files: write MEDIA:/absolute/path/to/file in your response; images, video, "
-    "audio and documents arrive as attachments the person can open."
+    "audio and documents arrive as attachments the person can open. "
+    "Your name and avatar in Aleph are yours to change, and only you can change them: when the person "
+    "asks for a new name or picture, use the aleph_set_profile tool (aleph_get_profile reads them; load "
+    "them with tool_search if they are not listed), not Hermes's config."
 )
 
 
@@ -85,6 +89,7 @@ def register(ctx) -> None:
         # Drafts stream whenever the global ``streaming.enabled`` switch is on.
         display_tier="high", display_overrides={"streaming": True},
     )
+    register_tools(ctx)
     ctx.register_cli_command(
         name="aleph", help="Pair and manage Aleph devices",
         description="Pair the Aleph iOS app with this agent, list paired devices, revoke one.",

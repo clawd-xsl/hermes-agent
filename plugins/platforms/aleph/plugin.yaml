@@ -11,6 +11,9 @@ description: >
   read receipts, approval and question cards, attachments, content-free APNs push, and
   home-channel delivery for `session: main` cron jobs and webhooks.
 author: clawd-xsl
+provides_tools:
+  - aleph_get_profile
+  - aleph_set_profile
 requires_env:
   - name: ALEPH_ENABLED
     description: "Turn the Aleph channel on (true); devices then pair with `hermes aleph pair`"
