@@ -2043,6 +2043,10 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         turn_ctx._progress_metadata, turn_ctx._progress_reply_to, _status_thread_metadata = (
             self._run_agent_progress_threading(source, event_message_id, _native_slack_task_cards)
         )
+        # Adapters that render tool progress as its own row (Aleph) opt in to a marker on those sends;
+        # everyone else keeps byte-identical metadata.
+        if getattr(type(self._delivery_adapter_for(source)), "MARKS_TOOL_PROGRESS", False) is True:
+            turn_ctx._progress_metadata = {**(turn_ctx._progress_metadata or {}), "_tool_progress": True}
         # Bridges: sync step/event/status callbacks → async hooks.emit and adapter.send.
         turn_ctx._loop_for_step = asyncio.get_running_loop()
         turn_ctx._hooks_ref = self.hooks
