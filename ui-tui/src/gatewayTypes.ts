@@ -4,6 +4,7 @@ import type {
   GatewayEvent,
   GatewayEventMap,
   InflightTurn,
+  SessionHistoryReloadResult,
   TranscriptMessage,
   Usage
 } from '@hermes/shared/gateway-events'
@@ -231,6 +232,9 @@ export interface SessionCreateResponse {
   /** Canonical gateways: the actor's subscription token for `session.detach`. */
   subscription_id?: string
 }
+
+// session.history.reload: the generated contract union (reloaded snapshot | skipped + rotated_to).
+export type SessionHistoryReloadResponse = SessionHistoryReloadResult
 
 export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working'
 

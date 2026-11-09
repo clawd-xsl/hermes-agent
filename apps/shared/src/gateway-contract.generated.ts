@@ -3550,6 +3550,37 @@ export interface SessionHistoryResult {
   count: number
   messages: TranscriptMessage[]
 }
+export type SessionHistoryReloadResult = SessionHistoryReloaded | SessionHistoryReloadSkipped
+/** Another writer advanced the persisted transcript: the refreshed live-session snapshot. */
+export interface SessionHistoryReloaded {
+  session_id: string
+  message_count: number
+  messages: TranscriptMessage[]
+  info: SessionLiveInfo
+  stored_session_id?: string | null
+  resumed?: string | null
+  session_key?: string | null
+  messages_omitted?: boolean | null
+  hydrating?: boolean | null
+  running?: boolean | null
+  turn_started_at?: number | null
+  started_at?: number | null
+  status?: string | null
+  inflight?: InflightTurn | null
+  queued?: QueuedPrompt | null
+  pending_approval?: PendingApproval | null
+  open_requests?: OpenRequestEntry[] | null
+  pending_connection?: ConnectionRequestPayload | null
+  todo_state?: TodoState | null
+  auto_continue?: AutoContinue | null
+  reloaded: true
+}
+/** Nothing to repaint. ``reason`` is one of baseline / unchanged / busy / lazy / no_session_key / db_unavailable / rotated / ``db_error: ...``; ``rotated_to`` names a compression tip to resume. */
+export interface SessionHistoryReloadSkipped {
+  reloaded: false
+  reason: string
+  rotated_to?: string | null
+}
 export interface SessionUsageParams {
   session_id: string
   profile?: string | null
@@ -6540,6 +6571,8 @@ export interface RpcMethods {
   'session.foreign.preview': { params: SessionForeignIdParams; result: SessionForeignPreviewResult }
   /** The durable display transcript (ancestors included, row ids attached). */
   'session.history': { params: SessionHistoryParams; result: SessionHistoryResult }
+  /** Idle poll: repaint turns another writer (messaging gateway, cron) persisted since the baseline. */
+  'session.history.reload': { params: SessionParams; result: SessionHistoryReloadResult }
   /** Stop the running turn (and streaming TTS); retires the crash-recovery marker. */
   'session.interrupt': { params: SessionInterruptParams; result: SessionInterruptResult }
   /** Human-facing stored sessions, most recent first (sub-agent / kanban sources denied). */
@@ -6870,6 +6903,7 @@ export const RPC_METHODS = [
   'session.foreign.list',
   'session.foreign.preview',
   'session.history',
+  'session.history.reload',
   'session.interrupt',
   'session.list',
   'session.most_recent',

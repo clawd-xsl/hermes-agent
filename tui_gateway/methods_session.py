@@ -1997,6 +1997,56 @@ def _(rid, params: dict, session: dict) -> dict:
     return _ok(rid, {"count": len(history), "messages": _history_to_messages(history, profile_home=session.get("profile_home"))})
 
 
+@_session_method("session.history.reload")
+def _(rid, params: dict, session: dict) -> dict:
+    """Idle sync with turns another writer persisted (messaging gateway, cron) for a long-lived TUI.
+
+    The dashboard's keep-alive PTY is reattached on reopen rather than respawned, so its TUI keeps the
+    transcript it hydrated at spawn. The model side is already caught up at turn start
+    (``_adopt_out_of_band_turns``); this lets an idle client repaint and folds the same rows in early.
+
+    The first call records a baseline (lineage tip + persisted row count of the live write row). A later
+    call reloads only when that marker moved without a local ``history_version`` bump: our own turns bump
+    the version and only re-baseline. Never touches a running/hydrating session; a compression tip
+    elsewhere is handed back as ``rotated_to`` for the client's resume path."""
+    if session.get("running") or session.get("resume_hydrating"):
+        return _ok(rid, {"reloaded": False, "reason": "busy"})
+    if session.get("lazy"):
+        return _ok(rid, {"reloaded": False, "reason": "lazy"})
+    if not session.get("session_key"):
+        return _ok(rid, {"reloaded": False, "reason": "no_session_key"})
+    row = _submit_row_target_key(session)
+    with _session_db(session) as db:
+        if db is None:
+            return _ok(rid, {"reloaded": False, "reason": "db_unavailable"})
+        try:
+            tip = db.resolve_resume_session_id(row) or row
+            marker = [tip, int(db.message_count(tip))]
+        except Exception as exc:
+            logger.debug("session.history.reload: marker read failed", exc_info=True)
+            return _ok(rid, {"reloaded": False, "reason": f"db_error: {exc}"})
+    with session["history_lock"]:
+        version = int(session.get("history_version", 0))
+        baseline = session.get("_persisted_sync")
+        if not isinstance(baseline, dict) or baseline.get("history_version") != version:
+            session["_persisted_sync"] = {"marker": marker, "history_version": version}
+            return _ok(rid, {"reloaded": False, "reason": "baseline"})
+        if baseline.get("marker") == marker:
+            return _ok(rid, {"reloaded": False, "reason": "unchanged"})
+    if tip != row:
+        # Compressed elsewhere: rebinding a live record to a new tip is the resume path's job.
+        return _ok(rid, {"reloaded": False, "reason": "rotated", "rotated_to": tip})
+    # Model-facing history: upstream's row-id keyed fold (a foreign compaction re-hydrates from the DB).
+    _adopt_out_of_band_turns(session)
+    with session["history_lock"]:
+        if session.get("running"):
+            return _ok(rid, {"reloaded": False, "reason": "busy"})
+        session["_persisted_sync"] = {"marker": marker, "history_version": int(session.get("history_version", 0))}
+    payload = _live_session_payload(str(params.get("session_id") or ""), session)
+    payload["reloaded"] = True
+    return _ok(rid, payload)
+
+
 @_session_method("session.undo", live=True)
 def _(rid, params: dict, session: dict) -> dict:
     # Under a running turn the post-run write would clobber the undo — stop the reply first.

@@ -3517,6 +3517,24 @@
       }
     },
     {
+      "name": "session.history.reload",
+      "summary": "Idle poll: repaint turns another writer (messaging gateway, cron) persisted since the baseline.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionHistoryReloadResult"
+        }
+      }
+    },
+    {
       "name": "session.interrupt",
       "summary": "Stop the running turn (and streaming TTS); retires the crash-recovery marker.",
       "params": [
@@ -38277,6 +38295,277 @@
           "session_id"
         ],
         "title": "SessionHistoryParams",
+        "type": "object"
+      },
+      "SessionHistoryReloadResult": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/SessionHistoryReloaded"
+          },
+          {
+            "$ref": "#/components/schemas/SessionHistoryReloadSkipped"
+          }
+        ],
+        "title": "SessionHistoryReloadResult"
+      },
+      "SessionHistoryReloadSkipped": {
+        "additionalProperties": false,
+        "description": "Nothing to repaint. ``reason`` is one of baseline / unchanged / busy / lazy / no_session_key /\ndb_unavailable / rotated / ``db_error: ...``; ``rotated_to`` names a compression tip to resume.",
+        "properties": {
+          "reloaded": {
+            "const": false,
+            "title": "Reloaded",
+            "type": "boolean"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "rotated_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rotated To"
+          }
+        },
+        "required": [
+          "reloaded",
+          "reason"
+        ],
+        "title": "SessionHistoryReloadSkipped",
+        "type": "object"
+      },
+      "SessionHistoryReloaded": {
+        "additionalProperties": false,
+        "description": "Another writer advanced the persisted transcript: the refreshed live-session snapshot.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "message_count": {
+            "title": "Message Count",
+            "type": "integer"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/TranscriptMessage"
+            },
+            "title": "Messages",
+            "type": "array"
+          },
+          "info": {
+            "$ref": "#/components/schemas/SessionLiveInfo"
+          },
+          "stored_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Stored Session Id"
+          },
+          "resumed": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Resumed"
+          },
+          "session_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Key"
+          },
+          "messages_omitted": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Messages Omitted"
+          },
+          "hydrating": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Hydrating"
+          },
+          "running": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Running"
+          },
+          "turn_started_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Started At"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Started At"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Status"
+          },
+          "inflight": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InflightTurn"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "queued": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueuedPrompt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "pending_approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingApproval"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "open_requests": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/OpenRequestEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Open Requests"
+          },
+          "pending_connection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConnectionRequestPayload"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "todo_state": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TodoState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "auto_continue": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutoContinue"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "reloaded": {
+            "const": true,
+            "title": "Reloaded",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session_id",
+          "message_count",
+          "messages",
+          "info",
+          "reloaded"
+        ],
+        "title": "SessionHistoryReloaded",
         "type": "object"
       },
       "SessionHistoryResult": {

@@ -5,7 +5,9 @@ listing/browsing stored rows, spawn-tree snapshots, event replay and the statele
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Literal
+
+from pydantic import Field, RootModel
 
 from .base import JsonValue, Params, Result, WireEnum
 from .common import (OpenModel, PendingApproval, ProfileParams, SessionLiveInfo, SessionParams, TranscriptMessage,
@@ -498,6 +500,29 @@ class SessionHistoryResult(Result):
 
 method("session.history", params=SessionHistoryParams, result=SessionHistoryResult,
        doc="The durable display transcript (ancestors included, row ids attached).")
+
+
+class SessionHistoryReloaded(LiveSessionSnapshot):
+    """Another writer advanced the persisted transcript: the refreshed live-session snapshot."""
+
+    reloaded: Literal[True]
+
+
+class SessionHistoryReloadSkipped(Result):
+    """Nothing to repaint. ``reason`` is one of baseline / unchanged / busy / lazy / no_session_key /
+    db_unavailable / rotated / ``db_error: ...``; ``rotated_to`` names a compression tip to resume."""
+
+    reloaded: Literal[False]
+    reason: str
+    rotated_to: str | None = None
+
+
+class SessionHistoryReloadResult(RootModel):
+    root: SessionHistoryReloaded | SessionHistoryReloadSkipped
+
+
+method("session.history.reload", params=SessionParams, result=SessionHistoryReloadResult,
+       doc="Idle poll: repaint turns another writer (messaging gateway, cron) persisted since the baseline.")
 
 
 class SessionUsageParams(SessionParams):

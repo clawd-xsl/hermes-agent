@@ -73,6 +73,7 @@ import { useApprovalAnswers } from './useApprovalAnswers.js'
 import { useBatteryPoll } from './useBatteryPoll.js'
 import { useComposerState } from './useComposerState.js'
 import { useConfigSync } from './useConfigSync.js'
+import { useHistorySync } from './useHistorySync.js'
 import { shouldDetachEditedHistoryInput, useInputHandlers } from './useInputHandlers.js'
 import { useLongRunToolCharms } from './useLongRunToolCharms.js'
 import {
@@ -691,6 +692,16 @@ export function useMainApp(gw: GatewayClient) {
       forceRedraw(stdout ?? process.stdout)
     }
   }, [dashboardFreshSessionId, stdout])
+
+  useHistorySync({
+    busy: ui.busy,
+    gw,
+    onRotated: session.resumeById,
+    scrollRef,
+    setHistoryItems,
+    sid: ui.sid,
+    stdout
+  })
 
   useEffect(() => {
     if (ui.busy) {
