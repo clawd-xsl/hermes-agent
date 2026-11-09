@@ -62,7 +62,9 @@ def _validate_config(config: PlatformConfig) -> bool:
 # System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.
 _PLATFORM_HINT = (
     "You are on Aleph, the person's own iOS app for talking to you. It renders full Markdown "
-    "(headings, lists, tables, code blocks, links) and shows your reply as it is written."
+    "(headings, lists, tables, code blocks, links) and shows your reply as it is written. "
+    "You can send files: write MEDIA:/absolute/path/to/file in your response; images, video, "
+    "audio and documents arrive as attachments the person can open."
 )
 
 
@@ -77,7 +79,7 @@ def register(ctx) -> None:
         required_env=["ALEPH_ENABLED"], install_hint="Aleph needs aiohttp (bundled with the gateway)",
         env_enablement_fn=_env_enablement, cron_deliver_env_var="ALEPH_HOME_CHANNEL",
         # Every send_message delivery goes through the live adapter (it owns the event log).
-        standalone_send=StandaloneSendPolicy(label="Aleph", media=False, text_direct=True),
+        standalone_send=StandaloneSendPolicy(label="Aleph", media=True, text_direct=True),
         standalone_sender_fn=standalone_send, max_message_length=MAX_MESSAGE_LENGTH,
         emoji="ℵ", pii_safe=False, allow_update_command=True, platform_hint=_PLATFORM_HINT,
         # Drafts stream whenever the global ``streaming.enabled`` switch is on.

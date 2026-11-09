@@ -4,11 +4,11 @@ kind: platform
 version: 1.0.0
 description: >
   Aleph channel for Hermes Agent: the Aleph iOS app talks to the gateway over its own
-  WebSocket (JSON-RPC 2.0, end-to-end encrypted with Noise),
+  WebSocket (JSON-RPC 2.0, end-to-end encrypted with Noise) and HTTP file endpoints,
   published through a tunnel or on the home network. Devices pair once by scanning a
   QR code (`hermes aleph pair`) and are known by their keys. One chat
   ("main") with a durable, replayable event log, streaming drafts, typing and status text,
-  read receipts, approval and question cards, and
+  read receipts, approval and question cards, attachments, and
   home-channel delivery for `session: main` cron jobs and webhooks.
 author: clawd-xsl
 requires_env:
@@ -38,6 +38,6 @@ optional_env:
     prompt: "History limit"
     password: false
   - name: ALEPH_STATE_DIR
-    description: "Where the server key, the event log and devices live (default $HERMES_HOME/aleph)"
+    description: "Where the event log, devices and files live (default $HERMES_HOME/aleph)"
     prompt: "State directory"
     password: false

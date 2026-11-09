@@ -1,5 +1,5 @@
 """The Aleph channel plugin (plugins/platforms/aleph): wire protocol, event log, receipts, cards
-driven through a real listener and WebSocket client."""
+and files, driven through a real listener and WebSocket client."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def test_register_declares_the_channel(monkeypatch):
     assert captured["name"] == "aleph" and captured["adapter_factory"] is mod.AlephAdapter
     assert captured["cron_deliver_env_var"] == "ALEPH_HOME_CHANNEL"
     assert captured["required_env"] == ["ALEPH_ENABLED"]
-    assert not captured["standalone_send"].media and callable(captured["standalone_sender_fn"])
+    assert captured["standalone_send"].media and callable(captured["standalone_sender_fn"])
     assert not captured.get("trusted_inbound")
     assert captured["cli"]["name"] == "aleph"
     # No shared secret: an enabled config is a connected one; the env probe needs ALEPH_ENABLED.

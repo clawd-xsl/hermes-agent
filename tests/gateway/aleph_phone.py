@@ -1,5 +1,5 @@
-"""A minimal Aleph phone for the plugin's tests: Noise IK handshake, encrypted JSON-RPC frames and
-pairing (Noise IKpsk1), all through the real listener."""
+"""A minimal Aleph phone for the plugin's tests: Noise IK handshake, encrypted JSON-RPC frames,
+local pairing (Noise IKpsk1) and encrypted file transfer, all through the real listener."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ import json
 import aiohttp
 
 from plugins.platforms.aleph import noise
+from plugins.platforms.aleph.files import decrypt_file, encrypt_file
+from plugins.platforms.aleph.noise import b64url
 
 
 def base_url(adapter):
@@ -89,6 +91,21 @@ class Phone:
                                            "client": {"name": "Aleph", "version": "0.1", "device": "test"}})
         replay = await self.events_until("sync.done")
         return answer, replay
+
+    async def upload(self, adapter, data: bytes, *, name: str, mime: str) -> dict:
+        """``file.ticket`` + ``PUT``: the ``message.send`` attachment for ``data``."""
+        key, ciphertext = encrypt_file(data)
+        answer = await self.call("file.ticket", {"size": len(ciphertext)})
+        ticket = answer["result"]
+        async with self.session.put(base_url(adapter) + ticket["url"], data=ciphertext) as resp:
+            assert resp.status == 204, await resp.text()
+        return {"ticket": ticket["ticket"], "key": b64url(key), "name": name, "mime": mime}
+
+    async def download(self, adapter, attachment: dict) -> bytes:
+        from plugins.platforms.aleph.noise import from_b64url
+        async with self.session.get(base_url(adapter) + attachment["url"]) as resp:
+            assert resp.status == 200, resp.status
+            return decrypt_file(from_b64url(attachment["key"]), await resp.read())
 
     async def close(self):
         await self.ws.close()

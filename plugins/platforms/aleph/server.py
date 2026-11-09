@@ -1,4 +1,4 @@
-"""Aleph's listener: the encrypted WebSocket and pairing.
+"""Aleph's listener: the encrypted WebSocket, pairing, and ticketed file transfer.
 
 - ``/aleph/v1/ws``: ``Noise_IK_25519_ChaChaPoly_SHA256`` (prologue ``aleph/1``); afterwards each binary
   message is one JSON-RPC 2.0 frame encrypted with that direction's transport key (up to 16 MB). An
@@ -6,6 +6,8 @@
   memory, never in the database, before the peer is authenticated.
 - ``/aleph/v1/pair``: ``Noise_IKpsk1`` with the pending pairing secret as PSK; ``404`` unless a pairing is
   pending, 5 attempts a minute per address, ``4403`` for a wrong secret.
+- ``PUT`` / ``GET /aleph/v1/files/<ticket>``: ciphertext only, against a one-time ticket issued over the
+  WebSocket (``file.ticket``).
 
 Frames on a connection go out through one queue drained by one writer task, which is also what
 encrypts them, so nonces follow the send order and a call's answer, the replay and live events can
@@ -61,6 +63,7 @@ MAX_WS_MESSAGE = MAX_FRAME_BYTES + 1024
 # A connection whose queue grows past this is too slow to keep up: it is closed, and the phone
 # reconnects and catches up from its last stored seq.
 MAX_QUEUED_FRAMES = 20000
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024 + 16
 
 # Pairing attempts allowed from one address per window (protocol "Pairing").
 PAIR_ATTEMPTS = 5
@@ -189,9 +192,11 @@ class AlephServer:
         self.connections: set[Connection] = set()
         self.pair_limiter = PairRateLimiter()
         self._runner: Optional[web.AppRunner] = None
-        app = web.Application()
+        app = web.Application(client_max_size=MAX_UPLOAD_BYTES)
         app.router.add_get(f"{BASE_PATH}/ws", self._ws_handler)
         app.router.add_get(f"{BASE_PATH}/pair", self._pair_handler)
+        app.router.add_put(f"{BASE_PATH}/files/{{ticket}}", self._upload_handler)
+        app.router.add_get(f"{BASE_PATH}/files/{{ticket}}", self._download_handler)
         self.app = app
 
     # ── lifecycle ──────────────────────────────────────────────────────────────────────────────
@@ -333,6 +338,32 @@ class AlephServer:
         await ws.send_bytes(handshake.write_message(json.dumps(result, separators=(",", ":")).encode()))
         await ws.close()
         return ws
+
+    # ── files ──────────────────────────────────────────────────────────────────────────────────
+
+    async def _upload_handler(self, request: web.Request) -> web.Response:
+        ticket = request.match_info["ticket"]
+        expected = self.adapter.upload_size(ticket)
+        if expected is None:
+            raise web.HTTPNotFound()
+        if request.content_length is not None and request.content_length != expected:
+            return web.json_response({"error": f"expected {expected} bytes"}, status=400)
+        try:
+            data = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            return web.json_response({"error": "file too large"}, status=413)
+        if len(data) != expected:
+            return web.json_response({"error": f"expected {expected} bytes"}, status=400)
+        if not await self.adapter.accept_upload(ticket, data):
+            raise web.HTTPNotFound()
+        return web.Response(status=204)
+
+    async def _download_handler(self, request: web.Request) -> web.StreamResponse:
+        path = self.adapter.redeem_download(request.match_info["ticket"])
+        if path is None:
+            raise web.HTTPNotFound()
+        return web.FileResponse(path, headers={"Content-Type": "application/octet-stream",
+                                               "Cache-Control": "no-store"})
 
     # ── JSON-RPC ───────────────────────────────────────────────────────────────────────────────
 

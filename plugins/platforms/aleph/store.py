@@ -1,4 +1,4 @@
-"""Aleph's durable state: the append-only event log, message index, paired devices
+"""Aleph's durable state: the append-only event log, message index, file registry, paired devices
 (by their static X25519 public key), the pending pairing secret, and the server's static key.
 
 One SQLite file under ``$HERMES_HOME/aleph/``. The log is what a phone replays after ``hello``;
@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS messages (
     text TEXT NOT NULL,
     attachments TEXT NOT NULL,
     dispatched INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS files (
+    id TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    path TEXT NOT NULL,
+    agent_path TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -110,6 +116,14 @@ class StoredMessage:
 
 
 @dataclass(frozen=True)
+class StoredFile:
+    id: str
+    description: dict[str, Any]
+    path: str  # Aleph's own copy (what GET serves)
+    agent_path: Optional[str]  # the gateway media-cache copy handed to the agent, for uploads
+
+
+@dataclass(frozen=True)
 class Device:
     id: str
     name: str
@@ -133,7 +147,8 @@ class AlephStore:
 
     def __init__(self, root: Path, *, history_limit: int = 20000) -> None:
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.files_dir = self.root / "files"
+        self.files_dir.mkdir(parents=True, exist_ok=True)
         self.history_limit = max(100, int(history_limit))
         self._lock = threading.Lock()
         self._db = sqlite3.connect(str(self.root / "aleph.db"), check_same_thread=False, isolation_level=None)
@@ -230,6 +245,19 @@ class AlephStore:
     def user_message_seq(self, message_id: str) -> Optional[int]:
         message = self.message(message_id)
         return message.seq if message is not None and message.sender == "user" else None
+
+    # ── files ──────────────────────────────────────────────────────────────────────────────────
+
+    def add_file(self, description: dict[str, Any], path: str, agent_path: Optional[str] = None) -> None:
+        with self._lock:
+            self._db.execute("INSERT INTO files (id, description, path, agent_path) VALUES (?, ?, ?, ?)",
+                             (description["id"], json.dumps(description, ensure_ascii=False), path, agent_path))
+
+    def file(self, file_id: str) -> Optional[StoredFile]:
+        with self._lock:
+            row = self._db.execute("SELECT id, description, path, agent_path FROM files WHERE id = ?",
+                                   (file_id,)).fetchone()
+        return StoredFile(row[0], json.loads(row[1]), row[2], row[3]) if row is not None else None
 
     # ── devices ──────────────────────────────────────────────────────────────────────────────
 

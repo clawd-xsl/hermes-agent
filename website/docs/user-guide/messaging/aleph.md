@@ -13,8 +13,9 @@ What the channel gives the phone:
   once a turn that includes the person's messages starts);
 - tool progress as compact rows, gateway notices as system notes;
 - approval cards for dangerous commands and question cards for the `clarify` tool;
-- end-to-end encryption: everything between the phone and the plugin is ciphertext to the network, the
-  tunnel and Cloudflare.
+- attachments both ways;
+- end-to-end encryption: everything between the phone and the plugin, files included, is ciphertext to
+  the network, the tunnel and Cloudflare.
 
 The wire protocol is specified in the Aleph repository (`docs/protocol.md`).
 
@@ -65,6 +66,8 @@ since the agent runs there.
   `aleph/1`). An unknown or revoked device key, or a handshake not finished within 10 seconds, closes with
   `4401`. After it, each binary WebSocket message is one JSON-RPC frame, encrypted with ChaCha20-Poly1305.
   The phone accepts only the server key it pinned at pairing.
+- Files are encrypted with a key of their own, which travels only inside the encrypted channel; the HTTP
+  side moves ciphertext against one-time tickets.
 
 ## Pair a device
 
@@ -129,7 +132,7 @@ ingress:
   - service: http_status:404
 ```
 
-The listener serves only `/aleph/v1/ws` and `/aleph/v1/pair`.
+The listener serves only `/aleph/v1/ws`, `/aleph/v1/pair` and `/aleph/v1/files/`.
 Hermes's dashboard and its gateway WebSocket (`/api/ws`) run on other ports and are never published.
 
 Run it with `cloudflared tunnel run hermes` (or install it as a service: `cloudflared service install`), set
@@ -155,7 +158,7 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_PUBLIC_URL` | `http://<LAN address>:<port>` | Base URL the phone uses, pairing included; goes into pairing links |
 | `ALEPH_HOME_CHANNEL` | `main` | Home channel; `off` leaves the home to another platform |
 | `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` |
-| `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`) |
+| `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`), and encrypted files |
 
 The same keys can be set under `platforms.aleph.extra` in `config.yaml` (`host`, `port`, `public_url`,
 `history_limit`, `state_dir`); environment
@@ -165,7 +168,10 @@ variables win.
 
 - `GET /aleph/v1/ws`: the WebSocket. Binary messages only: the Noise IK handshake, then one encrypted
   JSON-RPC 2.0 frame per message. `hello {protocol: 1, after}` first; the server replays what the phone
-  lacks, sends `sync.done`, then live events.
+  lacks, sends `sync.done`, then live events. Also `file.ticket`.
 - `GET /aleph/v1/pair`: the pairing WebSocket (Noise IKpsk1), there only while a pairing is pending.
+- `PUT /aleph/v1/files/<ticket>`: upload ciphertext of exactly the size the ticket was issued for (`204`).
+- `GET /aleph/v1/files/<ticket>`: download ciphertext; each link works once.
 
-No request carries credentials: connections authenticate inside the Noise handshake.
+No request carries credentials: connections authenticate inside the Noise handshake, and file transfers by
+their one-time tickets.

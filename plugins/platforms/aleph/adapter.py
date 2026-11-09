@@ -12,17 +12,20 @@ Map onto the base adapter:
 - ``send_draft`` -> live ``draft`` (whole text); the next text ``send`` carries its ``draft_id``;
 - ``send_typing`` / ``stop_typing`` / status text -> live ``typing``;
 - ``_send_exec_approval_prompt`` / ``send_clarify`` -> ``approval.request`` / ``clarify.request``;
+- ``send_image_file`` / ``send_document`` / ``send_voice`` / ``send_video`` -> attachments;
 - ``on_processing_start`` -> ``receipt`` (the turn that takes the person's messages has started).
 
 Everything to and from the phone is end-to-end encrypted with Noise (``noise.py``): a device pairs
 once by scanning a QR code (``hermes aleph pair``, then the ``/aleph/v1/pair`` handshake) and is known
-by its static key from then on.
+by its static key from then on. Files are encrypted with keys of their own (``files.py``).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
+import os
 import secrets
 import time
 import uuid
@@ -34,10 +37,12 @@ from typing import Any, Optional
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import extra_or_secret
 from gateway.platforms.base import (
-    BasePlatformAdapter, ExecApprovalPrompt, MessageEvent, MessageType, SendResult)
+    BasePlatformAdapter, ExecApprovalPrompt, MessageEvent, MessageType, SendResult, cache_media_bytes_async)
 from gateway.platforms.helpers import MessageDeduplicator
 
 from plugins.platforms.aleph import noise
+from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file, file_url
+from plugins.platforms.aleph.noise import b64url, from_b64url
 from plugins.platforms.aleph.server import (
     INVALID_PARAMS, METHOD_NOT_FOUND, AlephServer, Connection, RpcError, event_frame)
 from plugins.platforms.aleph.store import AlephStore, Device, LoggedEvent, load_or_create_server_key
@@ -59,6 +64,8 @@ DEFAULT_HISTORY_LIMIT = 20000
 # Generous: Aleph renders long Markdown itself, and drafts stream the whole reply anyway.
 MAX_MESSAGE_LENGTH = 32000
 MAX_TEXT_CHARS = 64000
+MAX_ATTACHMENTS = 20
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 # How often the gateway reloads paired keys and the pending pairing written by the CLI (another
 # process): a revoked device is cut off, and a new pairing becomes reachable, within this.
 DEVICE_POLL_SECONDS = 1.0
@@ -91,6 +98,31 @@ def resolve_state_dir(extra: Optional[dict]) -> Path:
         return Path(state_dir).expanduser()
     from hermes_constants import get_hermes_home
     return get_hermes_home() / "aleph"
+
+
+def _file_kind(cached_kind: str, mime: str, name: str) -> str:
+    """Protocol attachment kind: image, video, audio, voice or file."""
+    if cached_kind == "image":
+        return "image"
+    if cached_kind == "video":
+        return "video"
+    if cached_kind == "audio":
+        return "voice" if (mime in ("audio/ogg", "audio/opus") or "voice" in name.lower()) else "audio"
+    return "file"
+
+
+def _media_message_type(kind: str) -> MessageType:
+    return {"image": MessageType.PHOTO, "video": MessageType.VIDEO, "audio": MessageType.AUDIO,
+            "voice": MessageType.VOICE}.get(kind, MessageType.DOCUMENT)
+
+
+def _image_size(path: str) -> Optional[tuple[int, int]]:
+    try:
+        from PIL import Image
+        with Image.open(path) as image:
+            return int(image.width), int(image.height)
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
@@ -127,6 +159,7 @@ class AlephAdapter(BasePlatformAdapter):
         # What the handshakes may consult before anyone is authenticated: memory only.
         self._device_keys: dict[bytes, Device] = {}
         self._pending: Optional[tuple[bytes, float]] = None
+        self._tickets: Optional[TicketBook] = None
         self._dedup = MessageDeduplicator(max_size=5000, ttl_seconds=3600)
         self._store: Optional[AlephStore] = None
         self._server: Optional[AlephServer] = None
@@ -173,6 +206,7 @@ class AlephAdapter(BasePlatformAdapter):
             await asyncio.to_thread(self._store.close)
             self._store = None
             return False
+        self._tickets = TicketBook(self._store.files_dir / "uploads")
         await self._reload_devices()
         self._last_user_message = await asyncio.to_thread(self._store.meta, "last_user_message")
         self._last_receipt = await asyncio.to_thread(self._store.meta, "last_receipt")
@@ -351,6 +385,8 @@ class AlephAdapter(BasePlatformAdapter):
         if method == "clarify.respond":
             await self._respond_clarify(params)
             return {}
+        if method == "file.ticket":
+            return await self._file_ticket(params)
         if method == "ping":
             return {}
         raise RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
@@ -362,8 +398,10 @@ class AlephAdapter(BasePlatformAdapter):
         text = params.get("text") or ""
         if not isinstance(text, str) or len(text) > MAX_TEXT_CHARS:
             raise RpcError(INVALID_PARAMS, "text must be a string")
-        if params.get("attachments"):
-            raise RpcError(INVALID_PARAMS, "attachments are not supported")
+        uploads = params.get("attachments") or []
+        if not isinstance(uploads, list) or len(uploads) > MAX_ATTACHMENTS or not all(
+                isinstance(item, dict) for item in uploads):
+            raise RpcError(INVALID_PARAMS, "attachments must be a list of {ticket, key, name, mime}")
         reply_to = params.get("reply_to")
         if reply_to is not None and not isinstance(reply_to, str):
             raise RpcError(INVALID_PARAMS, "reply_to must be a message id or null")
@@ -376,21 +414,36 @@ class AlephAdapter(BasePlatformAdapter):
                 # attempt was logged but never reached the gateway.
                 self._dedup.is_duplicate(message_id)
                 if not existing.dispatched:
-                    await self._dispatch_user_message(message_id, existing.text, reply_to)
+                    await self._dispatch_user_message(message_id, existing.text, existing.attachments,
+                                                      reply_to)
                 return existing.seq
-            if not text.strip():
-                raise RpcError(INVALID_PARAMS, "a message needs text")
+            if not text.strip() and not uploads:
+                raise RpcError(INVALID_PARAMS, "a message needs text or attachments")
+            attachments = await self._take_uploads(uploads)
             self._dedup.is_duplicate(message_id)
-            payload = {"id": message_id, "sender": "user", "text": text, "attachments": [], "created_at": now_iso()}
+            payload = {"id": message_id, "sender": "user", "text": text,
+                       "attachments": self._with_links(attachments), "created_at": now_iso()}
             event = await self._log("message.new", payload, message={
-                "id": message_id, "sender": "user", "kind": "text", "text": text, "attachments": []})
-            await self._dispatch_user_message(message_id, text, reply_to)
+                "id": message_id, "sender": "user", "kind": "text", "text": text, "attachments": attachments})
+            await self._dispatch_user_message(message_id, text, attachments, reply_to)
             return event.seq
 
-    async def _dispatch_user_message(self, message_id: str, text: str, reply_to: Optional[str]) -> None:
+    async def _dispatch_user_message(self, message_id: str, text: str, attachments: list[dict[str, Any]],
+                                     reply_to: Optional[str]) -> None:
+        media_urls, media_types = [], []
+        message_type = MessageType.TEXT
+        for description in attachments:
+            stored = await asyncio.to_thread(self.store.file, str(description.get("id")))
+            if stored is None or not stored.agent_path:
+                continue
+            media_urls.append(stored.agent_path)
+            media_types.append(str(description.get("mime") or "application/octet-stream"))
+            if message_type == MessageType.TEXT:
+                message_type = _media_message_type(str(description.get("kind") or "file"))
         source = self.build_source(chat_id=self.chat_id, chat_name=CHAT_NAME, chat_type="dm",
                                    user_id=OWNER_ID, user_name=OWNER_NAME)
-        event = MessageEvent(source=source, text=text, message_type=MessageType.TEXT, message_id=message_id)
+        event = MessageEvent(source=source, text=text, message_type=message_type, message_id=message_id,
+                             media_urls=media_urls, media_types=media_types)
         if reply_to:
             replied = await asyncio.to_thread(self.store.message, reply_to)
             if replied is not None:
@@ -444,12 +497,13 @@ class AlephAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Aleph is not connected", retryable=True)
         meta = metadata or {}
         kind = "tool" if meta.get("_tool_progress") else "system" if meta.get("_interim_send") else "text"
-        return await self._send_message(str(chat_id or self.chat_id), content or "", kind=kind)
+        return await self._send_message(str(chat_id or self.chat_id), content or "", [], kind=kind)
 
-    async def _send_message(self, chat_id: str, text: str, *, kind: str = "text") -> SendResult:
+    async def _send_message(self, chat_id: str, text: str, attachments: list[dict[str, Any]], *,
+                            kind: str = "text") -> SendResult:
         message_id = str(uuid.uuid4())
         payload: dict[str, Any] = {"id": message_id, "sender": "agent", "text": text,
-                                   "attachments": [], "created_at": now_iso()}
+                                   "attachments": self._with_links(attachments), "created_at": now_iso()}
         if kind != "text":
             payload["kind"] = kind
         else:
@@ -459,7 +513,7 @@ class AlephAdapter(BasePlatformAdapter):
                 payload["draft_id"] = open_draft[0]
         try:
             await self._log("message.new", payload, message={
-                "id": message_id, "sender": "agent", "kind": kind, "text": text, "attachments": []})
+                "id": message_id, "sender": "agent", "kind": kind, "text": text, "attachments": attachments})
         except Exception as exc:
             logger.error("Aleph: logging an outbound message failed: %s", exc)
             return SendResult(success=False, error=str(exc))
@@ -684,6 +738,161 @@ class AlephAdapter(BasePlatformAdapter):
             await self._log("clarify.resolved", {"clarify_id": clarify_id, "answer": answer, "by": "user"})
         else:
             await self._log("clarify.resolved", {"clarify_id": clarify_id, "answer": None, "by": "timeout"})
+
+    # ── files ──────────────────────────────────────────────────────────────────────────────────
+
+    async def _file_ticket(self, params: dict[str, Any]) -> dict[str, Any]:
+        """``file.ticket {size}`` before an upload, ``{id}`` for a fresh download link."""
+        if self._tickets is None:
+            raise RpcError(INVALID_PARAMS, "not connected")
+        if "id" in params:
+            file_id = params.get("id")
+            stored = await asyncio.to_thread(self.store.file, file_id) if isinstance(file_id, str) else None
+            if stored is None or not os.path.isfile(stored.path):
+                raise RpcError(INVALID_PARAMS, "no such file")
+            ticket = self._tickets.issue_download(stored.id)
+        else:
+            size = params.get("size")
+            if isinstance(size, bool) or not isinstance(size, int) or not 16 <= size <= MAX_UPLOAD_BYTES + 16:
+                raise RpcError(INVALID_PARAMS, "size must be the ciphertext's byte count (at most 200 MB)")
+            ticket = self._tickets.issue_upload(size)
+        return {"ticket": ticket, "url": file_url(ticket)}
+
+    def upload_size(self, ticket: str) -> Optional[int]:
+        return self._tickets.upload_size(ticket) if self._tickets is not None else None
+
+    async def accept_upload(self, ticket: str, data: bytes) -> bool:
+        if self._tickets is None:
+            return False
+        return await asyncio.to_thread(self._tickets.accept_upload, ticket, data)
+
+    def redeem_download(self, ticket: str) -> Optional[str]:
+        """The ciphertext path a download ticket opens (once), or ``None``."""
+        if self._tickets is None or self._store is None:
+            return None
+        file_id = self._tickets.redeem_download(ticket)
+        stored = self.store.file(file_id) if file_id else None
+        return stored.path if stored is not None and os.path.isfile(stored.path) else None
+
+    def _with_links(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Attachments as a logged ``message.new`` carries them: each with a fresh download link."""
+        if self._tickets is None:
+            return attachments
+        return [{**description, "url": file_url(self._tickets.issue_download(str(description["id"])))}
+                for description in attachments]
+
+    async def _take_uploads(self, uploads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """``message.send`` attachments ``{ticket, key, name, mime}``: decrypt each upload, hand the
+        plaintext to the gateway's media cache (what the agent reads) and keep the ciphertext (what
+        downloads serve). All are checked before any is spent."""
+        if self._tickets is None:
+            raise RpcError(INVALID_PARAMS, "not connected")
+        opened = []
+        for upload in uploads:
+            ticket, key = upload.get("ticket"), upload.get("key")
+            name, mime = upload.get("name"), upload.get("mime")
+            path = self._tickets.uploaded(ticket) if isinstance(ticket, str) else None
+            if path is None:
+                raise RpcError(INVALID_PARAMS, "unknown or unfinished upload ticket")
+            try:
+                plaintext = decrypt_file(from_b64url(key) if isinstance(key, str) else b"",
+                                         await asyncio.to_thread(path.read_bytes))
+            except (ValueError, OSError) as exc:
+                raise RpcError(INVALID_PARAMS, f"the upload does not decrypt with its key: {exc}") from exc
+            name = Path(name).name.replace("\x00", "").strip()[:200] if isinstance(name, str) else ""
+            mime = (mime.split(";", 1)[0].strip().lower() if isinstance(mime, str) else "") or "application/octet-stream"
+            opened.append((ticket, str(key), name or "file" + (mimetypes.guess_extension(mime) or ""), mime,
+                           path, plaintext))
+        attachments = []
+        for ticket, key, name, mime, path, plaintext in opened:
+            cached = await cache_media_bytes_async(plaintext, filename=name, mime_type=mime)
+            if cached is None:
+                raise RpcError(INVALID_PARAMS, f"{name} could not be read")
+            file_id = f"f_{uuid.uuid4().hex}"
+            dest = self.store.files_dir / f"{file_id}.bin"
+            await asyncio.to_thread(os.replace, path, dest)
+            self._tickets.spend_upload(ticket)
+            media_type = cached.media_type or mime
+            description = self._describe(file_id, name, media_type, _file_kind(cached.kind, media_type, name),
+                                         len(plaintext), cached.path, key)
+            await asyncio.to_thread(self.store.add_file, description, str(dest), cached.path)
+            attachments.append(description)
+        return attachments
+
+    @staticmethod
+    def _describe(file_id: str, name: str, mime: str, kind: str, size: int, plaintext_path: str,
+                  key: str) -> dict[str, Any]:
+        description: dict[str, Any] = {"id": file_id, "name": name, "mime": mime, "kind": kind, "size": size}
+        if kind == "image":
+            dims = _image_size(plaintext_path)
+            if dims is not None:
+                description["width"], description["height"] = dims
+        description["key"] = key
+        return description
+
+    async def _register_agent_file(self, source_path: str, *, kind: str, name: Optional[str] = None) -> dict[str, Any]:
+        """Encrypt a file the agent sends into Aleph's store (the original may be a temp/cache file)."""
+        src = Path(source_path).expanduser()
+        if not src.is_file():
+            raise FileNotFoundError(source_path)
+        display = name or src.name
+        plaintext = await asyncio.to_thread(src.read_bytes)
+        key, ciphertext = encrypt_file(plaintext)
+        file_id = f"f_{uuid.uuid4().hex}"
+        dest = self.store.files_dir / f"{file_id}.bin"
+        await asyncio.to_thread(dest.write_bytes, ciphertext)
+        mime = mimetypes.guess_type(display)[0] or mimetypes.guess_type(str(src))[0] or "application/octet-stream"
+        description = self._describe(file_id, display, mime, kind, len(plaintext), str(src), b64url(key))
+        await asyncio.to_thread(self.store.add_file, description, str(dest), None)
+        return description
+
+    async def _send_file(self, chat_id: str, path: str, caption: Optional[str], *, kind: str,
+                         name: Optional[str] = None) -> SendResult:
+        if self._store is None:
+            return SendResult(success=False, error="Aleph is not connected", retryable=True)
+        try:
+            description = await self._register_agent_file(path, kind=kind, name=name)
+        except (OSError, ValueError) as exc:
+            logger.warning("Aleph: cannot attach %s: %s", path, exc)
+            return SendResult(success=False, error=f"cannot read {path}: {exc}")
+        return await self._send_message(str(chat_id or self.chat_id), caption or "", [description])
+
+    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
+                              reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+                              **kwargs) -> SendResult:
+        return await self._send_file(chat_id, image_path, caption, kind="image")
+
+    async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
+                            file_name: Optional[str] = None, reply_to: Optional[str] = None,
+                            metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
+        return await self._send_file(chat_id, file_path, caption, kind="file", name=file_name)
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+                         **kwargs) -> SendResult:
+        return await self._send_file(chat_id, audio_path, caption, kind="voice")
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+                         **kwargs) -> SendResult:
+        return await self._send_file(chat_id, video_path, caption, kind="video")
+
+    async def send_files(self, chat_id: str, file_paths: list[str], caption: str = "") -> SendResult:
+        """Several files on one message (send_message with media)."""
+        if self._store is None:
+            return SendResult(success=False, error="Aleph is not connected", retryable=True)
+        attachments = []
+        for path in file_paths:
+            mime = mimetypes.guess_type(path)[0] or ""
+            kind = ("image" if mime.startswith("image/") else "video" if mime.startswith("video/")
+                    else "audio" if mime.startswith("audio/") else "file")
+            try:
+                attachments.append(await self._register_agent_file(path, kind=kind))
+            except (OSError, ValueError) as exc:
+                logger.warning("Aleph: cannot attach %s: %s", path, exc)
+        if not attachments and not caption.strip():
+            return SendResult(success=False, error="no readable files")
+        return await self._send_message(str(chat_id or self.chat_id), caption, attachments)
 
     # ── misc ───────────────────────────────────────────────────────────────────────────────────
 
