@@ -354,6 +354,38 @@ def test_native_turn_honors_interrupt_that_precedes_child_dispatch(monkeypatch):
         agent.close()
 
 
+def test_soft_interrupt_that_errors_the_child_is_not_a_failed_turn(monkeypatch):
+    """A new user message soft-interrupts the running child, which then reports an empty error
+    result. The turn is interrupted, not failed: no "Claude CLI turn failed" reply reaches the user."""
+    agent = _make_agent()
+
+    class ErrorOnInterrupt(_FakeSession):
+        def run_turn(self, **kwargs):
+            self.calls.append(kwargs)
+            kwargs["agent"].interrupt("user sent a new message")
+            # What the live child reported: interrupted AND an empty-result error.
+            return ClaudeCliTurnResult(interrupted=True, error="Claude CLI turn failed", should_retire=True,
+                                       native_session_id="native-preserved")
+
+    native = ErrorOnInterrupt()
+
+    def get_session(bound_agent, **_kwargs):
+        bound_agent._claude_cli_session = native
+        return native
+
+    monkeypatch.setattr("plugins.claude_cli.runtime._get_session", get_session)
+    with patch.object(agent, "_sync_external_memory_for_turn", return_value=None):
+        result = agent.run_conversation("read this pdf")
+    try:
+        assert result["interrupted"] is True
+        assert result["turn_exit_reason"] == "interrupted_by_user"
+        assert "Claude CLI turn failed" not in str(result.get("final_response") or "")
+        assert not result.get("error")
+        assert not any("Claude CLI turn failed" in str(m.get("content") or "") for m in result["messages"])
+    finally:
+        agent.close()
+
+
 def test_tool_interrupt_finalizer_keeps_native_session_for_next_user_turn(monkeypatch):
     agent = _make_agent()
 

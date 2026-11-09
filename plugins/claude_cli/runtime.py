@@ -4031,9 +4031,14 @@ def run_claude_cli_turn(
     )
     result.update({
         "partial": interrupted or (failed and not content_policy_blocked),
+        # An interrupted turn is superseded by the user's next message, not failed: the child often
+        # reports the cancellation as an empty error result, which the gateway would otherwise
+        # deliver as a "Claude CLI turn failed" reply.
         "error": (
             turn.final_text
             if persistence_failed
+            else None
+            if interrupted
             else str(turn.error)
             if content_policy_blocked
             else str(turn.error)
