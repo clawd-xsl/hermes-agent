@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -71,6 +72,10 @@ MAX_MESSAGE_LENGTH = 32000
 MAX_TEXT_CHARS = 64000
 MAX_ATTACHMENTS = 20
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+MAX_PLACE_TEXT = 200
+# What the phone may tell about an upload (layout before download), within sane bounds.
+MAX_MEDIA_SIDE = 100_000
+MAX_MEDIA_SECONDS = 7 * 24 * 3600
 # How often the gateway reloads paired keys and the pending pairing written by the CLI (another
 # process): a revoked device is cut off, and a new pairing becomes reachable, within this.
 DEVICE_POLL_SECONDS = 1.0
@@ -123,6 +128,79 @@ def _file_kind(cached_kind: str, mime: str, name: str) -> str:
     if cached_kind == "audio":
         return "voice" if (mime in ("audio/ogg", "audio/opus") or "voice" in name.lower()) else "audio"
     return "file"
+
+
+def upload_limit() -> int:
+    """The largest file the phone may upload: 200 MB, or less when the gateway's own inbound media cap
+    (``gateway.max_inbound_media_bytes``, 128 MB by default) is lower, since the file must fit it to
+    reach the agent."""
+    from gateway.platforms.base import get_inbound_media_max_bytes
+    try:
+        gateway_cap = int(get_inbound_media_max_bytes())
+    except Exception:
+        gateway_cap = 0
+    return min(MAX_UPLOAD_BYTES, gateway_cap) if gateway_cap > 0 else MAX_UPLOAD_BYTES
+
+
+def _place_text(value: Any, field: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RpcError(INVALID_PARAMS, f"location.{field} must be a string")
+    text = " ".join(value.split())  # one line
+    if len(text) > MAX_PLACE_TEXT:
+        raise RpcError(INVALID_PARAMS, f"location.{field} is longer than {MAX_PLACE_TEXT} characters")
+    return text or None
+
+
+def clean_location(raw: Any) -> Optional[dict[str, Any]]:
+    """``message.send``'s ``location``: ``{latitude, longitude, name?, address?}``, validated."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RpcError(INVALID_PARAMS, "location must be an object")
+    point: dict[str, Any] = {}
+    for field, bound in (("latitude", 90.0), ("longitude", 180.0)):
+        value = raw.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                or not -bound <= value <= bound:
+            raise RpcError(INVALID_PARAMS, f"location.{field} must be a number from {-bound:g} to {bound:g}")
+        point[field] = float(value)
+    for field in ("name", "address"):
+        text = _place_text(raw.get(field), field)
+        if text:
+            point[field] = text
+    return point
+
+
+def location_note(point: dict[str, Any], text: str = "") -> str:
+    """The note a shared pin reaches the agent as, the way other channels word it, then the message's
+    own text."""
+    from urllib.parse import quote
+    lat, lon = point["latitude"], point["longitude"]
+    lines = ["[The user shared a location pin.]"]
+    if point.get("name"):
+        lines.append(f"Place: {point['name']}")
+    if point.get("address"):
+        lines.append(f"Address: {point['address']}")
+    link = f"https://maps.apple.com/?ll={lat},{lon}" + (f"&q={quote(point['name'])}" if point.get("name") else "")
+    lines += [f"latitude: {lat}", f"longitude: {lon}", f"Map: {link}"]
+    note = "\n".join(lines)
+    return f"{note}\n\n{text}" if text.strip() else note
+
+
+def _upload_hints(upload: dict[str, Any]) -> dict[str, Any]:
+    """``width``/``height``/``duration`` the phone gave for an upload, keeping only sane values."""
+    hints: dict[str, Any] = {}
+    for field in ("width", "height"):
+        value = upload.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= MAX_MEDIA_SIDE:
+            hints[field] = value
+    duration = upload.get("duration")
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(duration) \
+            and 0 <= duration <= MAX_MEDIA_SECONDS:
+        hints["duration"] = round(float(duration), 3)
+    return hints
 
 
 def _media_message_type(kind: str) -> MessageType:
@@ -587,6 +665,7 @@ class AlephAdapter(BasePlatformAdapter):
         reply_to = params.get("reply_to")
         if reply_to is not None and not isinstance(reply_to, str):
             raise RpcError(INVALID_PARAMS, "reply_to must be a message id or null")
+        location = clean_location(params.get("location"))
         async with self._intake_lock:
             existing = await asyncio.to_thread(self.store.message, message_id)
             if existing is not None:
@@ -597,21 +676,30 @@ class AlephAdapter(BasePlatformAdapter):
                 self._dedup.is_duplicate(message_id)
                 if not existing.dispatched:
                     await self._dispatch_user_message(message_id, existing.text, existing.attachments,
-                                                      reply_to)
+                                                      reply_to, await self._logged_location(existing.seq))
                 return existing.seq
-            if not text.strip() and not uploads:
-                raise RpcError(INVALID_PARAMS, "a message needs text or attachments")
+            if not text.strip() and not uploads and location is None:
+                raise RpcError(INVALID_PARAMS, "a message needs text, attachments or a location")
             attachments = await self._take_uploads(uploads)
             self._dedup.is_duplicate(message_id)
             payload = {"id": message_id, "sender": "user", "text": text,
-                       "attachments": self._with_links(attachments), "created_at": now_iso()}
+                       "attachments": self._with_links(attachments)}
+            if location is not None:
+                payload["location"] = location
+            payload["created_at"] = now_iso()
             event = await self._log("message.new", payload, message={
                 "id": message_id, "sender": "user", "kind": "text", "text": text, "attachments": attachments})
-            await self._dispatch_user_message(message_id, text, attachments, reply_to)
+            await self._dispatch_user_message(message_id, text, attachments, reply_to, location)
             return event.seq
 
+    async def _logged_location(self, seq: int) -> Optional[dict[str, Any]]:
+        """The location a logged message carried (for handing over a resend that never reached the
+        gateway)."""
+        events = await asyncio.to_thread(self.store.events_after, seq - 1, until=seq)
+        return events[0].payload.get("location") if events else None
+
     async def _dispatch_user_message(self, message_id: str, text: str, attachments: list[dict[str, Any]],
-                                     reply_to: Optional[str]) -> None:
+                                     reply_to: Optional[str], location: Optional[dict[str, Any]] = None) -> None:
         media_urls, media_types = [], []
         message_type = MessageType.TEXT
         for description in attachments:
@@ -622,6 +710,10 @@ class AlephAdapter(BasePlatformAdapter):
             media_types.append(str(description.get("mime") or "application/octet-stream"))
             if message_type == MessageType.TEXT:
                 message_type = _media_message_type(str(description.get("kind") or "file"))
+        if location is not None:
+            text = location_note(location, text)
+            if message_type == MessageType.TEXT:
+                message_type = MessageType.LOCATION
         source = self.build_source(chat_id=self.chat_id, chat_name=CHAT_NAME, chat_type="dm",
                                    user_id=OWNER_ID, user_name=OWNER_NAME)
         event = MessageEvent(source=source, text=text, message_type=message_type, message_id=message_id,
@@ -935,8 +1027,12 @@ class AlephAdapter(BasePlatformAdapter):
             ticket = self._tickets.issue_download(stored.id)
         else:
             size = params.get("size")
-            if isinstance(size, bool) or not isinstance(size, int) or not 16 <= size <= MAX_UPLOAD_BYTES + 16:
-                raise RpcError(INVALID_PARAMS, "size must be the ciphertext's byte count (at most 200 MB)")
+            limit = upload_limit()
+            if isinstance(size, bool) or not isinstance(size, int) or size < 16:
+                raise RpcError(INVALID_PARAMS, "size must be the ciphertext's byte count (the file's plus 16)")
+            if size > limit + 16:
+                raise RpcError(INVALID_PARAMS, f"the file is too large: at most {limit // (1024 * 1024)} MB",
+                               {"max_bytes": limit})
             ticket = self._tickets.issue_upload(size)
         return {"ticket": ticket, "url": file_url(ticket)}
 
@@ -984,31 +1080,46 @@ class AlephAdapter(BasePlatformAdapter):
             name = Path(name).name.replace("\x00", "").strip()[:200] if isinstance(name, str) else ""
             mime = (mime.split(";", 1)[0].strip().lower() if isinstance(mime, str) else "") or "application/octet-stream"
             opened.append((ticket, str(key), name or "file" + (mimetypes.guess_extension(mime) or ""), mime,
-                           path, plaintext))
-        attachments = []
-        for ticket, key, name, mime, path, plaintext in opened:
-            cached = await cache_media_bytes_async(plaintext, filename=name, mime_type=mime)
+                           path, plaintext, _upload_hints(upload)))
+        # Into the media cache first, all of them: a file the gateway refuses (too big, not what its
+        # type claims) fails the send before any ticket is spent.
+        cached_files = []
+        for ticket, key, name, mime, path, plaintext, hints in opened:
+            try:
+                cached = await cache_media_bytes_async(plaintext, filename=name, mime_type=mime)
+            except ValueError as exc:
+                raise RpcError(INVALID_PARAMS, f"{name} was refused: {exc}") from exc
             if cached is None:
                 raise RpcError(INVALID_PARAMS, f"{name} could not be read")
+            cached_files.append(cached)
+        attachments = []
+        for (ticket, key, name, mime, path, plaintext, hints), cached in zip(opened, cached_files):
             file_id = f"f_{uuid.uuid4().hex}"
             dest = self.store.files_dir / f"{file_id}.bin"
             await asyncio.to_thread(os.replace, path, dest)
             self._tickets.spend_upload(ticket)
             media_type = cached.media_type or mime
             description = self._describe(file_id, name, media_type, _file_kind(cached.kind, media_type, name),
-                                         len(plaintext), cached.path, key)
+                                         len(plaintext), cached.path, key, hints)
             await asyncio.to_thread(self.store.add_file, description, str(dest), cached.path)
             attachments.append(description)
         return attachments
 
     @staticmethod
     def _describe(file_id: str, name: str, mime: str, kind: str, size: int, plaintext_path: str,
-                  key: str) -> dict[str, Any]:
+                  key: str, hints: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """A file description. An image's size is measured; otherwise what the phone said is kept
+        (``width``/``height`` for an image or video, ``duration`` for a video or audio)."""
+        hints = hints or {}
         description: dict[str, Any] = {"id": file_id, "name": name, "mime": mime, "kind": kind, "size": size}
-        if kind == "image":
-            dims = _image_size(plaintext_path)
+        if kind in ("image", "video"):
+            dims = _image_size(plaintext_path) if kind == "image" else None
             if dims is not None:
                 description["width"], description["height"] = dims
+            elif "width" in hints and "height" in hints:
+                description["width"], description["height"] = hints["width"], hints["height"]
+        if kind in ("video", "audio", "voice") and "duration" in hints:
+            description["duration"] = hints["duration"]
         description["key"] = key
         return description
 

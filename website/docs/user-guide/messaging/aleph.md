@@ -13,7 +13,7 @@ What the channel gives the phone:
   once a turn that includes the person's messages starts);
 - tool progress as compact rows, gateway notices as system notes;
 - approval cards for dangerous commands and question cards for the `clarify` tool;
-- attachments both ways;
+- attachments both ways, and shared locations (they reach the agent as a location pin with a map link);
 - end-to-end encryption: everything between the phone and the plugin, files included, is ciphertext to
   the network, the tunnel and Cloudflare;
 - push notifications through APNs that carry no content: the app's notification extension fetches the
@@ -200,6 +200,18 @@ Without all four, the channel works and pushes nothing; the gateway log says `pu
   machine, not through the tunnel.
 - A token Apple rejects (`410`, or `400 BadDeviceToken`) is dropped. Pushing never delays delivery over the
   WebSocket.
+
+## Attachments and locations
+
+The person's files reach the agent through the gateway's media cache, like on any channel: images go to
+the model natively when it has vision, voice notes are transcribed, other files are noted with their paths.
+The phone converts camera formats such as HEIC to JPEG first; videos and other files go as they are, with
+the width, height and duration the phone knows, so every device can lay them out before downloading.
+
+An upload may be up to 200 MB, but never more than the gateway accepts for inbound media
+(`gateway.max_inbound_media_bytes` in `config.yaml`, 128 MB by default); raise that to allow longer videos.
+A shared location reaches the agent as a location message: the place and address the phone looked up,
+the coordinates and an Apple Maps link, then any text sent with it.
 
 ## The agent's name and avatar
 
