@@ -19,6 +19,7 @@ What the channel gives the phone:
   the network, the tunnel and Cloudflare;
 - push notifications through APNs that carry no content: the app's notification extension fetches the
   real text over the channel itself.
+- emoji reactions both ways, like a tapback;
 - the agent's own name and avatar, which only the agent changes, with the `aleph` tools.
 
 The wire protocol is specified in the Aleph repository (`docs/protocol.md`).
@@ -235,6 +236,17 @@ An upload may be up to 200 MB, but never more than the gateway accepts for inbou
 (`gateway.max_inbound_media_bytes` in `config.yaml`, 128 MB by default); raise that to allow longer videos.
 A shared location reaches the agent as a location message: the place and address the phone looked up,
 the coordinates and an Apple Maps link, then any text sent with it.
+
+## Reactions
+
+Either side can react to a message with one emoji: one reaction per person per message, a new one
+replaces the old, and either can be taken back. Every device shows them; they are never pushed.
+
+- The person's reactions reach the agent with their next message, as a note in front of it, one line per
+  reaction since their last message: `[The person reacted ❤️ to your message "…"]`. A reaction alone
+  never starts a turn.
+- The agent reacts with the `aleph_react` tool (by default to the person's latest message;
+  `messages_back` reaches earlier ones), or with `send_message` and `action: "react"` / `"unreact"`.
 
 ## The agent's name and avatar
 

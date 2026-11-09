@@ -92,7 +92,45 @@ SET_PROFILE = {
     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 }
 
-TOOLS = (GET_PROFILE, SET_PROFILE)
+REACT = {
+    "name": "aleph_react",
+    "title": "React to a message in Aleph",
+    "description": (
+        "React to one of the person's messages in Aleph with a single emoji, the way they would tap back "
+        "in Messages. Reach for it when a reaction is what a person would do: something funny gets a 😂, "
+        "warmth gets a ❤️, a plan you're on board with gets a 👍. Then carry on with whatever the message "
+        "needs; if the reaction says it all, it can be the whole reply. Use it like a person: occasionally, "
+        "when felt, not on every message and never as a status signal. Never narrate it ('I reacted "
+        "with…'): the emoji on the bubble is the point. It goes on the person's latest message unless you "
+        "say otherwise; messages_back reaches an earlier one (1 = the one before the latest), for when "
+        "something lands late. One reaction per message: another emoji replaces yours, an empty string "
+        "takes it back."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "emoji": {"type": "string",
+                      "description": "One emoji (e.g. '❤️', '😂', '👍'), or an empty string to take your reaction back."},
+            "messages_back": {"type": "integer", "minimum": 0,
+                              "description": "Optional. 0 (the default) is the person's latest message, 1 the one before, and so on."},
+            "message_id": {"type": "string",
+                           "description": "Optional. A specific message's id, instead of messages_back."},
+        },
+        "required": ["emoji"],
+        "additionalProperties": False,
+    },
+    "outputSchema": {
+        "type": "object",
+        "properties": {
+            "message_id": {"type": "string", "description": "The message reacted to."},
+            "emoji": {"type": ["string", "null"], "description": "Your reaction on it now; null when taken back."},
+        },
+        "required": ["message_id", "emoji"],
+        "additionalProperties": False,
+    },
+    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+}
+
+TOOLS = (GET_PROFILE, SET_PROFILE, REACT)
 
 
 def hermes_schema(tool: dict[str, Any]) -> dict[str, Any]:
@@ -199,8 +237,46 @@ async def set_profile(args: dict[str, Any], **_: Any) -> str:
     return ok(text, result)
 
 
+async def react(args: dict[str, Any], **_: Any) -> str:
+    from plugins.platforms.aleph.reactions import clean_emoji
+    args = args or {}
+    unknown = sorted(set(args) - {"emoji", "messages_back", "message_id"})
+    if unknown:
+        return error(f"Unknown argument(s): {', '.join(unknown)}. Use emoji, and messages_back or message_id.")
+    if "emoji" not in args:
+        return error("emoji is required: one emoji, or an empty string to take your reaction back.")
+    try:
+        emoji = clean_emoji(args.get("emoji"))
+    except ValueError as exc:
+        return error(f"{exc}. Give exactly one emoji, such as ❤️ or 👍.")
+    back, message_id = args.get("messages_back"), args.get("message_id")
+    if back is not None and (isinstance(back, bool) or not isinstance(back, int) or back < 0):
+        return error("messages_back must be 0 or more.")
+    if message_id is not None and (not isinstance(message_id, str) or not message_id):
+        return error("message_id must be a message id.")
+    if message_id and back:
+        return error("Give either message_id or messages_back, not both.")
+    runner, adapter = _live()
+    if adapter is None:
+        return _not_running()
+
+    async def apply():
+        return await adapter.react(emoji, message_id=message_id, messages_back=back or 0)
+    try:
+        result = await _on_gateway(runner, apply)
+    except ValueError as exc:
+        return error(f"Could not react: {exc}.")
+    except Exception as exc:
+        logger.warning("Aleph: reacting failed", exc_info=True)
+        return error(f"Could not react ({exc.__class__.__name__}: {exc}).")
+    if isinstance(result, dict) and "error" in result and "message_id" not in result:
+        return error(f"Could not react: {result['error']}.")
+    text = "Reaction removed." if result["emoji"] is None else f"Reacted {result['emoji']}."
+    return ok(text, result)
+
+
 def register_tools(ctx) -> None:
-    handlers = {"aleph_get_profile": get_profile, "aleph_set_profile": set_profile}
+    handlers = {"aleph_get_profile": get_profile, "aleph_set_profile": set_profile, "aleph_react": react}
     for tool in TOOLS:
         ctx.register_tool(name=tool["name"], toolset=TOOLSET, schema=hermes_schema(tool),
                           handler=handlers[tool["name"]], check_fn=aleph_connected, is_async=True,

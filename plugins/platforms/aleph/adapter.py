@@ -25,6 +25,7 @@ active (protocol "Push"); pushing never holds up logging or delivery.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import mimetypes
@@ -45,7 +46,7 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import MessageDeduplicator
 
 from plugins.platforms.aleph import noise
-from plugins.platforms.aleph import activity
+from plugins.platforms.aleph import activity, reactions
 from plugins.platforms.aleph.profile import DEFAULT_NAME, Avatar
 from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file, file_url
 from plugins.platforms.aleph.noise import b64url, from_b64url
@@ -268,6 +269,9 @@ class AlephAdapter(BasePlatformAdapter):
         self._turn_message: dict[str, Optional[str]] = {}
         self._open_steps: dict[str, list[tuple[str, dict[str, Any]]]] = {}  # chat -> [(raw tool, step)]
         self._activity_status: dict[str, Optional[str]] = {}
+        # The person's reactions since their last message: message id -> emoji, oldest first. They
+        # reach the agent in front of the next message (protocol "Reactions").
+        self._pending_reactions: dict[str, str] = {}
         self._dedup = MessageDeduplicator(max_size=5000, ttl_seconds=3600)
         self._store: Optional[AlephStore] = None
         self._server: Optional[AlephServer] = None
@@ -319,6 +323,10 @@ class AlephAdapter(BasePlatformAdapter):
         self._last_user_message = await asyncio.to_thread(self._store.meta, "last_user_message")
         self._last_receipt = await asyncio.to_thread(self._store.meta, "last_receipt")
         await self._load_profile()
+        try:
+            self._pending_reactions = json.loads(await asyncio.to_thread(self._store.meta, "pending_reactions") or "{}")
+        except ValueError:
+            self._pending_reactions = {}
         self._server = AlephServer(self, host=self.host, port=self.port, static=self.static)
         try:
             await self._server.start()
@@ -658,6 +666,8 @@ class AlephAdapter(BasePlatformAdapter):
             return await self._file_ticket(params)
         if method == "activity.list":
             return await self.list_activity(params)
+        if method == "reaction.set":
+            return {"seq": await self._user_reaction(params)}
         if method == "ping":
             return {}
         raise RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
@@ -725,6 +735,9 @@ class AlephAdapter(BasePlatformAdapter):
             text = location_note(location, text)
             if message_type == MessageType.TEXT:
                 message_type = MessageType.LOCATION
+        reacted = await self._take_pending_reactions()
+        if reacted:
+            text = f"{reacted}\n\n{text}" if text.strip() else reacted
         source = self.build_source(chat_id=self.chat_id, chat_name=CHAT_NAME, chat_type="dm",
                                    user_id=OWNER_ID, user_name=OWNER_NAME)
         event = MessageEvent(source=source, text=text, message_type=message_type, message_id=message_id,
@@ -880,6 +893,91 @@ class AlephAdapter(BasePlatformAdapter):
         """Hermes's live status is the Slack form ("is searching …"); Aleph words its status line
         itself from the tool activity (``on_tool_activity``), so this text is not shown."""
         super().set_status_text(chat_id, text)
+
+    # ── reactions ──────────────────────────────────────────────────────────────────────────────
+
+    async def _user_reaction(self, params: dict[str, Any]) -> int:
+        """``reaction.set {message_id, emoji|null}``: log it; the agent hears of it with the next message."""
+        message_id = params.get("message_id")
+        if not isinstance(message_id, str) or not message_id:
+            raise RpcError(INVALID_PARAMS, "message_id is required")
+        if "emoji" not in params:
+            raise RpcError(INVALID_PARAMS, "emoji is required (null takes the reaction back)")
+        raw = params.get("emoji")
+        if raw is not None and not reactions.is_single_emoji(raw):
+            raise RpcError(INVALID_PARAMS, "emoji must be one emoji, or null")
+        stored = await asyncio.to_thread(self.store.message, message_id)
+        if stored is None:
+            raise RpcError(INVALID_PARAMS, "no message with that id")
+        event = await self._log("reaction", {"message_id": message_id, "by": "user", "emoji": raw, "at": now_iso()})
+        if stored.sender == "agent":
+            # The latest per message; a retraction drops it.
+            self._pending_reactions.pop(message_id, None)
+            if raw is not None:
+                self._pending_reactions[message_id] = raw
+            await asyncio.to_thread(self.store.set_meta, "pending_reactions", json.dumps(self._pending_reactions))
+        return event.seq
+
+    async def _take_pending_reactions(self) -> str:
+        """The note for the person's reactions since their last message, which it then clears."""
+        if not self._pending_reactions:
+            return ""
+        pending, self._pending_reactions = self._pending_reactions, {}
+        await asyncio.to_thread(self.store.set_meta, "pending_reactions", "{}")
+        reacted = []
+        for message_id, emoji in pending.items():
+            stored = await asyncio.to_thread(self.store.message, message_id)
+            if stored is not None:
+                reacted.append((emoji, stored.text, bool(stored.attachments)))
+        return reactions.note(reacted)
+
+    async def react(self, emoji: Optional[str], *, message_id: Optional[str] = None,
+                    messages_back: int = 0) -> dict[str, Any]:
+        """The agent reacts (``emoji`` None: takes its reaction back), by default to the person's latest
+        message; ``ValueError`` says what is wrong. Runs on the gateway's loop."""
+        if message_id:
+            stored = await asyncio.to_thread(self.store.message, message_id)
+            if stored is None:
+                raise ValueError(f"there is no message {message_id!r} in the conversation")
+        else:
+            ids = await asyncio.to_thread(self.store.user_message_ids, messages_back + 1)
+            if len(ids) <= messages_back:
+                raise ValueError("there is no message of the person's to react to yet" if not messages_back
+                                 else f"the person has fewer than {messages_back + 1} messages")
+            message_id = ids[messages_back]
+        await self._log("reaction", {"message_id": message_id, "by": "agent", "emoji": emoji, "at": now_iso()})
+        return {"message_id": message_id, "emoji": emoji}
+
+    async def _react_on_loop(self, emoji: Optional[str], message_id: Optional[str]) -> dict[str, Any]:
+        """``send_message(action="react")`` calls from another loop; the log is the gateway loop's."""
+        loop = self._loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        try:
+            if loop is None or running is loop:
+                result = await self.react(emoji, message_id=message_id)
+            else:
+                future = asyncio.run_coroutine_threadsafe(self.react(emoji, message_id=message_id), loop)
+                result = await asyncio.wrap_future(future)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        return {"success": True, **result}
+
+    async def add_reaction(self, chat_id: str, emoji: str, message_id: Optional[str] = None) -> dict[str, Any]:
+        """Hermes's ``send_message(action="react")``: react to a message (default: the person's latest)."""
+        try:
+            cleaned = reactions.clean_emoji(emoji)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        if cleaned is None:
+            return {"success": False, "error": "emoji is required; use action='unreact' to take a reaction back"}
+        return await self._react_on_loop(cleaned, message_id)
+
+    async def remove_reaction(self, chat_id: str, message_id: Optional[str] = None) -> dict[str, Any]:
+        """``send_message(action="unreact")``: take the agent's reaction back."""
+        return await self._react_on_loop(None, message_id)
 
     # ── activity ───────────────────────────────────────────────────────────────────────────────
 

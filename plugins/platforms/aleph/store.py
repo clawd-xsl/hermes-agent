@@ -251,6 +251,13 @@ class AlephStore:
         with self._lock:
             self._db.execute("DELETE FROM messages WHERE id = ?", (message_id,))
 
+    def user_message_ids(self, limit: int) -> list[str]:
+        """The person's most recent message ids, newest first."""
+        with self._lock:
+            rows = self._db.execute("SELECT id FROM messages WHERE sender = 'user' ORDER BY seq DESC LIMIT ?",
+                                    (limit,)).fetchall()
+        return [row[0] for row in rows]
+
     def user_message_seq(self, message_id: str) -> Optional[int]:
         message = self.message(message_id)
         return message.seq if message is not None and message.sender == "user" else None

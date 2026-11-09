@@ -66,9 +66,10 @@ _PLATFORM_HINT = (
     "(headings, lists, tables, code blocks, links) and shows your reply as it is written. "
     "You can send files: write MEDIA:/absolute/path/to/file in your response; images, video, "
     "audio and documents arrive as attachments the person can open. "
-    "Your name and avatar in Aleph are yours to change, and only you can change them: when the person "
-    "asks for a new name or picture, use the aleph_set_profile tool (aleph_get_profile reads them; load "
-    "them with tool_search if they are not listed), not Hermes's config."
+    "Aleph's own tools are loaded on demand (call them through tool_call): aleph_set_profile changes "
+    "your name and avatar there, and only you can change them, so when the person asks for a new name "
+    "or picture use it, not Hermes's config (aleph_get_profile reads them); aleph_react puts an emoji "
+    "on the person's message, as they would tap back."
 )
 
 
