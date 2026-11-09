@@ -160,6 +160,7 @@ class GatewayTurnProgressMixin:
         if event_type == "subagent.complete":
             self._progress_subagent_notice(preview, kwargs)
             return
+        self._progress_adapter_activity(event_type, tool_name, args, kwargs)
         self._progress_live_status(event_type, tool_name, args)
         # "log" mode: append tool.started lines to the log queue, silent in chat. Handled before
         # the progress_queue guard because log mode runs without a chat progress queue.
@@ -224,6 +225,25 @@ class GatewayTurnProgressMixin:
                     platform=ctx.source.platform, user_config=ctx.user_config)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
+
+    def _progress_adapter_activity(self, event_type: str, tool_name, args, kwargs: dict) -> None:
+        """Tool start/finish for an adapter that keeps its own record of the agent's steps (an
+        ``on_tool_activity`` method, e.g. Aleph's activity history). Called on the agent's worker
+        thread: the adapter hops to its own loop. Adapters without the method see nothing."""
+        if event_type not in ("tool.started", "tool.completed") or not tool_name or tool_name == "_thinking":
+            return
+        ctx = self._ctx
+        try:
+            adapter = self._runner._delivery_adapter_for(ctx.source)
+            hook = getattr(adapter, "on_tool_activity", None)
+            if hook is None or (event_type == "tool.started" and not ctx._run_still_current()):
+                return
+            hook(ctx.source, {
+                "type": event_type, "tool": tool_name, "args": args if isinstance(args, dict) else None,
+                "is_error": kwargs.get("is_error"), "duration": kwargs.get("duration"),
+                "live_status": ctx._live_status_mode})
+        except Exception as err:
+            logger.debug("adapter tool activity failed: %s", err)
 
     def _progress_live_status(self, event_type: str, tool_name, args) -> None:
         """Live status line (Slack assistant status): stash the tool phrase on the adapter; the
