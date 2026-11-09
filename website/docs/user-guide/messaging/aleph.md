@@ -228,7 +228,8 @@ too, `off` shows no line. Steps are recorded either way.
 ## Attachments and locations
 
 The person's files reach the agent through the gateway's media cache, like on any channel: images go to
-the model natively when it has vision, voice notes are transcribed, other files are noted with their paths.
+the model natively when it has vision, voice notes are transcribed, a text file of up to 100 KB
+(Markdown, code, CSV, JSON…) is put into the message, and other files are noted with their paths.
 The phone converts camera formats such as HEIC to JPEG first; videos and other files go as they are, with
 the width, height and duration the phone knows, so every device can lay them out before downloading.
 

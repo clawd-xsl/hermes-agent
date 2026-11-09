@@ -338,3 +338,29 @@ async def test_every_agent_file_send_carries_key_url_and_kind(adapter, tmp_path)
     finally:
         await phone.close()
 
+
+
+# ── text files the agent reads ───────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_small_text_files_are_inlined_and_the_gateway_says_so_truthfully(adapter):
+    from gateway.run_inbound import GatewayInboundMixin
+    phone = await _phone(adapter)
+    try:
+        await phone.hello()
+        notes = await phone.upload(adapter, b"# Plan\n\n- fly Tuesday\n", name="plan.md", mime="text/markdown")
+        big = await phone.upload(adapter, b"x" * (100 * 1024 + 1), name="huge.log", mime="text/plain")
+        pdf = await phone.upload(adapter, b"%PDF-1.4 binary", name="paper.pdf", mime="application/pdf")
+        assert "result" in await _send(phone, text="Have a look", attachments=[notes, big, pdf])
+        event = await _received(adapter)
+        assert event.media_text_inlined == [True, False, False]
+        assert event.media_filenames == ["plan.md", "huge.log", "paper.pdf"]
+        assert event.text == "[Content of plan.md]:\n# Plan\n\n- fly Tuesday\n\n\nHave a look"
+        # What the gateway then puts in front, per file.
+        prompt = GatewayInboundMixin._prepend_inbound_document_notes(event, event.text)
+        assert "text document: 'plan.md'. Its content has been included below" in prompt
+        assert "text document: 'huge.log'" in prompt and "Its content is not inlined here" in prompt
+        assert "document: 'paper.pdf'" in prompt and "extract the document's text yourself" in prompt
+    finally:
+        await phone.close()

@@ -75,6 +75,9 @@ MAX_TEXT_CHARS = 64000
 MAX_ATTACHMENTS = 20
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 MAX_PLACE_TEXT = 200
+# A text file this small is put into the message itself, as other channels do; larger ones and
+# binary files reach the agent as a path it reads.
+MAX_INLINE_TEXT_BYTES = 100 * 1024
 # What the phone may tell about an upload (layout before download), within sane bounds.
 MAX_MEDIA_SIDE = 100_000
 MAX_MEDIA_SECONDS = 7 * 24 * 3600
@@ -203,6 +206,23 @@ def _upload_hints(upload: dict[str, Any]) -> dict[str, Any]:
             and 0 <= duration <= MAX_MEDIA_SECONDS:
         hints["duration"] = round(float(duration), 3)
     return hints
+
+
+def _inline_text(path: str, name: str, mime: str, kind: str) -> Optional[str]:
+    """A small text file's content, to put into the message; None for anything else."""
+    from gateway.platforms.base import _TEXT_INJECT_EXTENSIONS
+    if kind != "file":
+        return None
+    ext = os.path.splitext(name or path)[1].lower()
+    if ext not in _TEXT_INJECT_EXTENSIONS and not mime.startswith("text/"):
+        return None
+    try:
+        if os.path.getsize(path) > MAX_INLINE_TEXT_BYTES:
+            return None
+        with open(path, "rb") as handle:
+            return handle.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _media_message_type(kind: str) -> MessageType:
@@ -721,16 +741,27 @@ class AlephAdapter(BasePlatformAdapter):
 
     async def _dispatch_user_message(self, message_id: str, text: str, attachments: list[dict[str, Any]],
                                      reply_to: Optional[str], location: Optional[dict[str, Any]] = None) -> None:
-        media_urls, media_types = [], []
+        media_urls, media_types, media_names, inlined, injected = [], [], [], [], []
         message_type = MessageType.TEXT
         for description in attachments:
             stored = await asyncio.to_thread(self.store.file, str(description.get("id")))
             if stored is None or not stored.agent_path:
                 continue
+            name = str(description.get("name") or "")
+            mime = str(description.get("mime") or "application/octet-stream")
             media_urls.append(stored.agent_path)
-            media_types.append(str(description.get("mime") or "application/octet-stream"))
+            media_types.append(mime)
+            media_names.append(name)
+            content = await asyncio.to_thread(_inline_text, stored.agent_path, name, mime,
+                                              str(description.get("kind") or "file"))
+            # The gateway words its note by this flag: "included below" only when it really is.
+            inlined.append(content is not None)
+            if content is not None:
+                injected.append(f"[Content of {name or 'the file'}]:\n{content}")
             if message_type == MessageType.TEXT:
                 message_type = _media_message_type(str(description.get("kind") or "file"))
+        if injected:
+            text = "\n\n".join(injected + ([text] if text.strip() else []))
         if location is not None:
             text = location_note(location, text)
             if message_type == MessageType.TEXT:
@@ -741,7 +772,8 @@ class AlephAdapter(BasePlatformAdapter):
         source = self.build_source(chat_id=self.chat_id, chat_name=CHAT_NAME, chat_type="dm",
                                    user_id=OWNER_ID, user_name=OWNER_NAME)
         event = MessageEvent(source=source, text=text, message_type=message_type, message_id=message_id,
-                             media_urls=media_urls, media_types=media_types)
+                             media_urls=media_urls, media_types=media_types, media_text_inlined=inlined,
+                             media_filenames=media_names)
         if reply_to:
             replied = await asyncio.to_thread(self.store.message, reply_to)
             if replied is not None:
