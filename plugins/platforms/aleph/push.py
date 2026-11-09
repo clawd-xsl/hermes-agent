@@ -27,7 +27,6 @@ ENVIRONMENTS = ("development", "production")
 # Apple accepts a provider token for an hour and rejects refreshing it more than every 20 minutes.
 JWT_MAX_AGE_SECONDS = 50 * 60
 EXPIRATION_SECONDS = 24 * 60 * 60
-THREAD_ID = "main"
 
 # Logged events that notify, and the generic body each one shows until the extension replaces it.
 BODY_MESSAGE = "New message"
@@ -53,17 +52,17 @@ def push_body_for(event_type: str, payload: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def build_payload(*, body: str, seq: int) -> dict[str, Any]:
+def build_payload(*, body: str, seq: int, chat: str) -> dict[str, Any]:
     """No title: the agent goes by the name the person gave it on the phone, which the server does
-    not know; the notification service extension sets it."""
+    not know; the notification service extension sets it. Notifications group by chat."""
     return {
         "aps": {
             "alert": {"body": body},
             "sound": "default",
             "mutable-content": 1,
-            "thread-id": THREAD_ID,
+            "thread-id": chat,
         },
-        "aleph": {"seq": seq},
+        "aleph": {"seq": seq, "chat": chat},
     }
 
 

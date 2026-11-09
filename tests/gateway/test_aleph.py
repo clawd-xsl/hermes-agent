@@ -143,7 +143,7 @@ async def test_unknown_keys_and_plain_frames_are_refused(adapter):
 async def test_hello_must_come_first_and_names_supported_protocols(adapter):
     phone = await _phone(adapter)
     try:
-        early = await phone.call("message.send", {"id": "m1", "text": "hi"})
+        early = await phone.call("message.send", {"chat": "main", "id": "m1", "text": "hi"})
         assert early["error"]["code"] == 4001
         wrong = await phone.call("hello", {"protocol": 9, "after": 0})
         assert wrong["error"]["code"] == -32602 and wrong["error"]["data"] == {"supported": [1]}
@@ -166,23 +166,23 @@ async def test_message_send_is_logged_echoed_dispatched_and_idempotent(adapter):
     phone = await _phone(adapter)
     try:
         await phone.hello()
-        first = await phone.call("message.send", {"id": "6F1C", "text": "Check the build"})
+        first = await phone.call("message.send", {"chat": "main", "id": "6F1C", "text": "Check the build"})
         assert first["result"] == {"seq": 1}
         echo = await phone.logged()
         assert echo["params"]["type"] == "message.new" and echo["params"]["seq"] == 1
         payload = echo["params"]["payload"]
         assert payload["id"] == "6F1C" and payload["sender"] == "user" and payload["text"] == "Check the build"
         assert payload["attachments"] == [] and "+" in payload["created_at"] or "-" in payload["created_at"][19:]
-        again = await phone.call("message.send", {"id": "6F1C", "text": "Check the build"})
+        again = await phone.call("message.send", {"chat": "main", "id": "6F1C", "text": "Check the build"})
         assert again["result"] == {"seq": 1}
         await asyncio.sleep(0.6)  # past the text-batch window
         handed = [event for event in adapter.received if event.message_id == "6F1C"]
         assert len(handed) == 1 and handed[0].text == "Check the build"
         assert handed[0].source.chat_id == "main" and handed[0].source.chat_type == "dm"
         assert handed[0].source.user_id == "owner"
-        bad = await phone.call("message.send", {"id": "", "text": "x"})
+        bad = await phone.call("message.send", {"chat": "main", "id": "", "text": "x"})
         assert bad["error"]["code"] == -32602
-        empty = await phone.call("message.send", {"id": "m-empty", "text": "  "})
+        empty = await phone.call("message.send", {"chat": "main", "id": "m-empty", "text": "  "})
         assert empty["error"]["code"] == -32602
     finally:
         await phone.close()
@@ -260,7 +260,7 @@ async def test_two_devices_both_receive_every_event(adapter):
     try:
         await a.hello()
         await b.hello()
-        await a.call("message.send", {"id": "x1", "text": "from a"})
+        await a.call("message.send", {"chat": "main", "id": "x1", "text": "from a"})
         for phone in (a, b):
             frame = await phone.logged()
             assert frame["params"]["payload"]["id"] == "x1"
@@ -283,7 +283,7 @@ async def test_draft_then_final_send_carries_the_draft_id(adapter):
         first, second = await phone.event(), await phone.event()
         assert first["params"]["type"] == "draft" and "seq" not in first["params"]
         draft_id = first["params"]["payload"]["draft_id"]
-        assert second["params"]["payload"] == {"draft_id": draft_id, "text": "Hello wor"}
+        assert second["params"]["payload"] == {"chat": "main", "draft_id": draft_id, "text": "Hello wor"}
         result = await adapter.send("main", "Hello world")
         assert result.success and result.message_id
         final = await phone.event()
@@ -312,7 +312,7 @@ async def test_abandoned_draft_is_cleared(adapter):
         await adapter.abandon_open_draft("main", "partial")
         cleared = await phone.event()
         assert cleared["params"] == {"type": "draft.clear",
-                                     "payload": {"draft_id": draft["params"]["payload"]["draft_id"]}}
+                                     "payload": {"chat": "main", "draft_id": draft["params"]["payload"]["draft_id"]}}
     finally:
         await phone.close()
 
@@ -346,7 +346,7 @@ async def test_edit_and_delete_agent_messages(adapter):
         assert (await adapter.edit_message("main", sent.message_id, "v2")).success
         edit = await phone.event()
         assert edit["params"]["type"] == "message.edit" and edit["params"]["payload"] == {
-            "id": sent.message_id, "text": "v2"}
+            "chat": "main", "id": sent.message_id, "text": "v2"}
         assert (await adapter.edit_message("main", sent.message_id, "v2")).success  # unchanged: no event
         assert await adapter.delete_message("main", sent.message_id)
         deleted = await phone.event()
@@ -376,10 +376,11 @@ async def test_typing_and_status_text_are_live(adapter):
         await adapter.stop_typing("main")
         frames = [f for f in [(await phone.event())["params"] for _ in range(6)] if f["type"] == "typing"]
         assert frames == [
-            {"type": "typing", "payload": {"active": True}},
-            {"type": "typing", "payload": {"active": True, "status": "Searching the web for flights to Tokyo…"}},
-            {"type": "typing", "payload": {"active": True}},
-            {"type": "typing", "payload": {"active": False}},
+            {"type": "typing", "payload": {"chat": "main", "active": True}},
+            {"type": "typing", "payload": {"chat": "main", "active": True,
+                                           "status": "Searching the web for flights to Tokyo…"}},
+            {"type": "typing", "payload": {"chat": "main", "active": True}},
+            {"type": "typing", "payload": {"chat": "main", "active": False}},
         ]
     finally:
         await phone.close()
@@ -393,7 +394,7 @@ async def test_phone_connecting_mid_turn_sees_typing_and_the_open_draft(adapter)
     try:
         await phone.hello()
         frames = [(await phone.event())["params"] for _ in range(2)]
-        assert frames[0] == {"type": "typing", "payload": {"active": True}}
+        assert frames[0] == {"type": "typing", "payload": {"chat": "main", "active": True}}
         assert frames[1]["type"] == "draft" and frames[1]["payload"]["text"] == "so far"
     finally:
         await phone.close()
@@ -417,11 +418,11 @@ async def test_receipts_follow_turns_including_queued_messages(adapter):
     phone = await _phone(adapter)
     try:
         await phone.hello()
-        await phone.call("message.send", {"id": "a", "text": "first"})
+        await phone.call("message.send", {"chat": "main", "id": "a", "text": "first"})
         frames = await phone.events_until("receipt")
         assert frames[-1]["payload"]["read_up_to"] == "a"
-        await phone.call("message.send", {"id": "b", "text": "second"})
-        await phone.call("message.send", {"id": "c", "text": "third"})
+        await phone.call("message.send", {"chat": "main", "id": "b", "text": "second"})
+        await phone.call("message.send", {"chat": "main", "id": "c", "text": "third"})
         echoes = [(await phone.logged())["params"] for _ in range(2)]
         assert [e["payload"]["id"] for e in echoes] == ["b", "c"]
         await asyncio.sleep(0.3)
@@ -440,7 +441,7 @@ async def test_receipts_follow_turns_including_queued_messages(adapter):
 @pytest.mark.asyncio
 async def test_internal_wakes_and_repeat_turns_send_no_receipt(adapter):
     source = SimpleNamespace(platform=adapter.platform, chat_id="main")
-    await adapter._accept_user_message({"id": "p0", "text": "hello"})
+    await adapter._accept_user_message({"chat": "main", "id": "p0", "text": "hello"})
     await asyncio.sleep(0.2)
     latest = adapter.store.latest()
     assert adapter.store.events_after(latest - 1)[0].type == "receipt"
@@ -452,7 +453,7 @@ async def test_internal_wakes_and_repeat_turns_send_no_receipt(adapter):
 @pytest.mark.asyncio
 async def test_receipt_watermark_survives_a_restart(adapter, tmp_path):
     from plugins.platforms.aleph.adapter import AlephAdapter
-    await adapter._accept_user_message({"id": "p1", "text": "hello"})
+    await adapter._accept_user_message({"chat": "main", "id": "p1", "text": "hello"})
     event = SimpleNamespace(internal=False, source=SimpleNamespace(platform=adapter.platform, chat_id="main"))
     await adapter.on_processing_start(event)
     await adapter.disconnect()
@@ -476,7 +477,7 @@ async def test_full_turn_through_the_base_adapter(adapter):
     phone = await _phone(adapter)
     try:
         await phone.hello()
-        await phone.call("message.send", {"id": "t1", "text": "ping"})
+        await phone.call("message.send", {"chat": "main", "id": "t1", "text": "ping"})
         seen = []
         while not any(e["type"] == "message.new" and e["payload"]["sender"] == "agent" for e in seen):
             seen.append((await phone.logged())["params"])
@@ -525,7 +526,7 @@ async def test_approval_card_round_trip(adapter, monkeypatch):
         assert calls == [("sk", "once", "req-1")]
         resolved = (await phone.event())["params"]
         assert resolved["type"] == "approval.resolved"
-        assert resolved["payload"] == {"request_id": "req-1", "choice": "once", "by": "user"}
+        assert resolved["payload"] == {"chat": "main", "request_id": "req-1", "choice": "once", "by": "user"}
         gone = await phone.call("approval.respond", {"request_id": "req-1", "choice": "once"})
         assert gone["error"]["code"] == -32602
     finally:
@@ -546,7 +547,7 @@ async def test_approval_settled_elsewhere_is_logged(adapter, monkeypatch):
         # The observer runs on the agent's thread when the wait times out.
         await asyncio.to_thread(observers[0], "timeout")
         resolved = (await phone.event())["params"]
-        assert resolved["payload"] == {"request_id": "req-2", "choice": None, "by": "timeout"}
+        assert resolved["payload"] == {"chat": "main", "request_id": "req-2", "choice": None, "by": "timeout"}
     finally:
         await phone.close()
 
@@ -586,13 +587,13 @@ async def test_clarify_card_round_trip(adapter, monkeypatch):
         await phone.hello()
         await adapter.send_clarify("main", "Which env?", ["staging", "prod"], "cl-1", "sk")
         request = (await phone.event())["params"]
-        assert request["payload"] == {"clarify_id": "cl-1", "question": "Which env?",
+        assert request["payload"] == {"chat": "main", "clarify_id": "cl-1", "question": "Which env?",
                                       "choices": ["staging", "prod"], "allows_text": True}
         assert (await phone.call("clarify.respond", {"clarify_id": "cl-1", "choice": 5}))["error"]["code"] == -32602
         assert (await phone.call("clarify.respond", {"clarify_id": "cl-1", "choice": 1}))["result"] == {}
         assert answers == [("cl-1", "prod")]
         resolved = (await phone.event())["params"]
-        assert resolved["payload"] == {"clarify_id": "cl-1", "answer": "prod", "by": "user"}
+        assert resolved["payload"] == {"chat": "main", "clarify_id": "cl-1", "answer": "prod", "by": "user"}
         await adapter.send_clarify("main", "Name?", None, "cl-2", "sk")
         await phone.event()
         assert (await phone.call("clarify.respond", {"clarify_id": "cl-2", "text": "Ada"}))["result"] == {}
@@ -603,7 +604,7 @@ async def test_clarify_card_round_trip(adapter, monkeypatch):
         await phone.event()
         await adapter.retire_clarify_card("cl-3", "expired")
         retired = (await phone.event())["params"]
-        assert retired["payload"] == {"clarify_id": "cl-3", "answer": None, "by": "timeout"}
+        assert retired["payload"] == {"chat": "main", "clarify_id": "cl-3", "answer": None, "by": "timeout"}
     finally:
         await phone.close()
 
@@ -613,7 +614,7 @@ async def test_chat_stop_dispatches_the_stop_command(adapter):
     phone = await _phone(adapter)
     try:
         await phone.hello()
-        assert (await phone.call("chat.stop"))["result"] == {}
+        assert (await phone.call("chat.stop", {"chat": "main"}))["result"] == {}
         await asyncio.sleep(0.1)
         assert [e.text for e in adapter.received] == ["/stop"]
         assert adapter.store.latest() == 0  # not logged as a message

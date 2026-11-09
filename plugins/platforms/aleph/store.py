@@ -1,9 +1,9 @@
-"""Aleph's durable state: the append-only event log, message index, file registry, paired devices
-(by their static X25519 public key), the pending pairing secret, and the server's static key.
+"""Aleph's durable state: the append-only event log, message index, chats, file registry, paired
+devices (by their static X25519 public key), the pending pairing secret, and the server's static key.
 
-One SQLite file under ``$HERMES_HOME/aleph/``. The log is what a phone replays after ``hello``;
-``seq`` is assigned here and increases by exactly one per logged event, so a gap on the phone means a
-missed event. Methods are synchronous and thread-safe (one connection behind a lock); the adapter
+One SQLite file under ``$HERMES_HOME/aleph/``. The log is what a phone replays after ``hello``, one log
+for all chats; ``seq`` is assigned here and increases by exactly one per logged event. Deleting a side
+chat takes its events out of the log, so a replay may skip the seqs it had. Methods are synchronous and thread-safe (one connection behind a lock); the adapter
 calls them through ``asyncio.to_thread`` under its own append lock, which also fixes the order in
 which events are broadcast.
 
@@ -25,20 +25,37 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+# The conversation's layout. A store written under another one is not converted: its conversation
+# (events, messages, chats, steps and their files) is dropped, keeping pairings and the agent's profile.
+SCHEMA_VERSION = "2"
+_CONVERSATION_TABLES = ("events", "messages", "chats", "activity")
+_META = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     seq INTEGER PRIMARY KEY,
     type TEXT NOT NULL,
+    chat TEXT,
     payload TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS events_chat ON events (chat);
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     seq INTEGER NOT NULL,
+    chat TEXT NOT NULL,
     sender TEXT NOT NULL,
     kind TEXT NOT NULL,
     text TEXT NOT NULL,
     attachments TEXT NOT NULL,
     dispatched INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS messages_chat ON messages (chat, seq);
+CREATE TABLE IF NOT EXISTS chats (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    created_at TEXT NOT NULL,
+    created_seq INTEGER NOT NULL,
+    last_active_at REAL NOT NULL,
+    deleted_seq INTEGER
 );
 CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
@@ -63,6 +80,7 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS activity (
     rowid INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
+    chat TEXT NOT NULL,
     step TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS pairing (
@@ -115,11 +133,30 @@ class LoggedEvent:
 class StoredMessage:
     id: str
     seq: int
+    chat: str
     sender: str
     kind: str
     text: str
     attachments: list[dict[str, Any]]
     dispatched: bool
+
+
+@dataclass(frozen=True)
+class Chat:
+    """A side chat (``main`` is not stored: it always exists)."""
+    id: str
+    title: Optional[str]
+    created_at: str
+    created_seq: int
+    last_active_at: float
+    deleted_seq: Optional[int]
+
+
+_CHAT_COLUMNS = "id, title, created_at, created_seq, last_active_at, deleted_seq"
+
+
+def _chat(row) -> Chat:
+    return Chat(row[0], row[1], row[2], int(row[3]), float(row[4]), int(row[5]) if row[5] is not None else None)
 
 
 @dataclass(frozen=True)
@@ -151,7 +188,7 @@ def _device(row) -> Device:
 
 
 class AlephStore:
-    """The chat's log. ``history_limit`` bounds how many events are kept; older ones are pruned and
+    """The chats' log. ``history_limit`` bounds how many events are kept; older ones are pruned and
     a ``hello`` asking for them gets ``reset: true``."""
 
     def __init__(self, root: Path, *, history_limit: int = 20000) -> None:
@@ -165,7 +202,25 @@ class AlephStore:
         self._db.execute("PRAGMA busy_timeout=5000")
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
-        self._db.executescript(_SCHEMA)
+        with self._lock:
+            self._db.executescript(_META)
+            if self._meta_locked("schema") != SCHEMA_VERSION:
+                self._drop_conversation_locked()
+            self._db.executescript(_SCHEMA)
+            self._set_meta_locked("schema", SCHEMA_VERSION)
+
+    def _drop_conversation_locked(self) -> None:
+        """Start the conversation over (a store from another layout): phones that knew it get
+        ``reset: true``. Pairings, the server key and the agent's profile stay."""
+        for table in _CONVERSATION_TABLES:
+            self._db.execute(f"DROP TABLE IF EXISTS {table}")
+        avatar = self._meta_locked("profile_avatar") or ""
+        exists = self._db.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'files'").fetchone()
+        if exists is not None:
+            for file_id, path in self._db.execute("SELECT id, path FROM files WHERE id != ?", (avatar,)).fetchall():
+                Path(path).unlink(missing_ok=True)
+            self._db.execute("DELETE FROM files WHERE id != ?", (avatar,))
+        self._db.execute("DELETE FROM meta WHERE key NOT LIKE 'profile_%'")
 
     def close(self) -> None:
         with self._lock:
@@ -178,37 +233,51 @@ class AlephStore:
             return self._latest_locked()
 
     def _latest_locked(self) -> int:
+        # A log that lost its newest events (pruned, or a deleted chat's) keeps counting from where
+        # it was, so seq never repeats.
         row = self._db.execute("SELECT MAX(seq) FROM events").fetchone()
-        if row[0] is not None:
-            return int(row[0])
-        # An emptied log keeps counting from where it was, so seq never repeats.
-        return int(self._meta_locked("seq_floor") or 0)
+        return max(int(row[0] or 0), int(self._meta_locked("seq_floor") or 0))
 
     def oldest(self) -> Optional[int]:
         with self._lock:
             row = self._db.execute("SELECT MIN(seq) FROM events").fetchone()
             return int(row[0]) if row[0] is not None else None
 
+    def pruned_through(self) -> int:
+        """The newest seq pruned for age: a phone that stored less has missed what it cannot get
+        back. (A deleted chat's events are gone too, but deliberately: that is no reset.)"""
+        with self._lock:
+            return int(self._meta_locked("pruned_through") or 0)
+
     def append(self, event_type: str, payload: dict[str, Any], *,
                message: Optional[dict[str, Any]] = None) -> LoggedEvent:
-        """Log one event (and index the message it records) atomically; returns it with its seq."""
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        """Log one event (and index the message it records) atomically; returns it with its seq. The
+        event's chat is its payload's ``chat``."""
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                seq = self._latest_locked() + 1
-                self._db.execute("INSERT INTO events (seq, type, payload) VALUES (?, ?, ?)", (seq, event_type, body))
-                if message is not None:
-                    self._db.execute(
-                        "INSERT INTO messages (id, seq, sender, kind, text, attachments, dispatched) "
-                        "VALUES (?, ?, ?, ?, ?, ?, 0)",
-                        (message["id"], seq, message["sender"], message.get("kind") or "text",
-                         message.get("text") or "", json.dumps(message.get("attachments") or [])))
-                self._prune_locked(seq)
+                event = self._append_locked(event_type, payload, message)
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
+        return event
+
+    def _append_locked(self, event_type: str, payload: dict[str, Any],
+                       message: Optional[dict[str, Any]] = None) -> LoggedEvent:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        chat = payload.get("chat")
+        seq = self._latest_locked() + 1
+        self._db.execute("INSERT INTO events (seq, type, chat, payload) VALUES (?, ?, ?, ?)",
+                         (seq, event_type, chat, body))
+        if message is not None:
+            self._db.execute(
+                "INSERT INTO messages (id, seq, chat, sender, kind, text, attachments, dispatched) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                (message["id"], seq, chat, message["sender"], message.get("kind") or "text",
+                 message.get("text") or "", json.dumps(message.get("attachments") or [])))
+            self._db.execute("UPDATE chats SET last_active_at = ? WHERE id = ?", (time.time(), chat))
+        self._prune_locked(seq)
         return LoggedEvent(seq, event_type, payload)
 
     def _prune_locked(self, latest: int) -> None:
@@ -218,6 +287,7 @@ class AlephStore:
         if oldest is not None and cutoff - int(oldest) >= self.history_limit // 10:
             self._db.execute("DELETE FROM events WHERE seq <= ?", (cutoff,))
             self._set_meta_locked("seq_floor", str(latest))
+            self._set_meta_locked("pruned_through", str(cutoff))
 
     def events_after(self, after: int, *, until: Optional[int] = None) -> list[LoggedEvent]:
         query, args = "SELECT seq, type, payload FROM events WHERE seq > ?", [int(after)]
@@ -233,11 +303,11 @@ class AlephStore:
     def message(self, message_id: str) -> Optional[StoredMessage]:
         with self._lock:
             row = self._db.execute(
-                "SELECT id, seq, sender, kind, text, attachments, dispatched FROM messages WHERE id = ?",
+                "SELECT id, seq, chat, sender, kind, text, attachments, dispatched FROM messages WHERE id = ?",
                 (message_id,)).fetchone()
         if row is None:
             return None
-        return StoredMessage(row[0], int(row[1]), row[2], row[3], row[4], json.loads(row[5]), bool(row[6]))
+        return StoredMessage(row[0], int(row[1]), row[2], row[3], row[4], row[5], json.loads(row[6]), bool(row[7]))
 
     def mark_dispatched(self, message_id: str) -> None:
         with self._lock:
@@ -251,16 +321,90 @@ class AlephStore:
         with self._lock:
             self._db.execute("DELETE FROM messages WHERE id = ?", (message_id,))
 
-    def user_message_ids(self, limit: int) -> list[str]:
-        """The person's most recent message ids, newest first."""
+    def user_message_ids(self, chat: str, limit: int) -> list[str]:
+        """The person's most recent message ids in a chat, newest first."""
         with self._lock:
-            rows = self._db.execute("SELECT id FROM messages WHERE sender = 'user' ORDER BY seq DESC LIMIT ?",
-                                    (limit,)).fetchall()
+            rows = self._db.execute("SELECT id FROM messages WHERE chat = ? AND sender = 'user' "
+                                    "ORDER BY seq DESC LIMIT ?", (chat, limit)).fetchall()
         return [row[0] for row in rows]
 
     def user_message_seq(self, message_id: str) -> Optional[int]:
         message = self.message(message_id)
         return message.seq if message is not None and message.sender == "user" else None
+
+    # ── chats ──────────────────────────────────────────────────────────────────────────────────
+
+    def chat(self, chat_id: str) -> Optional[Chat]:
+        with self._lock:
+            row = self._db.execute(f"SELECT {_CHAT_COLUMNS} FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        return _chat(row) if row is not None else None
+
+    def chats(self) -> list[Chat]:
+        """The side chats that exist (not deleted), oldest first."""
+        with self._lock:
+            rows = self._db.execute(f"SELECT {_CHAT_COLUMNS} FROM chats WHERE deleted_seq IS NULL "
+                                    "ORDER BY created_seq").fetchall()
+        return [_chat(row) for row in rows]
+
+    def create_chat(self, chat_id: str, title: Optional[str], created_at: str) -> tuple[Chat, Optional[LoggedEvent]]:
+        """Open a side chat and log its ``chat.new``, atomically; one that exists (or existed) is
+        returned as it is, with no event."""
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(f"SELECT {_CHAT_COLUMNS} FROM chats WHERE id = ?", (chat_id,)).fetchone()
+                event = None
+                if row is None:
+                    event = self._append_locked("chat.new", {"chat": chat_id, "title": title, "created_at": created_at})
+                    self._db.execute("INSERT INTO chats (id, title, created_at, created_seq, last_active_at) "
+                                     "VALUES (?, ?, ?, ?, ?)", (chat_id, title, created_at, event.seq, time.time()))
+                    row = self._db.execute(f"SELECT {_CHAT_COLUMNS} FROM chats WHERE id = ?", (chat_id,)).fetchone()
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return _chat(row), event
+
+    def set_chat_title(self, chat_id: str, title: str) -> None:
+        with self._lock:
+            self._db.execute("UPDATE chats SET title = ? WHERE id = ?", (title, chat_id))
+
+    def idle_chats(self, before: float) -> list[str]:
+        """Side chats nobody has written in since ``before`` (a time)."""
+        with self._lock:
+            rows = self._db.execute("SELECT id FROM chats WHERE deleted_seq IS NULL AND last_active_at < ?",
+                                    (before,)).fetchall()
+        return [row[0] for row in rows]
+
+    def delete_chat(self, chat_id: str) -> LoggedEvent:
+        """Drop a side chat's events, messages, steps and files, and log ``chat.delete``, atomically.
+        The chat is remembered as deleted (its id is not reused)."""
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                file_ids = []
+                for (attachments,) in self._db.execute("SELECT attachments FROM messages WHERE chat = ?", (chat_id,)):
+                    file_ids += [str(item.get("id")) for item in json.loads(attachments) if isinstance(item, dict)]
+                paths = []
+                for file_id in file_ids:
+                    row = self._db.execute("SELECT path FROM files WHERE id = ?", (file_id,)).fetchone()
+                    if row is not None:
+                        paths.append(row[0])
+                        self._db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+                self._set_meta_locked("seq_floor", str(self._latest_locked()))
+                for table in ("events", "messages", "activity"):
+                    self._db.execute(f"DELETE FROM {table} WHERE chat = ?", (chat_id,))
+                for key in (f"last_user_message:{chat_id}", f"last_receipt:{chat_id}"):
+                    self._db.execute("DELETE FROM meta WHERE key = ?", (key,))
+                event = self._append_locked("chat.delete", {"chat": chat_id})
+                self._db.execute("UPDATE chats SET deleted_seq = ? WHERE id = ?", (event.seq, chat_id))
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        for path in paths:
+            Path(path).unlink(missing_ok=True)
+        return event
 
     # ── files ──────────────────────────────────────────────────────────────────────────────────
 
@@ -395,8 +539,8 @@ class AlephStore:
     def add_step(self, step: dict[str, Any], *, keep: int = 500) -> None:
         """Record an activity step; only the most recent ``keep`` are kept (not in the event log)."""
         with self._lock:
-            self._db.execute("INSERT INTO activity (id, step) VALUES (?, ?)",
-                             (step["id"], json.dumps(step, ensure_ascii=False)))
+            self._db.execute("INSERT INTO activity (id, chat, step) VALUES (?, ?, ?)",
+                             (step["id"], step["chat"], json.dumps(step, ensure_ascii=False)))
             self._db.execute("DELETE FROM activity WHERE rowid <= (SELECT MAX(rowid) FROM activity) - ?", (keep,))
 
     def update_step(self, step: dict[str, Any]) -> None:
@@ -404,19 +548,24 @@ class AlephStore:
             self._db.execute("UPDATE activity SET step = ? WHERE id = ?",
                              (json.dumps(step, ensure_ascii=False), step["id"]))
 
-    def steps(self, *, before: Optional[str] = None, limit: int = 50) -> tuple[list[dict[str, Any]], bool]:
-        """The most recent steps, newest first, older than ``before`` (a step id) when given; and
-        whether there are more."""
+    def steps(self, *, chat: Optional[str] = None, before: Optional[str] = None,
+              limit: int = 50) -> tuple[list[dict[str, Any]], bool]:
+        """The most recent steps (of one chat, or all), newest first, older than ``before`` (a step
+        id) when given; and whether there are more."""
+        where, args = [], []
         with self._lock:
             if before:
                 row = self._db.execute("SELECT rowid FROM activity WHERE id = ?", (before,)).fetchone()
                 if row is None:
                     return [], False
-                rows = self._db.execute("SELECT step FROM activity WHERE rowid < ? ORDER BY rowid DESC LIMIT ?",
-                                        (row[0], limit + 1)).fetchall()
-            else:
-                rows = self._db.execute("SELECT step FROM activity ORDER BY rowid DESC LIMIT ?",
-                                        (limit + 1,)).fetchall()
+                where.append("rowid < ?")
+                args.append(row[0])
+            if chat is not None:
+                where.append("chat = ?")
+                args.append(chat)
+            clause = f"WHERE {' AND '.join(where)} " if where else ""
+            rows = self._db.execute(f"SELECT step FROM activity {clause}ORDER BY rowid DESC LIMIT ?",
+                                    (*args, limit + 1)).fetchall()
         return [json.loads(r[0]) for r in rows[:limit]], len(rows) > limit
 
     # ── meta ───────────────────────────────────────────────────────────────────────────────────

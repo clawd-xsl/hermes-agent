@@ -1,14 +1,15 @@
 # Aleph
 
 Aleph is a personal iOS app that talks to Hermes as a messaging channel, the way Telegram or Signal do, but
-directly: the plugin (`plugins/platforms/aleph/`) runs its own listener and the phone connects to it. There
-is one conversation, chat `main`, and it is meant to be the gateway's **home channel**, so `session: main`
-cron jobs and webhooks land in it.
+directly: the plugin (`plugins/platforms/aleph/`) runs its own listener and the phone connects to it. The
+conversation is the main chat, `main`, meant to be the gateway's **home channel** (so `session: main` cron
+jobs and webhooks land in it), and the side chats the person opens beside it.
 
 What the channel gives the phone:
 
-- a durable, replayable history: every message, edit, deletion, receipt and card is logged with a `seq`, and a
-  phone that was offline catches up from the last `seq` it stored;
+- a durable, replayable history: every message, edit, deletion, receipt and card is logged with a `seq`, all
+  chats in one log, and a phone that was offline catches up from the last `seq` it stored;
+- side chats: a quick question beside the main conversation, each in a Hermes session of its own;
 - streaming drafts of the reply, typing with a status line ("is running …"), and read receipts (two checks
   once a turn that includes the person's messages starts);
 - the agent's activity out of the thread: one line saying what it is doing, and a history of its steps;
@@ -196,12 +197,30 @@ Without all four, the channel works and pushes nothing; the gateway log says `pu
   person is looking at the app (`presence`). A device with the app in the foreground gets no push.
 - Pushed: the agent's messages (files included), approval requests and questions. Not pushed: tool rows,
   system notices, the person's own messages, drafts and typing.
-- The push carries only a generic line ("New message", "Approval needed", "Question") and the event's
-  `seq`, and no title: the agent goes by the name given to it on the phone, which the server does not
+- The push carries only a generic line ("New message", "Approval needed", "Question"), the event's `seq`
+  and its chat (also the `thread-id`, so notifications group by chat), and no title: the agent goes by the name given to it on the phone, which the server does not
   know, so the app's notification extension sets the title. Debug builds use the APNs sandbox, release builds production; Apple calls go straight from this
   machine, not through the tunnel.
 - A token Apple rejects (`410`, or `400 BadDeviceToken`) is dropped. Pushing never delays delivery over the
   WebSocket.
+
+## Side chats
+
+The person can open a chat beside the main one (`chat.create`), to ask something quickly without taking the
+main conversation elsewhere. A side chat is the same agent, with its memory, skills, profile and tools, but
+a Hermes session of its own: the plugin hands the gateway its messages with the side chat's id as the
+source's `chat_id` (a DM), so the gateway keys a session for it. The main chat's conversation is not in it.
+
+- Every event about a chat names it in `chat`: messages, receipts, cards, reactions, drafts, typing and
+  activity. Replies, drafts and typing go back to the chat the gateway names; scheduled jobs and webhooks
+  go to `main`.
+- Hermes's session titles name a side chat: the quick title from its opening message and then the model's,
+  each logged as `chat.update` (the gateway calls the adapter's `on_session_title`). `main` has no title.
+- Deleting a side chat (`chat.delete`, from the phone; the agent cannot) ends its session, as `/new` would,
+  and drops its events, messages, steps and files from the server. What the gateway still sends there goes
+  nowhere. `main` cannot be deleted.
+- A side chat nobody has written in for 30 days is deleted the same way (`side_chat_idle_days`; `0` keeps
+  them).
 
 ## Activity
 
@@ -295,10 +314,11 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_APNS_TOPIC` | | The app's bundle id |
 | `ALEPH_HOME_CHANNEL` | `main` | Home channel; `off` leaves the home to another platform |
 | `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` |
+| `ALEPH_SIDE_CHAT_IDLE_DAYS` | `30` | Days after which a side chat nobody has written in is deleted; `0` keeps them |
 | `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`), and encrypted files |
 
 The same keys can be set under `platforms.aleph.extra` in `config.yaml` (`host`, `port`, `public_url`, `access_id`, `access_secret`,
-`apns_key_file`, `apns_key_id`, `apns_team_id`, `apns_topic`, `history_limit`, `state_dir`); environment
+`apns_key_file`, `apns_key_id`, `apns_team_id`, `apns_topic`, `history_limit`, `side_chat_idle_days`, `state_dir`); environment
 variables win.
 
 ## Endpoints

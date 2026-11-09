@@ -103,8 +103,10 @@ def describe(tool: str, args: Optional[dict[str, Any]], *,
     return name, _clip(_redact(summary), MAX_SUMMARY_CHARS), _clip_block(detail, MAX_DETAIL_CHARS) if detail else None
 
 
-def new_step(turn: Optional[str], tool: str, summary: str, detail: Optional[str], started_at: str) -> dict[str, Any]:
-    step: dict[str, Any] = {"id": f"a_{secrets.token_hex(8)}", "turn": turn, "tool": tool, "summary": summary}
+def new_step(chat: str, turn: Optional[str], tool: str, summary: str, detail: Optional[str],
+             started_at: str) -> dict[str, Any]:
+    step: dict[str, Any] = {"id": f"a_{secrets.token_hex(8)}", "chat": chat, "turn": turn, "tool": tool,
+                            "summary": summary}
     if detail:
         step["detail"] = detail
     step.update({"started_at": started_at, "finished_at": None, "ok": None})

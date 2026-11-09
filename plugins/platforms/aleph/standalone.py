@@ -13,7 +13,7 @@ from tools.send_message_senders import _error, _live_adapter, _success
 
 logger = logging.getLogger(__name__)
 
-NO_LIVE_GATEWAY_ERROR = ("Aleph delivery needs the running gateway: its adapter owns the chat's event log. "
+NO_LIVE_GATEWAY_ERROR = ("Aleph delivery needs the running gateway: its adapter owns the chats' event log. "
                          "Start the gateway (or run the job inside it) and retry.")
 
 

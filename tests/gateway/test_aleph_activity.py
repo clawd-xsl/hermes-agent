@@ -107,24 +107,24 @@ async def test_a_step_starts_and_finishes_as_live_events_and_drives_the_status_l
     phone = await connect(adapter, adapter.keys)
     try:
         await phone.hello()
-        adapter._last_user_message = "m-1"  # the person's message this turn answers
+        adapter._last_user_message["main"] = "m-1"  # the person's message this turn answers
         await adapter.on_processing_start(_turn())
         await adapter.send_typing("main")
         latest = adapter.store.latest()
         await _tool(adapter, "tool.started", "web_search", {"query": "flights to Tokyo"})
         (started,) = await _live(phone)
-        assert started["turn"] == "m-1" and started["tool"] == "web_search"
+        assert started["chat"] == "main" and started["turn"] == "m-1" and started["tool"] == "web_search"
         assert started["summary"] == "Searching the web for flights to Tokyo"
         assert started["detail"] == "flights to Tokyo" and started["finished_at"] is None and started["ok"] is None
         (typing,) = await _live(phone, "typing")
         while typing.get("status") is None:
             (typing,) = await _live(phone, "typing")
-        assert typing == {"active": True, "status": "Searching the web for flights to Tokyo…"}
+        assert typing == {"chat": "main", "active": True, "status": "Searching the web for flights to Tokyo…"}
         await _tool(adapter, "tool.completed", "web_search", is_error=True)
         (finished,) = await _live(phone)
         assert finished["id"] == started["id"] and finished["finished_at"] and finished["ok"] is False
         (typing,) = await _live(phone, "typing")
-        assert typing == {"active": True}  # null between tools: the phone shows "Thinking…"
+        assert typing == {"chat": "main", "active": True}  # null between tools: the phone shows "Thinking…"
         assert adapter.store.latest() == latest  # steps are not in the event log
     finally:
         await phone.close()
@@ -228,7 +228,7 @@ def test_only_the_most_recent_steps_are_kept(tmp_path):
     store = AlephStore(tmp_path)
     try:
         for n in range(6):
-            store.add_step({"id": f"a_{n}", "turn": None, "tool": "t", "summary": "s", "started_at": "x",
+            store.add_step({"id": f"a_{n}", "chat": "main", "turn": None, "tool": "t", "summary": "s", "started_at": "x",
                             "finished_at": None, "ok": None}, keep=4)
         steps, more = store.steps(limit=10)
         assert [s["id"] for s in steps] == ["a_5", "a_4", "a_3", "a_2"] and more is False

@@ -239,7 +239,7 @@ async def test_frames_larger_than_64k_go_both_ways(adapter):
     phone = await _phone(adapter, keys)
     try:
         text = "é" * 60_000  # 120 KB of UTF-8, under the 64,000-character text limit
-        assert "result" in await phone.call("message.send", {"id": "big", "text": text})
+        assert "result" in await phone.call("message.send", {"chat": "main", "id": "big", "text": text})
         echo = (await phone.logged())["params"]["payload"]
         assert echo["text"] == text
     finally:

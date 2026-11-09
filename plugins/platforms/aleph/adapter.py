@@ -1,8 +1,10 @@
 """Aleph platform adapter: the iOS app as a Hermes messaging channel.
 
-One chat (``main``, a DM) between one person and the agent, spoken over Aleph's own WebSocket
-protocol (Aleph repo, ``docs/protocol.md``). Everything that changes the thread is logged with a
-per-chat ``seq`` so a phone that was offline catches up; drafts and typing are live only.
+A direct conversation between one person and the agent, spoken over Aleph's own WebSocket protocol
+(Aleph repo, ``docs/protocol.md``): the main chat (``main``, the home channel) and side chats the person
+opens beside it, each a DM with a ``chat_id`` of its own, so a Hermes session of its own. Everything
+that changes a thread is logged, all chats in one log with one ``seq``, so a phone that was offline
+catches up; drafts and typing are live only. Every event about a chat names it (``chat``).
 
 Map onto the base adapter:
 
@@ -13,7 +15,9 @@ Map onto the base adapter:
 - ``send_typing`` / ``stop_typing`` / status text -> live ``typing``;
 - ``_send_exec_approval_prompt`` / ``send_clarify`` -> ``approval.request`` / ``clarify.request``;
 - ``send_image_file`` / ``send_document`` / ``send_voice`` / ``send_video`` -> attachments;
-- ``on_processing_start`` -> ``receipt`` (the turn that takes the person's messages has started).
+- ``on_processing_start`` -> ``receipt`` (the turn that takes the person's messages has started);
+- ``chat.create`` / ``chat.delete`` -> a side chat opened, or ended (``/new``) and dropped;
+- ``on_session_title`` -> ``chat.update`` (a side chat's session titles).
 
 Everything to and from the phone is end-to-end encrypted with Noise (``noise.py``): a device pairs
 once by scanning a QR code (``hermes aleph pair``, then the ``/aleph/v1/pair`` handshake) and is known
@@ -25,6 +29,7 @@ active (protocol "Push"); pushing never holds up logging or delivery.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -54,13 +59,18 @@ from plugins.platforms.aleph.push import (
     BODY_MESSAGE, ENVIRONMENTS, ApnsConfig, ApnsSender, build_payload, push_body_for)
 from plugins.platforms.aleph.server import (
     INVALID_PARAMS, METHOD_NOT_FOUND, AlephServer, Connection, RpcError, event_frame)
-from plugins.platforms.aleph.store import AlephStore, Device, LoggedEvent, load_or_create_server_key
+from plugins.platforms.aleph.store import AlephStore, Chat, Device, LoggedEvent, load_or_create_server_key
 
 logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "aleph"
-CHAT_ID = "main"
+CHAT_ID = "main"  # the main chat: the home channel, always there
 CHAT_NAME = "Aleph"
+MAX_CHAT_ID = 128
+MAX_CHAT_TITLE = 200
+# A side chat nobody has written in for this long is deleted (``side_chat_idle_days``; 0 keeps them).
+DEFAULT_SIDE_CHAT_IDLE_DAYS = 30
+IDLE_SWEEP_SECONDS = 3600
 # Every paired device is the owner's: every inbound message is from this one sender.
 OWNER_ID = "owner"
 # The agent's name until it picks its own with the ``aleph_set_profile`` tool (protocol "Agent profile").
@@ -266,12 +276,20 @@ class AlephAdapter(BasePlatformAdapter):
         self.host = str(extra_or_secret(extra, "host", "ALEPH_HOST", DEFAULT_HOST) or DEFAULT_HOST).strip()
         self.port = self._int_setting(extra, "port", "ALEPH_PORT", DEFAULT_PORT)
         self.history_limit = self._int_setting(extra, "history_limit", "ALEPH_HISTORY_LIMIT", DEFAULT_HISTORY_LIMIT)
+        self.side_chat_idle_days = self._int_setting(extra, "side_chat_idle_days", "ALEPH_SIDE_CHAT_IDLE_DAYS",
+                                                     DEFAULT_SIDE_CHAT_IDLE_DAYS)
         self.state_dir = resolve_state_dir(extra)
         self.apns_config = apns_config(extra)
         self._push: Optional[ApnsSender] = None
         self._push_tasks: set[asyncio.Task] = set()
         self._push_problems_reported: set[tuple[str, str]] = set()
         self._device_watch: Optional[asyncio.Task] = None
+        self._idle_sweep: Optional[asyncio.Task] = None
+        # The side chats that exist (``main`` always does), and those deleted while running: what the
+        # gateway still sends them (the /new that ended the session, a late reply) goes nowhere.
+        self._chats: dict[str, Chat] = {}
+        self._deleted_chats: set[str] = set()
+        self._chat_lock = asyncio.Lock()
         self._last_seen: dict[str, float] = {}
         self.static: Optional[noise.KeyPair] = None
         # What the handshakes may consult before anyone is authenticated: memory only.
@@ -289,9 +307,9 @@ class AlephAdapter(BasePlatformAdapter):
         self._turn_message: dict[str, Optional[str]] = {}
         self._open_steps: dict[str, list[tuple[str, dict[str, Any]]]] = {}  # chat -> [(raw tool, step)]
         self._activity_status: dict[str, Optional[str]] = {}
-        # The person's reactions since their last message: message id -> emoji, oldest first. They
-        # reach the agent in front of the next message (protocol "Reactions").
-        self._pending_reactions: dict[str, str] = {}
+        # The person's reactions since their last message in each chat: chat -> {message id -> emoji},
+        # oldest first. They reach the agent in front of the next message there (protocol "Reactions").
+        self._pending_reactions: dict[str, dict[str, str]] = {}
         self._dedup = MessageDeduplicator(max_size=5000, ttl_seconds=3600)
         self._store: Optional[AlephStore] = None
         self._server: Optional[AlephServer] = None
@@ -306,9 +324,10 @@ class AlephAdapter(BasePlatformAdapter):
         # Cards awaiting an answer.
         self._approvals: dict[str, dict[str, Any]] = {}
         self._clarifies: dict[str, dict[str, Any]] = {}
-        # Receipt watermark: the newest of the person's messages handed to the gateway.
-        self._last_user_message: Optional[str] = None
-        self._last_receipt: Optional[str] = None
+        # Receipt watermarks, per chat: the newest of the person's messages handed to the gateway, and
+        # the newest a receipt covered.
+        self._last_user_message: dict[str, str] = {}
+        self._last_receipt: dict[str, str] = {}
 
     @staticmethod
     def _int_setting(extra: dict, key: str, env: str, default: int) -> int:
@@ -340,11 +359,17 @@ class AlephAdapter(BasePlatformAdapter):
             return False
         self._tickets = TicketBook(self._store.files_dir / "uploads")
         await self._reload_devices()
-        self._last_user_message = await asyncio.to_thread(self._store.meta, "last_user_message")
-        self._last_receipt = await asyncio.to_thread(self._store.meta, "last_receipt")
+        self._chats = {chat.id: chat for chat in await asyncio.to_thread(self._store.chats)}
+        self._last_user_message, self._last_receipt = {}, {}
+        for chat in (CHAT_ID, *self._chats):
+            for marks, key in ((self._last_user_message, "last_user_message"), (self._last_receipt, "last_receipt")):
+                value = await asyncio.to_thread(self._store.meta, f"{key}:{chat}")
+                if value:
+                    marks[chat] = value
         await self._load_profile()
         try:
-            self._pending_reactions = json.loads(await asyncio.to_thread(self._store.meta, "pending_reactions") or "{}")
+            pending = json.loads(await asyncio.to_thread(self._store.meta, "pending_reactions") or "{}")
+            self._pending_reactions = pending if isinstance(pending, dict) else {}
         except ValueError:
             self._pending_reactions = {}
         self._server = AlephServer(self, host=self.host, port=self.port, static=self.static)
@@ -363,14 +388,18 @@ class AlephAdapter(BasePlatformAdapter):
         logger.info("Aleph: %d paired device(s); push %s", len(devices),
                     f"on ({self.apns_config.topic})" if self._push else "off")
         self._device_watch = asyncio.create_task(self._watch_devices())
+        if self.side_chat_idle_days > 0:
+            self._idle_sweep = asyncio.create_task(self._sweep_idle_chats())
         self._mark_connected(listener_base=f"http://{self.host}:{port}")
         return True
 
     async def disconnect(self) -> None:
         server, store, push, watch = self._server, self._store, self._push, self._device_watch
+        sweep, self._idle_sweep = self._idle_sweep, None
         self._server = self._store = self._push = self._device_watch = None
-        if watch is not None:
-            watch.cancel()
+        for task in (watch, sweep):
+            if task is not None:
+                task.cancel()
         for task in list(self._push_tasks):
             task.cancel()
         if push is not None:
@@ -395,10 +424,14 @@ class AlephAdapter(BasePlatformAdapter):
         ``push_body``, regardless of its kind)."""
         async with self.append_lock:
             event = await asyncio.to_thread(self.store.append, event_type, payload, message=message)
-            if self._server is not None:
-                self._server.broadcast(event_frame(event.type, event.payload, event.seq))
+            self._broadcast(event)
         self._schedule_push(event, push_body)
         return event
+
+    def _broadcast(self, event: LoggedEvent) -> None:
+        """Under ``append_lock``: a logged event to every connected phone."""
+        if self._server is not None:
+            self._server.broadcast(event_frame(event.type, event.payload, event.seq))
 
     # ── devices ────────────────────────────────────────────────────────────────────────────────
 
@@ -441,8 +474,8 @@ class AlephAdapter(BasePlatformAdapter):
         logger.info("Aleph: paired %s (%s, %s)", device.name, device.model or "unknown model", device.id)
         message_id = str(uuid.uuid4())
         text = f"New device paired: {device.name}"
-        await self._log("message.new", {"id": message_id, "sender": "agent", "text": text, "attachments": [],
-                                        "created_at": now_iso(), "kind": "system"},
+        await self._log("message.new", {"chat": CHAT_ID, "id": message_id, "sender": "agent", "text": text,
+                                        "attachments": [], "created_at": now_iso(), "kind": "system"},
                         message={"id": message_id, "sender": "agent", "kind": "system", "text": text,
                                  "attachments": []},
                         push_body=BODY_MESSAGE)
@@ -514,7 +547,7 @@ class AlephAdapter(BasePlatformAdapter):
             targets = [d for d in devices if d.push_token and d.id not in active]
             if not targets:
                 return
-            payload = build_payload(body=body, seq=event.seq)
+            payload = build_payload(body=body, seq=event.seq, chat=str(event.payload.get("chat") or CHAT_ID))
             results = await asyncio.gather(
                 *(sender.send(d.push_token, d.push_environment or "production", payload) for d in targets),
                 return_exceptions=True)
@@ -547,32 +580,31 @@ class AlephAdapter(BasePlatformAdapter):
         self._on_loop(emit)
 
     def live_state_frames(self) -> list[str]:
-        """What a phone connecting mid-turn needs to show the present: typing, the open draft, and
-        the steps still running."""
+        """What a phone connecting mid-turn needs to show the present, in every chat: typing, the open
+        draft, and the steps still running."""
         frames = []
         for chat, status in self._typing.items():
-            if chat == self.chat_id:
-                payload: dict[str, Any] = {"active": True}
-                if status:
-                    payload["status"] = status
-                frames.append(event_frame("typing", payload))
-        open_draft = self._open_draft.get(self.chat_id)
-        if open_draft is not None:
-            frames.append(event_frame("draft", {"draft_id": open_draft[0], "text": open_draft[1]}))
-        for _raw, step in self._open_steps.get(self.chat_id) or []:
-            frames.append(event_frame("activity", dict(step)))
+            if self._exists(chat):
+                frames.append(event_frame("typing", self._typing_payload(chat, True, status)))
+        for chat, (wire_id, text) in self._open_draft.items():
+            if self._exists(chat):
+                frames.append(event_frame("draft", {"chat": chat, "draft_id": wire_id, "text": text}))
+        for chat, open_steps in self._open_steps.items():
+            if self._exists(chat):
+                frames += [event_frame("activity", dict(step)) for _raw, step in open_steps]
         return frames
 
     async def replay_snapshot(self, after: int) -> ReplaySnapshot:
         """Under ``append_lock``: the events a phone that stored ``after`` is missing."""
         latest = await asyncio.to_thread(self.store.latest)
-        oldest = await asyncio.to_thread(self.store.oldest)
+        pruned = await asyncio.to_thread(self.store.pruned_through)
         reset = False
         start = after
         if after > latest:
             # The phone is ahead of this log (a wiped or replaced server): start over.
             reset, start = True, 0
-        elif oldest is not None and after < oldest - 1:
+        elif after < pruned:
+            # What it is missing was pruned for age.
             reset, start = True, 0
         events = await asyncio.to_thread(self.store.events_after, start, until=latest) if latest > start else []
         return ReplaySnapshot(latest, reset, events)
@@ -674,8 +706,12 @@ class AlephAdapter(BasePlatformAdapter):
         if method == "message.send":
             return {"seq": await self._accept_user_message(params)}
         if method == "chat.stop":
-            await self._stop()
+            await self._stop(self._chat_param(params))
             return {}
+        if method == "chat.create":
+            return {"seq": await self._create_chat(params)}
+        if method == "chat.delete":
+            return {"seq": await self._delete_chat_call(params)}
         if method == "approval.respond":
             await self._respond_approval(params)
             return {}
@@ -693,6 +729,7 @@ class AlephAdapter(BasePlatformAdapter):
         raise RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
 
     async def _accept_user_message(self, params: dict[str, Any]) -> int:
+        chat = self._chat_param(params)
         message_id = params.get("id")
         if not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 128:
             raise RpcError(INVALID_PARAMS, "id must be a non-empty string")
@@ -710,27 +747,27 @@ class AlephAdapter(BasePlatformAdapter):
         async with self._intake_lock:
             existing = await asyncio.to_thread(self.store.message, message_id)
             if existing is not None:
-                if existing.sender != "user":
+                if existing.sender != "user" or existing.chat != chat:
                     raise RpcError(INVALID_PARAMS, "id belongs to another message")
                 # A resend after a lost answer: answer as the first time; hand it over if the first
                 # attempt was logged but never reached the gateway.
                 self._dedup.is_duplicate(message_id)
                 if not existing.dispatched:
-                    await self._dispatch_user_message(message_id, existing.text, existing.attachments,
+                    await self._dispatch_user_message(chat, message_id, existing.text, existing.attachments,
                                                       reply_to, await self._logged_location(existing.seq))
                 return existing.seq
             if not text.strip() and not uploads and location is None:
                 raise RpcError(INVALID_PARAMS, "a message needs text, attachments or a location")
             attachments = await self._take_uploads(uploads)
             self._dedup.is_duplicate(message_id)
-            payload = {"id": message_id, "sender": "user", "text": text,
+            payload = {"chat": chat, "id": message_id, "sender": "user", "text": text,
                        "attachments": self._with_links(attachments)}
             if location is not None:
                 payload["location"] = location
             payload["created_at"] = now_iso()
             event = await self._log("message.new", payload, message={
                 "id": message_id, "sender": "user", "kind": "text", "text": text, "attachments": attachments})
-            await self._dispatch_user_message(message_id, text, attachments, reply_to, location)
+            await self._dispatch_user_message(chat, message_id, text, attachments, reply_to, location)
             return event.seq
 
     async def _logged_location(self, seq: int) -> Optional[dict[str, Any]]:
@@ -739,7 +776,7 @@ class AlephAdapter(BasePlatformAdapter):
         events = await asyncio.to_thread(self.store.events_after, seq - 1, until=seq)
         return events[0].payload.get("location") if events else None
 
-    async def _dispatch_user_message(self, message_id: str, text: str, attachments: list[dict[str, Any]],
+    async def _dispatch_user_message(self, chat: str, message_id: str, text: str, attachments: list[dict[str, Any]],
                                      reply_to: Optional[str], location: Optional[dict[str, Any]] = None) -> None:
         media_urls, media_types, media_names, inlined, injected = [], [], [], [], []
         message_type = MessageType.TEXT
@@ -766,60 +803,192 @@ class AlephAdapter(BasePlatformAdapter):
             text = location_note(location, text)
             if message_type == MessageType.TEXT:
                 message_type = MessageType.LOCATION
-        reacted = await self._take_pending_reactions()
+        reacted = await self._take_pending_reactions(chat)
         if reacted:
             text = f"{reacted}\n\n{text}" if text.strip() else reacted
-        source = self.build_source(chat_id=self.chat_id, chat_name=CHAT_NAME, chat_type="dm",
-                                   user_id=OWNER_ID, user_name=OWNER_NAME)
+        source = self._source(chat)
         event = MessageEvent(source=source, text=text, message_type=message_type, message_id=message_id,
                              media_urls=media_urls, media_types=media_types, media_text_inlined=inlined,
                              media_filenames=media_names)
         if reply_to:
             replied = await asyncio.to_thread(self.store.message, reply_to)
-            if replied is not None:
+            if replied is not None and replied.chat == chat:
                 event.reply_to_message_id = reply_to
                 event.reply_to_text = replied.text
                 event.reply_to_is_own_message = replied.sender == "agent"
         # Recorded before the hand-off: a turn may start (and send its receipt) inside it.
-        self._last_user_message = message_id
-        await asyncio.to_thread(self.store.set_meta, "last_user_message", message_id)
+        self._last_user_message[chat] = message_id
+        await asyncio.to_thread(self.store.set_meta, f"last_user_message:{chat}", message_id)
         await self.handle_message(event)
         await asyncio.to_thread(self.store.mark_dispatched, message_id)
 
-    async def _stop(self) -> None:
-        """``chat.stop``: the gateway's own ``/stop`` for this chat (not logged as a message)."""
-        source = self.build_source(chat_id=self.chat_id, chat_name=CHAT_NAME, chat_type="dm",
-                                   user_id=OWNER_ID, user_name=OWNER_NAME)
-        await self.handle_message(MessageEvent(source=source, text="/stop", message_type=MessageType.COMMAND,
-                                               message_id=f"stop-{uuid.uuid4().hex}"))
+    def _source(self, chat: str):
+        """The gateway's source for a chat: a DM keyed by its id, so each chat is a session of its own."""
+        side = self._chats.get(chat)
+        name = (side.title or "Side chat") if side is not None else CHAT_NAME
+        return self.build_source(chat_id=chat, chat_name=name, chat_type="dm", user_id=OWNER_ID, user_name=OWNER_NAME)
+
+    async def _command(self, chat: str, command: str) -> None:
+        """A slash command of the gateway's own for a chat (not logged as a message)."""
+        await self.handle_message(MessageEvent(source=self._source(chat), text=command,
+                                               message_type=MessageType.COMMAND,
+                                               message_id=f"{command.strip('/')}-{uuid.uuid4().hex}"))
+
+    async def _stop(self, chat: str) -> None:
+        """``chat.stop``: the gateway's own ``/stop`` for that chat."""
+        await self._command(chat, "/stop")
+
+    # ── chats ──────────────────────────────────────────────────────────────────────────────────
+
+    def _exists(self, chat: str) -> bool:
+        return chat == CHAT_ID or chat in self._chats
+
+    def _chat_param(self, params: dict[str, Any], key: str = "chat") -> str:
+        """A call's chat: ``main`` or a side chat that exists."""
+        chat = params.get(key)
+        if not isinstance(chat, str) or not chat:
+            raise RpcError(INVALID_PARAMS, f"{key} is required: main or a side chat's id")
+        if not self._exists(chat):
+            raise RpcError(INVALID_PARAMS, "no chat with that id")
+        return chat
+
+    def _outbound_chat(self, chat_id: Any) -> Optional[str]:
+        """Where the gateway's send goes, or None for a chat that no longer exists."""
+        chat = str(chat_id or CHAT_ID)
+        if self._exists(chat):
+            return chat
+        if chat not in self._deleted_chats:
+            logger.warning("Aleph: dropped a send to unknown chat %r", chat)
+        return None
+
+    async def _create_chat(self, params: dict[str, Any]) -> int:
+        """``chat.create {id, title?}``: open a side chat; the same id again answers as the first time."""
+        chat_id, title = params.get("id"), params.get("title")
+        if not isinstance(chat_id, str) or not chat_id.strip() or len(chat_id) > MAX_CHAT_ID:
+            raise RpcError(INVALID_PARAMS, "id must be a non-empty string")
+        if chat_id == CHAT_ID:
+            raise RpcError(INVALID_PARAMS, "main always exists")
+        if title is not None:
+            if not isinstance(title, str):
+                raise RpcError(INVALID_PARAMS, "title must be a string or null")
+            title = " ".join(title.split())[:MAX_CHAT_TITLE] or None
+        async with self._chat_lock, self.append_lock:
+            chat, event = await asyncio.to_thread(self.store.create_chat, chat_id, title, now_iso())
+            if chat.deleted_seq is not None:
+                raise RpcError(INVALID_PARAMS, "that chat was deleted")
+            self._chats[chat.id] = chat
+            if event is not None:
+                self._broadcast(event)
+                logger.info("Aleph: opened side chat %s", chat.id)
+        return chat.created_seq
+
+    async def _delete_chat_call(self, params: dict[str, Any]) -> int:
+        chat_id = params.get("id")
+        if chat_id == CHAT_ID:
+            raise RpcError(INVALID_PARAMS, "main cannot be deleted")
+        if not isinstance(chat_id, str) or not chat_id:
+            raise RpcError(INVALID_PARAMS, "id is required")
+        known = await asyncio.to_thread(self.store.chat, chat_id)
+        if known is None:
+            raise RpcError(INVALID_PARAMS, "no chat with that id")
+        if known.deleted_seq is not None:
+            return known.deleted_seq  # a resend after a lost answer
+        return await self.delete_chat(chat_id)
+
+    async def delete_chat(self, chat_id: str) -> int:
+        """End a side chat's session (the gateway's ``/new``) and drop it: its events, messages, steps
+        and files; logs ``chat.delete``."""
+        async with self._chat_lock:
+            if chat_id not in self._chats:
+                known = await asyncio.to_thread(self.store.chat, chat_id)
+                return known.deleted_seq if known is not None and known.deleted_seq is not None else 0
+            source = self._source(chat_id)
+            self._chats.pop(chat_id)
+            self._deleted_chats.add(chat_id)
+            self._clear_draft(chat_id)
+            self._set_typing(chat_id, active=False)
+            self._open_steps.pop(chat_id, None)
+            self._activity_status.pop(chat_id, None)
+            self._turn_message.pop(chat_id, None)
+            self._last_user_message.pop(chat_id, None)
+            self._last_receipt.pop(chat_id, None)
+            if self._pending_reactions.pop(chat_id, None) is not None:
+                await self._save_pending_reactions()
+            for cards in (self._approvals, self._clarifies):
+                for card_id in [k for k, card in cards.items() if card.get("chat") == chat_id]:
+                    cards.pop(card_id, None)
+            try:
+                await self.handle_message(MessageEvent(source=source, text="/new", message_type=MessageType.COMMAND,
+                                                       message_id=f"new-{uuid.uuid4().hex}"))
+            except Exception:
+                logger.warning("Aleph: ending side chat %s's session failed", chat_id, exc_info=True)
+            async with self.append_lock:
+                event = await asyncio.to_thread(self.store.delete_chat, chat_id)
+                self._broadcast(event)
+            logger.info("Aleph: deleted side chat %s", chat_id)
+            return event.seq
+
+    async def _sweep_idle_chats(self) -> None:
+        """Delete the side chats nobody has written in for ``side_chat_idle_days``, hourly."""
+        while True:
+            try:
+                if self._store is None:
+                    return
+                cutoff = time.time() - self.side_chat_idle_days * 86400
+                for chat_id in await asyncio.to_thread(self.store.idle_chats, cutoff):
+                    if chat_id not in self._typing and chat_id not in self._open_steps:  # not mid-turn
+                        logger.info("Aleph: side chat %s was idle for %d days", chat_id, self.side_chat_idle_days)
+                        await self.delete_chat(chat_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Aleph: idle chat sweep failed", exc_info=True)
+            await asyncio.sleep(IDLE_SWEEP_SECONDS)
+
+    def on_session_title(self, source: Any, title: str, title_source: str) -> None:
+        """Hermes named a session (on the agent's thread): a side chat's title, logged as ``chat.update``.
+        ``main`` has none."""
+        chat = str(getattr(source, "chat_id", "") or "")
+        title = " ".join(str(title or "").split())[:MAX_CHAT_TITLE]
+        if chat and chat != CHAT_ID and title:
+            self._on_loop(lambda: asyncio.ensure_future(self._retitle(chat, title)))
+
+    async def _retitle(self, chat_id: str, title: str) -> None:
+        async with self._chat_lock:
+            chat = self._chats.get(chat_id)
+            if chat is None or chat.title == title or self._store is None:
+                return
+            await asyncio.to_thread(self.store.set_chat_title, chat_id, title)
+            self._chats[chat_id] = dataclasses.replace(chat, title=title)
+            await self._log("chat.update", {"chat": chat_id, "title": title})
 
     # ── receipts ───────────────────────────────────────────────────────────────────────────────
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """A turn started on the person's input: everything they sent so far is being read."""
         source = getattr(event, "source", None)
-        if getattr(source, "platform", None) == self.platform:
-            # The steps of this turn answer the newest of the person's messages (none for a cron run).
-            chat = str(getattr(source, "chat_id", "") or self.chat_id)
-            self._turn_message[chat] = None if getattr(event, "internal", False) else self._last_user_message
-        if getattr(event, "internal", False) or getattr(source, "platform", None) != self.platform:
+        if getattr(source, "platform", None) != self.platform:
             return
-        if str(getattr(source, "chat_id", "")) != self.chat_id or self._store is None:
+        chat = str(getattr(source, "chat_id", "") or CHAT_ID)
+        # The steps of this turn answer the newest of the person's messages (none for a cron run).
+        internal = getattr(event, "internal", False)
+        self._turn_message[chat] = None if internal else self._last_user_message.get(chat)
+        if internal or not self._exists(chat) or self._store is None:
             return
-        target = self._last_user_message
-        if not target or target == self._last_receipt:
+        target = self._last_user_message.get(chat)
+        if not target or target == self._last_receipt.get(chat):
             return
         if await asyncio.to_thread(self.store.user_message_seq, target) is None:
             return
-        self._last_receipt = target
-        await asyncio.to_thread(self.store.set_meta, "last_receipt", target)
-        await self._log("receipt", {"read_up_to": target, "at": now_iso()})
+        self._last_receipt[chat] = target
+        await asyncio.to_thread(self.store.set_meta, f"last_receipt:{chat}", target)
+        await self._log("receipt", {"chat": chat, "read_up_to": target, "at": now_iso()})
 
     async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
         source = getattr(event, "source", None)
         if getattr(source, "platform", None) != self.platform:
             return
-        chat = str(getattr(source, "chat_id", "") or self.chat_id)
+        chat = str(getattr(source, "chat_id", "") or CHAT_ID)
         self._clear_draft(chat)
         await self._close_open_steps(chat)
         self._set_typing(chat, active=False)
@@ -832,12 +1001,17 @@ class AlephAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Aleph is not connected", retryable=True)
         meta = metadata or {}
         kind = "tool" if meta.get("_tool_progress") else "system" if meta.get("_interim_send") else "text"
-        return await self._send_message(str(chat_id or self.chat_id), content or "", [], kind=kind)
+        return await self._send_message(chat_id, content or "", [], kind=kind)
 
-    async def _send_message(self, chat_id: str, text: str, attachments: list[dict[str, Any]], *,
+    async def _send_message(self, chat_id: Any, text: str, attachments: list[dict[str, Any]], *,
                             kind: str = "text") -> SendResult:
+        chat = self._outbound_chat(chat_id)
+        if chat is None:
+            # A deleted chat: the reply has nowhere to go (not an error the gateway should retry).
+            return SendResult(success=True, message_id=None)
+        chat_id = chat
         message_id = str(uuid.uuid4())
-        payload: dict[str, Any] = {"id": message_id, "sender": "agent", "text": text,
+        payload: dict[str, Any] = {"chat": chat, "id": message_id, "sender": "agent", "text": text,
                                    "attachments": self._with_links(attachments), "created_at": now_iso()}
         if kind != "text":
             payload["kind"] = kind
@@ -863,7 +1037,7 @@ class AlephAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="unknown message")
         if stored.text != content:
             await asyncio.to_thread(self.store.update_message_text, stored.id, content)
-            await self._log("message.edit", {"id": stored.id, "text": content})
+            await self._log("message.edit", {"chat": stored.chat, "id": stored.id, "text": content})
         return SendResult(success=True, message_id=stored.id)
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
@@ -873,7 +1047,7 @@ class AlephAdapter(BasePlatformAdapter):
         if stored is None or stored.sender != "agent":
             return False
         await asyncio.to_thread(self.store.forget_message, stored.id)
-        await self._log("message.delete", {"id": stored.id})
+        await self._log("message.delete", {"chat": stored.chat, "id": stored.id})
         return True
 
     # ── drafts ─────────────────────────────────────────────────────────────────────────────────
@@ -884,7 +1058,9 @@ class AlephAdapter(BasePlatformAdapter):
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str,
                          metadata: Optional[dict[str, Any]] = None) -> SendResult:
-        chat = str(chat_id or self.chat_id)
+        chat = self._outbound_chat(chat_id)
+        if chat is None:
+            return SendResult(success=True)
         # A segment after a tool call opens with blank lines the final message does not have.
         content = (content or "").lstrip("\n")
         wire_id = self._draft_wire_ids.get(draft_id)
@@ -896,30 +1072,31 @@ class AlephAdapter(BasePlatformAdapter):
                     self._draft_wire_ids.pop(stale, None)
         previous = self._open_draft.get(chat)
         if previous is not None and previous[0] != wire_id:
-            self._live("draft.clear", {"draft_id": previous[0]})
+            self._live("draft.clear", {"chat": chat, "draft_id": previous[0]})
         self._open_draft[chat] = (wire_id, content)
-        self._live("draft", {"draft_id": wire_id, "text": content})
+        self._live("draft", {"chat": chat, "draft_id": wire_id, "text": content})
         return SendResult(success=True)
 
     async def abandon_open_draft(self, chat_id: str, content: str,
                                  metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """The draft's turn died (/stop, /new, an error): the phone drops it."""
-        self._clear_draft(str(chat_id or self.chat_id))
+        self._clear_draft(str(chat_id or CHAT_ID))
         return SendResult(success=True)
 
     def _clear_draft(self, chat: str) -> None:
         open_draft = self._open_draft.pop(chat, None)
         if open_draft is not None:
-            self._live("draft.clear", {"draft_id": open_draft[0]})
+            self._live("draft.clear", {"chat": chat, "draft_id": open_draft[0]})
 
     # ── typing ─────────────────────────────────────────────────────────────────────────────────
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        chat = str(chat_id or self.chat_id)
-        self._set_typing(chat, active=True, status=self._activity_status.get(chat))
+        chat = self._outbound_chat(chat_id)
+        if chat is not None:
+            self._set_typing(chat, active=True, status=self._activity_status.get(chat))
 
     async def stop_typing(self, chat_id: str) -> None:
-        self._set_typing(str(chat_id or self.chat_id), active=False)
+        self._set_typing(str(chat_id or CHAT_ID), active=False)
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Hermes's live status is the Slack form ("is searching …"); Aleph words its status line
@@ -941,21 +1118,28 @@ class AlephAdapter(BasePlatformAdapter):
         stored = await asyncio.to_thread(self.store.message, message_id)
         if stored is None:
             raise RpcError(INVALID_PARAMS, "no message with that id")
-        event = await self._log("reaction", {"message_id": message_id, "by": "user", "emoji": raw, "at": now_iso()})
+        event = await self._log("reaction", {"chat": stored.chat, "message_id": message_id, "by": "user",
+                                             "emoji": raw, "at": now_iso()})
         if stored.sender == "agent":
             # The latest per message; a retraction drops it.
-            self._pending_reactions.pop(message_id, None)
+            pending = self._pending_reactions.setdefault(stored.chat, {})
+            pending.pop(message_id, None)
             if raw is not None:
-                self._pending_reactions[message_id] = raw
-            await asyncio.to_thread(self.store.set_meta, "pending_reactions", json.dumps(self._pending_reactions))
+                pending[message_id] = raw
+            await self._save_pending_reactions()
         return event.seq
 
-    async def _take_pending_reactions(self) -> str:
-        """The note for the person's reactions since their last message, which it then clears."""
-        if not self._pending_reactions:
+    async def _save_pending_reactions(self) -> None:
+        self._pending_reactions = {chat: pending for chat, pending in self._pending_reactions.items() if pending}
+        await asyncio.to_thread(self.store.set_meta, "pending_reactions", json.dumps(self._pending_reactions))
+
+    async def _take_pending_reactions(self, chat: str) -> str:
+        """The note for the person's reactions in a chat since their last message there, which it
+        then clears."""
+        pending = self._pending_reactions.pop(chat, None)
+        if not pending:
             return ""
-        pending, self._pending_reactions = self._pending_reactions, {}
-        await asyncio.to_thread(self.store.set_meta, "pending_reactions", "{}")
+        await self._save_pending_reactions()
         reacted = []
         for message_id, emoji in pending.items():
             stored = await asyncio.to_thread(self.store.message, message_id)
@@ -963,35 +1147,39 @@ class AlephAdapter(BasePlatformAdapter):
                 reacted.append((emoji, stored.text, bool(stored.attachments)))
         return reactions.note(reacted)
 
-    async def react(self, emoji: Optional[str], *, message_id: Optional[str] = None,
+    async def react(self, emoji: Optional[str], *, chat: str = CHAT_ID, message_id: Optional[str] = None,
                     messages_back: int = 0) -> dict[str, Any]:
-        """The agent reacts (``emoji`` None: takes its reaction back), by default to the person's latest
-        message; ``ValueError`` says what is wrong. Runs on the gateway's loop."""
+        """The agent reacts in a chat (``emoji`` None: takes its reaction back), by default to the
+        person's latest message there; ``ValueError`` says what is wrong. Runs on the gateway's loop."""
+        if not self._exists(chat):
+            raise ValueError("this chat no longer exists")
         if message_id:
             stored = await asyncio.to_thread(self.store.message, message_id)
-            if stored is None:
+            if stored is None or stored.chat != chat:
                 raise ValueError(f"there is no message {message_id!r} in the conversation")
         else:
-            ids = await asyncio.to_thread(self.store.user_message_ids, messages_back + 1)
+            ids = await asyncio.to_thread(self.store.user_message_ids, chat, messages_back + 1)
             if len(ids) <= messages_back:
                 raise ValueError("there is no message of the person's to react to yet" if not messages_back
                                  else f"the person has fewer than {messages_back + 1} messages")
             message_id = ids[messages_back]
-        await self._log("reaction", {"message_id": message_id, "by": "agent", "emoji": emoji, "at": now_iso()})
+        await self._log("reaction", {"chat": chat, "message_id": message_id, "by": "agent", "emoji": emoji,
+                                     "at": now_iso()})
         return {"message_id": message_id, "emoji": emoji}
 
-    async def _react_on_loop(self, emoji: Optional[str], message_id: Optional[str]) -> dict[str, Any]:
+    async def _react_on_loop(self, chat_id: Any, emoji: Optional[str], message_id: Optional[str]) -> dict[str, Any]:
         """``send_message(action="react")`` calls from another loop; the log is the gateway loop's."""
         loop = self._loop
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
+        chat = str(chat_id or CHAT_ID)
         try:
             if loop is None or running is loop:
-                result = await self.react(emoji, message_id=message_id)
+                result = await self.react(emoji, chat=chat, message_id=message_id)
             else:
-                future = asyncio.run_coroutine_threadsafe(self.react(emoji, message_id=message_id), loop)
+                future = asyncio.run_coroutine_threadsafe(self.react(emoji, chat=chat, message_id=message_id), loop)
                 result = await asyncio.wrap_future(future)
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
@@ -1005,18 +1193,20 @@ class AlephAdapter(BasePlatformAdapter):
             return {"success": False, "error": str(exc)}
         if cleaned is None:
             return {"success": False, "error": "emoji is required; use action='unreact' to take a reaction back"}
-        return await self._react_on_loop(cleaned, message_id)
+        return await self._react_on_loop(chat_id, cleaned, message_id)
 
     async def remove_reaction(self, chat_id: str, message_id: Optional[str] = None) -> dict[str, Any]:
         """``send_message(action="unreact")``: take the agent's reaction back."""
-        return await self._react_on_loop(None, message_id)
+        return await self._react_on_loop(chat_id, None, message_id)
 
     # ── activity ───────────────────────────────────────────────────────────────────────────────
 
     def on_tool_activity(self, source: Any, event: dict[str, Any]) -> None:
         """A tool started or finished in a turn this channel answers (the gateway's progress
         callback, on the agent's worker thread)."""
-        chat = str(getattr(source, "chat_id", "") or self.chat_id)
+        chat = str(getattr(source, "chat_id", "") or CHAT_ID)
+        if not self._exists(chat):
+            return
         mode = str(event.get("live_status") or "full")
         tool = str(event.get("tool") or "")
         if event.get("type") == "tool.started":
@@ -1024,7 +1214,7 @@ class AlephAdapter(BasePlatformAdapter):
             if described is None:
                 return  # looking tools up: no step, and the line stays on "Thinking…"
             name, summary, detail = described
-            step = activity.new_step(self._turn_message.get(chat), name, summary, detail, now_iso())
+            step = activity.new_step(chat, self._turn_message.get(chat), name, summary, detail, now_iso())
             show = mode != "off"
             self._on_loop(lambda: asyncio.ensure_future(self._step_started(chat, tool, step, show)))
         elif event.get("type") == "tool.completed":
@@ -1032,7 +1222,7 @@ class AlephAdapter(BasePlatformAdapter):
             self._on_loop(lambda: asyncio.ensure_future(self._step_finished(chat, tool, ok)))
 
     async def _step_started(self, chat: str, tool: str, step: dict[str, Any], show: bool) -> None:
-        if self._store is None:
+        if self._store is None or not self._exists(chat):
             return
         self._open_steps.setdefault(chat, []).append((tool, step))
         await asyncio.to_thread(self.store.add_step, step)
@@ -1066,13 +1256,15 @@ class AlephAdapter(BasePlatformAdapter):
             self._set_typing(chat, active=True, status=status)
 
     async def list_activity(self, params: dict[str, Any]) -> dict[str, Any]:
-        """``activity.list {before?, limit?}`` -> ``{steps, more}``, newest first."""
+        """``activity.list {chat?, before?, limit?}`` -> ``{steps, more}``, newest first; without
+        ``chat``, every chat's."""
+        chat = self._chat_param(params) if params.get("chat") is not None else None
         before, limit = params.get("before"), params.get("limit", 50)
         if before is not None and not isinstance(before, str):
             raise RpcError(INVALID_PARAMS, "before must be a step id")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
             raise RpcError(INVALID_PARAMS, "limit must be from 1 to 200")
-        steps, more = await asyncio.to_thread(self.store.steps, before=before, limit=limit)
+        steps, more = await asyncio.to_thread(self.store.steps, chat=chat, before=before, limit=limit)
         return {"steps": steps, "more": more}
 
     def _on_loop(self, fn) -> None:
@@ -1093,12 +1285,16 @@ class AlephAdapter(BasePlatformAdapter):
             if chat in self._typing and self._typing[chat] == status:
                 return  # the 2s refresh repeats itself; the phone already shows it
             self._typing[chat] = status
-            payload: dict[str, Any] = {"active": True}
-            if status:
-                payload["status"] = status
-            self._live("typing", payload)
+            self._live("typing", self._typing_payload(chat, True, status))
         elif self._typing.pop(chat, "absent") != "absent":
-            self._live("typing", {"active": False})
+            self._live("typing", self._typing_payload(chat, False))
+
+    @staticmethod
+    def _typing_payload(chat: str, active: bool, status: Optional[str] = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"chat": chat, "active": active}
+        if active and status:
+            payload["status"] = status
+        return payload
 
     # ── approvals ──────────────────────────────────────────────────────────────────────────────
 
@@ -1108,12 +1304,15 @@ class AlephAdapter(BasePlatformAdapter):
         request_id = prompt.request_id or uuid.uuid4().hex
         choices = [{"label": label, "choice": choice, "style": _APPROVAL_STYLES.get(style, "default")}
                    for label, choice, style in prompt.actions]
-        payload: dict[str, Any] = {"request_id": request_id, "text": prompt.text, "choices": choices}
+        chat = self._outbound_chat(prompt.chat_id)
+        if chat is None:
+            return SendResult(success=False, error="the chat was deleted")
+        payload: dict[str, Any] = {"chat": chat, "request_id": request_id, "text": prompt.text, "choices": choices}
         if prompt.command:
             payload["command"] = prompt.command
         if prompt.description:
             payload["reason"] = prompt.description
-        self._approvals[request_id] = {"session_key": prompt.session_key, "choices": prompt.choices,
+        self._approvals[request_id] = {"chat": chat, "session_key": prompt.session_key, "choices": prompt.choices,
                                        "card_request_id": prompt.request_id, "answered": False}
         await self._log("approval.request", payload)
         if prompt.request_id:
@@ -1140,7 +1339,7 @@ class AlephAdapter(BasePlatformAdapter):
         if card is None or card.get("answered") or self._store is None:
             return
         by = "timeout" if reason == "timeout" else "other" if reason == "resolved" else "cancelled"
-        await self._log("approval.resolved", {"request_id": request_id, "choice": None, "by": by})
+        await self._log("approval.resolved", {"chat": card["chat"], "request_id": request_id, "choice": None, "by": by})
 
     async def _respond_approval(self, params: dict[str, Any]) -> None:
         request_id, choice = params.get("request_id"), params.get("choice")
@@ -1156,10 +1355,11 @@ class AlephAdapter(BasePlatformAdapter):
         card["answered"] = True
         resolved = resolve_gateway_approval_card(card["session_key"], choice, card["card_request_id"])
         self._approvals.pop(request_id, None)
+        chat = card["chat"]
         if resolved:
-            await self._log("approval.resolved", {"request_id": request_id, "choice": choice, "by": "user"})
+            await self._log("approval.resolved", {"chat": chat, "request_id": request_id, "choice": choice, "by": "user"})
         else:
-            await self._log("approval.resolved", {"request_id": request_id, "choice": None, "by": "timeout"})
+            await self._log("approval.resolved", {"chat": chat, "request_id": request_id, "choice": None, "by": "timeout"})
 
     # ── clarify ────────────────────────────────────────────────────────────────────────────────
 
@@ -1167,6 +1367,9 @@ class AlephAdapter(BasePlatformAdapter):
                            session_key: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         if self._store is None:
             return SendResult(success=False, error="Aleph is not connected", retryable=True)
+        chat = self._outbound_chat(chat_id)
+        if chat is None:
+            return SendResult(success=False, error="the chat was deleted")
         labels = [str(choice) for choice in (choices or [])]
         entry = None
         try:
@@ -1175,8 +1378,8 @@ class AlephAdapter(BasePlatformAdapter):
         except ImportError:
             pass
         # The entry is kept to read the answer when the clarify ends some other way.
-        self._clarifies[clarify_id] = {"choices": labels, "answered": False, "entry": entry}
-        await self._log("clarify.request", {"clarify_id": clarify_id, "question": question,
+        self._clarifies[clarify_id] = {"chat": chat, "choices": labels, "answered": False, "entry": entry}
+        await self._log("clarify.request", {"chat": chat, "clarify_id": clarify_id, "question": question,
                                             "choices": labels, "allows_text": True})
         return SendResult(success=True, message_id=clarify_id)
 
@@ -1189,7 +1392,7 @@ class AlephAdapter(BasePlatformAdapter):
         answer = getattr(card.get("entry"), "response", None)
         if not isinstance(answer, str) or not answer or answer.startswith("\x00"):
             answer = None  # the SKIPPED / CANCELLED sentinels are not answers
-        await self._log("clarify.resolved", {"clarify_id": clarify_id, "answer": answer,
+        await self._log("clarify.resolved", {"chat": card["chat"], "clarify_id": clarify_id, "answer": answer,
                                              "by": "user" if answer else "timeout"})
 
     async def _respond_clarify(self, params: dict[str, Any]) -> None:
@@ -1212,10 +1415,11 @@ class AlephAdapter(BasePlatformAdapter):
         card["answered"] = True
         resolved = resolve_gateway_clarify(clarify_id, answer)
         self._clarifies.pop(clarify_id, None)
+        chat = card["chat"]
         if resolved:
-            await self._log("clarify.resolved", {"clarify_id": clarify_id, "answer": answer, "by": "user"})
+            await self._log("clarify.resolved", {"chat": chat, "clarify_id": clarify_id, "answer": answer, "by": "user"})
         else:
-            await self._log("clarify.resolved", {"clarify_id": clarify_id, "answer": None, "by": "timeout"})
+            await self._log("clarify.resolved", {"chat": chat, "clarify_id": clarify_id, "answer": None, "by": "timeout"})
 
     # ── files ──────────────────────────────────────────────────────────────────────────────────
 
@@ -1352,7 +1556,7 @@ class AlephAdapter(BasePlatformAdapter):
         except (OSError, ValueError) as exc:
             logger.warning("Aleph: cannot attach %s: %s", path, exc)
             return SendResult(success=False, error=f"cannot read {path}: {exc}")
-        return await self._send_message(str(chat_id or self.chat_id), caption or "", [description])
+        return await self._send_message(chat_id, caption or "", [description])
 
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
                               reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
@@ -1389,12 +1593,14 @@ class AlephAdapter(BasePlatformAdapter):
                 logger.warning("Aleph: cannot attach %s: %s", path, exc)
         if not attachments and not caption.strip():
             return SendResult(success=False, error="no readable files")
-        return await self._send_message(str(chat_id or self.chat_id), caption, attachments)
+        return await self._send_message(chat_id, caption, attachments)
 
     # ── misc ───────────────────────────────────────────────────────────────────────────────────
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
-        return {"name": CHAT_NAME, "type": "dm", "chat_id": str(chat_id or self.chat_id)}
+        chat = str(chat_id or CHAT_ID)
+        side = self._chats.get(chat)
+        return {"name": (side.title or "Side chat") if side is not None else CHAT_NAME, "type": "dm", "chat_id": chat}
 
     def format_message(self, content: str) -> str:
         return content  # Markdown goes through untouched; Aleph renders it

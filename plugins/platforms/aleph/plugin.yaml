@@ -6,8 +6,9 @@ description: >
   Aleph channel for Hermes Agent: the Aleph iOS app talks to the gateway over its own
   WebSocket (JSON-RPC 2.0, end-to-end encrypted with Noise) and HTTP file endpoints,
   published through a tunnel or on the home network. Devices pair once by scanning a
-  QR code (`hermes aleph pair`) and are known by their keys. One chat
-  ("main") with a durable, replayable event log, streaming drafts, typing and status text,
+  QR code (`hermes aleph pair`) and are known by their keys. The main chat ("main") and
+  side chats, each a session of its own, in one durable, replayable event log, with streaming
+  drafts, typing and status text,
   read receipts, approval and question cards, attachments, content-free APNs push, and
   home-channel delivery for `session: main` cron jobs and webhooks.
 author: clawd-xsl

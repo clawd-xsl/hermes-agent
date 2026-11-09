@@ -164,10 +164,10 @@ def test_push_body_for_each_logged_event():
 
 def test_payload_and_headers_match_the_protocol():
     from plugins.platforms.aleph.push import build_headers, build_payload
-    assert build_payload(body="New message", seq=58) == {
+    assert build_payload(body="New message", seq=58, chat="main") == {
         "aps": {"alert": {"body": "New message"}, "sound": "default",
                 "mutable-content": 1, "thread-id": "main"},
-        "aleph": {"seq": 58},
+        "aleph": {"seq": 58, "chat": "main"},
     }
     headers = build_headers(topic="sh.xsl.aleph", now=1_000_000.0)
     assert headers == {"apns-push-type": "alert", "apns-priority": "10", "apns-topic": "sh.xsl.aleph",
@@ -186,7 +186,7 @@ async def test_only_notifying_events_push_and_only_to_inactive_devices(adapter):
         await phone_looking.call("push.register", {"token": "cd" * 32, "environment": "production"})
         await phone_looking.call("presence", {"active": True})
         sender = adapter._push
-        await phone_away.call("message.send", {"id": "u1", "text": "hello"})  # user echo: quiet
+        await phone_away.call("message.send", {"chat": "main", "id": "u1", "text": "hello"})  # user echo: quiet
         await adapter.send("main", "tool row", metadata={"_tool_progress": True})  # quiet
         await adapter.send("main", "Session reset", metadata={"_interim_send": True})  # quiet
         reply = await adapter.send("main", "the reply")

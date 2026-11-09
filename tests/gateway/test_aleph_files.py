@@ -45,10 +45,10 @@ async def test_upload_attach_and_download(adapter):
     try:
         await phone.hello()
         attachment = await phone.upload(adapter, png, name="shot one.png", mime="image/png")
-        bad = await phone.call("message.send", {"id": "m-bad", "text": "", "attachments": [
+        bad = await phone.call("message.send", {"chat": "main", "id": "m-bad", "text": "", "attachments": [
             {"ticket": "t_nope", "key": attachment["key"], "name": "x", "mime": "image/png"}]})
         assert bad["error"]["code"] == -32602
-        await phone.call("message.send", {"id": "m-img", "text": "", "attachments": [attachment]})
+        await phone.call("message.send", {"chat": "main", "id": "m-img", "text": "", "attachments": [attachment]})
         echo = (await phone.logged())["params"]["payload"]
         (description,) = echo["attachments"]
         assert description["name"] == "shot one.png" and description["kind"] == "image"
@@ -65,7 +65,7 @@ async def test_upload_attach_and_download(adapter):
         assert event.media_types == ["image/png"] and event.message_type.value == "photo"
         assert event.media_urls and Path(event.media_urls[0]).read_bytes() == png  # the agent gets plaintext
         # The upload ticket was spent.
-        again = await phone.call("message.send", {"id": "m-again", "text": "", "attachments": [attachment]})
+        again = await phone.call("message.send", {"chat": "main", "id": "m-again", "text": "", "attachments": [attachment]})
         assert again["error"]["code"] == -32602
     finally:
         await phone.close()
@@ -92,10 +92,10 @@ async def test_upload_tickets_check_size_key_and_use(adapter):
             assert resp.status == 404  # one PUT per ticket
         async with phone.session.put(base + "/aleph/v1/files/t_made_up", data=ciphertext) as resp:
             assert resp.status == 404
-        wrong = await phone.call("message.send", {"id": "m-wrong", "text": "", "attachments": [
+        wrong = await phone.call("message.send", {"chat": "main", "id": "m-wrong", "text": "", "attachments": [
             {"ticket": ticket["ticket"], "key": b64url(b"\x01" * 32), "name": "a.txt", "mime": "text/plain"}]})
         assert wrong["error"]["code"] == -32602
-        right = await phone.call("message.send", {"id": "m-right", "text": "", "attachments": [
+        right = await phone.call("message.send", {"chat": "main", "id": "m-right", "text": "", "attachments": [
             {"ticket": ticket["ticket"], "key": b64url(key), "name": "a.txt", "mime": "text/plain"}]})
         assert "result" in right  # a wrong key did not spend the ticket
     finally:
@@ -136,7 +136,7 @@ def _png_bytes():
 
 async def _send(phone, **params):
     import uuid
-    return await phone.call("message.send", {"id": str(uuid.uuid4()), "text": "", **params})
+    return await phone.call("message.send", {"chat": "main", "id": str(uuid.uuid4()), "text": "", **params})
 
 
 async def _received(adapter, message_id=None):
@@ -303,9 +303,9 @@ async def test_a_resend_that_never_reached_the_gateway_keeps_its_location(adapte
             raise RuntimeError("gateway gone")
         with monkeypatch.context() as patch:
             patch.setattr(adapter, "_dispatch_user_message", gateway_gone)
-            answer = await phone.call("message.send", {"id": "m-loc", "text": "", "location": point})
+            answer = await phone.call("message.send", {"chat": "main", "id": "m-loc", "text": "", "location": point})
         assert answer["error"]["code"] == -32603  # logged, never handed over
-        assert "result" in await phone.call("message.send", {"id": "m-loc", "text": "", "location": point})
+        assert "result" in await phone.call("message.send", {"chat": "main", "id": "m-loc", "text": "", "location": point})
         event = await _received(adapter, "m-loc")
         assert event.message_type.value == "location" and "Place: Spot" in event.text
     finally:

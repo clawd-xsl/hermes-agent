@@ -159,6 +159,14 @@ def _live() -> tuple[Any, Any]:
     return runner, adapter
 
 
+def _session_chat() -> str:
+    """The Aleph chat this turn is in (a side chat, or ``main`` for any other origin)."""
+    from gateway.session_context import get_session_env
+    if get_session_env("HERMES_SESSION_PLATFORM", "") == "aleph":
+        return get_session_env("HERMES_SESSION_CHAT_ID", "") or "main"
+    return "main"
+
+
 def aleph_connected() -> bool:
     """``check_fn``: the tools work only where the gateway runs a connected Aleph adapter."""
     try:
@@ -259,9 +267,10 @@ async def react(args: dict[str, Any], **_: Any) -> str:
     runner, adapter = _live()
     if adapter is None:
         return _not_running()
+    chat = _session_chat()
 
     async def apply():
-        return await adapter.react(emoji, message_id=message_id, messages_back=back or 0)
+        return await adapter.react(emoji, chat=chat, message_id=message_id, messages_back=back or 0)
     try:
         result = await _on_gateway(runner, apply)
     except ValueError as exc:
