@@ -1,0 +1,43 @@
+name: aleph-platform
+label: Aleph
+kind: platform
+version: 1.0.0
+description: >
+  Aleph channel for Hermes Agent: the Aleph iOS app talks to the gateway over its own
+  WebSocket (JSON-RPC 2.0, end-to-end encrypted with Noise),
+  published through a tunnel or on the home network. Devices pair once by scanning a
+  QR code (`hermes aleph pair`) and are known by their keys. One chat
+  ("main") with a durable, replayable event log, streaming drafts, typing and status text,
+  read receipts, approval and question cards, and
+  home-channel delivery for `session: main` cron jobs and webhooks.
+author: clawd-xsl
+requires_env:
+  - name: ALEPH_ENABLED
+    description: "Turn the Aleph channel on (true); devices then pair with `hermes aleph pair`"
+    prompt: "Enable Aleph? (true/false)"
+    password: false
+optional_env:
+  - name: ALEPH_HOST
+    description: "Address to listen on: 127.0.0.1 behind a tunnel (the default), a LAN address for development, 0.0.0.0 for every interface"
+    prompt: "Listen address"
+    password: false
+  - name: ALEPH_PORT
+    description: "Port to listen on (default 8650)"
+    prompt: "Port"
+    password: false
+  - name: ALEPH_PUBLIC_URL
+    description: "Base URL the phone uses, pairing included, such as https://aleph.xsl.sh (default http://<LAN address>:<port>); goes into pairing links"
+    prompt: "Public URL"
+    password: false
+  - name: ALEPH_HOME_CHANNEL
+    description: "Home channel for cron / webhook delivery (default main; set to off to keep another platform's home)"
+    prompt: "Home channel"
+    password: false
+  - name: ALEPH_HISTORY_LIMIT
+    description: "How many logged events the server keeps for phones to catch up from (default 20000)"
+    prompt: "History limit"
+    password: false
+  - name: ALEPH_STATE_DIR
+    description: "Where the server key, the event log and devices live (default $HERMES_HOME/aleph)"
+    prompt: "State directory"
+    password: false

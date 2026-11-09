@@ -661,6 +661,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/messaging/whatsapp',
             'user-guide/messaging/whatsapp-cloud',
             'user-guide/messaging/signal',
+            'user-guide/messaging/aleph',
             'user-guide/messaging/email',
             'user-guide/messaging/sms',
           ],
