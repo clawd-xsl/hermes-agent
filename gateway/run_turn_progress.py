@@ -986,6 +986,15 @@ class GatewayTurnProgressMixin:
                 agent._on_session_title = republish
                 return
             runner = self._runner
+            # A channel that shows session titles itself (``on_session_title``, e.g. Aleph naming its
+            # side chats) hears every title, the quick one and the model's; it is called on the
+            # agent's thread.
+            find_adapter = getattr(runner, "_delivery_adapter_for", None)
+            hook = getattr(find_adapter(ctx.source), "on_session_title", None) if find_adapter else None
+            if hook is not None:
+                hook_source = ctx.source
+                agent._on_session_title = lambda title, title_source: hook(hook_source, title, title_source)
+                return
             source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
             # Both lanes spend a rate-limited platform call per title, so they use the model's title
             # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
