@@ -73,7 +73,7 @@ def register(ctx) -> None:
     from gateway.platforms.send_targets import StandaloneSendPolicy
     ctx.register_platform(
         name="aleph", label="Aleph", adapter_factory=AlephAdapter,
-        dashboard_description="The Aleph iOS app: end-to-end encrypted, paired by QR code.",
+        dashboard_description="The Aleph iOS app: end-to-end encrypted, paired by QR code, with push.",
         check_fn=check_aleph_requirements, validate_config=_validate_config, is_connected=_is_connected,
         config_connected_fn=_config_connected,
         required_env=["ALEPH_ENABLED"], install_hint="Aleph needs aiohttp (bundled with the gateway)",

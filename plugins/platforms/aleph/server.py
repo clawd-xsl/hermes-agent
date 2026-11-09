@@ -138,6 +138,7 @@ class Connection:
         self.device_id = device_id
         self.device_name = device_name
         self.ready = False  # hello answered
+        self.active = False  # presence: the person is looking at Aleph on this connection
         self.client: dict[str, Any] = {}
         self._queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
         self._writer = asyncio.create_task(self._write_loop())
@@ -238,6 +239,10 @@ class AlephServer:
         for conn in list(self.connections):
             if conn.ready:
                 conn.enqueue(text)
+
+    def active_device_ids(self) -> set[str]:
+        """Devices the person is looking at Aleph on: any of their connections is active."""
+        return {conn.device_id for conn in self.connections if conn.active and conn.device_id}
 
     async def close_devices(self, keep: set[str]) -> int:
         """Close every connection whose device is not in ``keep`` (it was revoked)."""
@@ -392,7 +397,10 @@ class AlephServer:
                 return
             if not conn.ready:
                 raise RpcError(NOT_READY, "call hello first")
-            result = await self.adapter.handle_call(method, params, conn)
+            if method == "presence":
+                result = self._presence(conn, params)
+            else:
+                result = await self.adapter.handle_call(method, params, conn)
         except RpcError as exc:
             if call_id is not None:
                 error: dict[str, Any] = {"code": exc.code, "message": exc.message}
@@ -408,6 +416,13 @@ class AlephServer:
             return
         if call_id is not None:
             conn.enqueue(_frame({"jsonrpc": "2.0", "id": call_id, "result": result}))
+
+    def _presence(self, conn: Connection, params: dict[str, Any]) -> dict[str, Any]:
+        active = params.get("active")
+        if not isinstance(active, bool):
+            raise RpcError(INVALID_PARAMS, "active must be true or false")
+        conn.active = active
+        return {}
 
     async def _hello(self, conn: Connection, call_id: Any, params: dict[str, Any]) -> None:
         if conn.ready:

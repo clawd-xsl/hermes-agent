@@ -15,7 +15,9 @@ What the channel gives the phone:
 - approval cards for dangerous commands and question cards for the `clarify` tool;
 - attachments both ways;
 - end-to-end encryption: everything between the phone and the plugin, files included, is ciphertext to
-  the network, the tunnel and Cloudflare.
+  the network, the tunnel and Cloudflare;
+- push notifications through APNs that carry no content: the app's notification extension fetches the
+  real text over the channel itself.
 
 The wire protocol is specified in the Aleph repository (`docs/protocol.md`).
 
@@ -97,15 +99,16 @@ handshake (prologue `aleph/1/pair`) that uses the secret as its pre-shared key, 
 - `/aleph/v1/pair` answers `404` unless a pairing is pending, so most of the time there is nothing to reach.
   It allows 5 attempts a minute per address (behind the tunnel, Cloudflare's `CF-Connecting-IP`, trusted
   only on loopback connections).
-- Each pairing posts "New device paired: <name>" into the thread, so a pairing nobody expected is noticed
-  at once.
+- Each pairing posts "New device paired: <name>" into the thread and pushes it, so a pairing nobody expected
+  is noticed at once.
 
 ```bash
-hermes aleph devices          # id, name, model, key fingerprint, when paired, last seen
+hermes aleph devices          # id, name, model, key fingerprint, when paired, last seen, push environment
 hermes aleph revoke d_3f9a…   # the device's key no longer connects
 ```
 
-Revoking closes the device's open connections within a couple of seconds (WebSocket close code `4401`).
+Revoking closes the device's open connections within a couple of seconds (WebSocket close code `4401`) and
+drops its push token.
 
 ## Reach it from anywhere
 
@@ -141,6 +144,32 @@ Run it with `cloudflared tunnel run hermes` (or install it as a service: `cloudf
 For development on the home network, `ALEPH_HOST=0.0.0.0` (or the LAN address) without `ALEPH_PUBLIC_URL`
 puts `http://<LAN address>:8650` in the link; plain `ws://` is for the home network only.
 
+## Push notifications
+
+Push needs the APNs auth key (`.p8`) of the Apple developer team that signs the app. Keep it on the Hermes
+machine only, outside any repository, and point the plugin at it:
+
+```bash
+ALEPH_APNS_KEY_FILE=/home/you/.hermes/secrets/AuthKey_ABC123DEFG.p8
+ALEPH_APNS_KEY_ID=ABC123DEFG
+ALEPH_APNS_TEAM_ID=PNDKVJR7LY
+ALEPH_APNS_TOPIC=sh.xsl.aleph
+```
+
+Without all four, the channel works and pushes nothing; the gateway log says `push on (sh.xsl.aleph)` or
+`push off`. APNs speaks only HTTP/2, which comes from the `h2` package in the `messaging` extra.
+
+- The phone registers its APNs token after each connection (`push.register`, per device) and says when the
+  person is looking at the app (`presence`). A device with the app in the foreground gets no push.
+- Pushed: the agent's messages (files included), approval requests and questions. Not pushed: tool rows,
+  system notices, the person's own messages, drafts and typing.
+- The push carries only a generic line ("New message", "Approval needed", "Question") and the event's
+  `seq`, and no title: the agent goes by the name given to it on the phone, which the server does not
+  know, so the app's notification extension sets the title. Debug builds use the APNs sandbox, release builds production; Apple calls go straight from this
+  machine, not through the tunnel.
+- A token Apple rejects (`410`, or `400 BadDeviceToken`) is dropped. Pushing never delays delivery over the
+  WebSocket.
+
 ## Home channel
 
 The plugin registers `aleph:main` as its home channel. `session: main` needs exactly one connected platform
@@ -156,19 +185,23 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_HOST` | `127.0.0.1` | Address to bind: loopback behind a tunnel, `0.0.0.0` (or a LAN address) for the home network |
 | `ALEPH_PORT` | `8650` | Port to bind |
 | `ALEPH_PUBLIC_URL` | `http://<LAN address>:<port>` | Base URL the phone uses, pairing included; goes into pairing links |
+| `ALEPH_APNS_KEY_FILE` | | Path to the APNs `.p8` key |
+| `ALEPH_APNS_KEY_ID` | | The key's id |
+| `ALEPH_APNS_TEAM_ID` | | Apple developer team id |
+| `ALEPH_APNS_TOPIC` | | The app's bundle id |
 | `ALEPH_HOME_CHANNEL` | `main` | Home channel; `off` leaves the home to another platform |
 | `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` |
 | `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`), and encrypted files |
 
 The same keys can be set under `platforms.aleph.extra` in `config.yaml` (`host`, `port`, `public_url`,
-`history_limit`, `state_dir`); environment
+`apns_key_file`, `apns_key_id`, `apns_team_id`, `apns_topic`, `history_limit`, `state_dir`); environment
 variables win.
 
 ## Endpoints
 
 - `GET /aleph/v1/ws`: the WebSocket. Binary messages only: the Noise IK handshake, then one encrypted
   JSON-RPC 2.0 frame per message. `hello {protocol: 1, after}` first; the server replays what the phone
-  lacks, sends `sync.done`, then live events. Also `file.ticket`.
+  lacks, sends `sync.done`, then live events. Also `push.register`, `presence` and `file.ticket`.
 - `GET /aleph/v1/pair`: the pairing WebSocket (Noise IKpsk1), there only while a pairing is pending.
 - `PUT /aleph/v1/files/<ticket>`: upload ciphertext of exactly the size the ticket was issued for (`204`).
 - `GET /aleph/v1/files/<ticket>`: download ciphertext; each link works once.

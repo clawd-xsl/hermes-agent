@@ -19,6 +19,7 @@ from plugins.platforms.aleph import noise
 from tests.gateway.aleph_phone import (
     connect, handshake, pair_device, run_pairing, start_pairing, url as _url)
 
+PUSH_TOKEN = "ab" * 32
 
 
 @pytest_asyncio.fixture
@@ -319,10 +320,11 @@ def test_cli_pair_devices_and_revoke(monkeypatch, tmp_path, capsys):
     gateway_side = AlephStore(tmp_path)
     phone_key = noise.KeyPair.generate().public
     device = gateway_side.complete_pairing(secret, phone_key, name="Xin's iPhone", model="iPhone18,1")
+    gateway_side.set_push_token(device.id, PUSH_TOKEN, "production")
     gateway_side.close()
     assert _cli(["devices"]) == 0
     listing = capsys.readouterr().out
-    assert device.id in listing and "Xin's iPhone" in listing
+    assert device.id in listing and "Xin's iPhone" in listing and "production" in listing
     assert fingerprint(phone_key) in listing
     assert _cli(["revoke", "d_missing"]) == 1
     assert _cli(["revoke", device.id]) == 0

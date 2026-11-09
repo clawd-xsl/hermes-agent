@@ -17,7 +17,9 @@ Map onto the base adapter:
 
 Everything to and from the phone is end-to-end encrypted with Noise (``noise.py``): a device pairs
 once by scanning a QR code (``hermes aleph pair``, then the ``/aleph/v1/pair`` handshake) and is known
-by its static key from then on. Files are encrypted with keys of their own (``files.py``).
+by its static key from then on. Files are encrypted with keys of their own (``files.py``). Logged events
+that notify are pushed through APNs, content-free, to every device with a push token that is not
+active (protocol "Push"); pushing never holds up logging or delivery.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import time
 import uuid
@@ -43,6 +46,8 @@ from gateway.platforms.helpers import MessageDeduplicator
 from plugins.platforms.aleph import noise
 from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file, file_url
 from plugins.platforms.aleph.noise import b64url, from_b64url
+from plugins.platforms.aleph.push import (
+    BODY_MESSAGE, ENVIRONMENTS, ApnsConfig, ApnsSender, build_payload, push_body_for)
 from plugins.platforms.aleph.server import (
     INVALID_PARAMS, METHOD_NOT_FOUND, AlephServer, Connection, RpcError, event_frame)
 from plugins.platforms.aleph.store import AlephStore, Device, LoggedEvent, load_or_create_server_key
@@ -70,6 +75,7 @@ MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 # process): a revoked device is cut off, and a new pairing becomes reachable, within this.
 DEVICE_POLL_SECONDS = 1.0
 LAST_SEEN_INTERVAL = 60.0
+_PUSH_TOKEN = re.compile(r"^[0-9a-fA-F]{16,400}$")
 
 # ExecApprovalPrompt styles -> protocol styles.
 _APPROVAL_STYLES = {"primary": "primary", "danger": "destructive"}
@@ -98,6 +104,14 @@ def resolve_state_dir(extra: Optional[dict]) -> Path:
         return Path(state_dir).expanduser()
     from hermes_constants import get_hermes_home
     return get_hermes_home() / "aleph"
+
+
+def apns_config(extra: Optional[dict]) -> Optional[ApnsConfig]:
+    return ApnsConfig.from_settings(
+        key_file=setting(extra, "apns_key_file", "ALEPH_APNS_KEY_FILE"),
+        key_id=setting(extra, "apns_key_id", "ALEPH_APNS_KEY_ID"),
+        team_id=setting(extra, "apns_team_id", "ALEPH_APNS_TEAM_ID"),
+        topic=setting(extra, "apns_topic", "ALEPH_APNS_TOPIC"))
 
 
 def _file_kind(cached_kind: str, mime: str, name: str) -> str:
@@ -153,6 +167,10 @@ class AlephAdapter(BasePlatformAdapter):
         self.port = self._int_setting(extra, "port", "ALEPH_PORT", DEFAULT_PORT)
         self.history_limit = self._int_setting(extra, "history_limit", "ALEPH_HISTORY_LIMIT", DEFAULT_HISTORY_LIMIT)
         self.state_dir = resolve_state_dir(extra)
+        self.apns_config = apns_config(extra)
+        self._push: Optional[ApnsSender] = None
+        self._push_tasks: set[asyncio.Task] = set()
+        self._push_problems_reported: set[tuple[str, str]] = set()
         self._device_watch: Optional[asyncio.Task] = None
         self._last_seen: dict[str, float] = {}
         self.static: Optional[noise.KeyPair] = None
@@ -221,16 +239,23 @@ class AlephAdapter(BasePlatformAdapter):
             return False
         port = self._server.bound_port or self.port
         logger.info("Aleph: listening on ws://%s:%d/aleph/v1/ws", self.host, port)
-        logger.info("Aleph: %d paired device(s)", len(self._device_keys))
+        self._push = ApnsSender.create(self.apns_config)
+        devices = await asyncio.to_thread(self._store.devices)
+        logger.info("Aleph: %d paired device(s); push %s", len(devices),
+                    f"on ({self.apns_config.topic})" if self._push else "off")
         self._device_watch = asyncio.create_task(self._watch_devices())
         self._mark_connected(listener_base=f"http://{self.host}:{port}")
         return True
 
     async def disconnect(self) -> None:
-        server, store, watch = self._server, self._store, self._device_watch
-        self._server = self._store = self._device_watch = None
+        server, store, push, watch = self._server, self._store, self._push, self._device_watch
+        self._server = self._store = self._push = self._device_watch = None
         if watch is not None:
             watch.cancel()
+        for task in list(self._push_tasks):
+            task.cancel()
+        if push is not None:
+            await push.close()
         if server is not None:
             await server.stop()
         if store is not None:
@@ -246,12 +271,14 @@ class AlephAdapter(BasePlatformAdapter):
     # ── fan-out ────────────────────────────────────────────────────────────────────────────────
 
     async def _log(self, event_type: str, payload: dict[str, Any], *,
-                   message: Optional[dict[str, Any]] = None) -> LoggedEvent:
-        """Append one logged event and broadcast it, in seq order."""
+                   message: Optional[dict[str, Any]] = None, push_body: Optional[str] = None) -> LoggedEvent:
+        """Append one logged event and broadcast it, in seq order; push it if it notifies (or, with
+        ``push_body``, regardless of its kind)."""
         async with self.append_lock:
             event = await asyncio.to_thread(self.store.append, event_type, payload, message=message)
             if self._server is not None:
                 self._server.broadcast(event_frame(event.type, event.payload, event.seq))
+        self._schedule_push(event, push_body)
         return event
 
     # ── devices ────────────────────────────────────────────────────────────────────────────────
@@ -298,7 +325,8 @@ class AlephAdapter(BasePlatformAdapter):
         await self._log("message.new", {"id": message_id, "sender": "agent", "text": text, "attachments": [],
                                         "created_at": now_iso(), "kind": "system"},
                         message={"id": message_id, "sender": "agent", "kind": "system", "text": text,
-                                 "attachments": []})
+                                 "attachments": []},
+                        push_body=BODY_MESSAGE)
         return {"device_id": device.id, "agent": {"name": self.agent_info()["name"]}}
 
     async def _watch_devices(self) -> None:
@@ -317,6 +345,80 @@ class AlephAdapter(BasePlatformAdapter):
                 raise
             except Exception:
                 logger.debug("Aleph: device check failed", exc_info=True)
+
+    async def _register_push(self, conn: Connection, params: dict[str, Any]) -> None:
+        token, environment = params.get("token"), params.get("environment")
+        if token is not None:
+            if not isinstance(token, str) or not _PUSH_TOKEN.match(token):
+                raise RpcError(INVALID_PARAMS, "token must be an APNs device token in hex, or null")
+            if environment not in ENVIRONMENTS:
+                raise RpcError(INVALID_PARAMS, "environment must be development or production")
+            token = token.lower()
+        await asyncio.to_thread(self.store.set_push_token, conn.device_id, token,
+                                environment if token is not None else None)
+        logger.info("Aleph: %s %s push (%s)", conn.device_id, "registered for" if token else "unregistered from",
+                    environment if token else "none")
+
+    def _report_push_config_problem(self, result) -> None:
+        """A setup problem fails every push the same way: say so once (per topic and reason) at
+        ERROR, with what to fix, and keep the rest quiet."""
+        topic = self.apns_config.topic if self.apns_config else "?"
+        key = (topic, result.reason)
+        if key in self._push_problems_reported:
+            logger.debug("Aleph: push failed again: %d %s", result.status, result.reason)
+            return
+        self._push_problems_reported.add(key)
+        logger.error("Aleph: push is not working for %s: APNs %d %s: %s. Pushes keep failing the same "
+                     "way until it is fixed (reported once).", topic, result.status, result.reason,
+                     result.config_problem)
+
+    # ── push ───────────────────────────────────────────────────────────────────────────────────
+
+    def _schedule_push(self, event: LoggedEvent, body: Optional[str] = None) -> None:
+        """Fire and forget: a slow or failing APNs never delays the log or the WebSocket."""
+        if self._push is None:
+            return
+        body = body or push_body_for(event.type, event.payload)
+        if body is None:
+            return
+        task = asyncio.create_task(self._push_event(event, body))
+        self._push_tasks.add(task)
+        task.add_done_callback(self._push_tasks.discard)
+
+    async def _push_event(self, event: LoggedEvent, body: str) -> None:
+        sender, store, server = self._push, self._store, self._server
+        if sender is None or store is None:
+            return
+        try:
+            devices = await asyncio.to_thread(store.devices)
+            active = server.active_device_ids() if server is not None else set()
+            targets = [d for d in devices if d.push_token and d.id not in active]
+            if not targets:
+                return
+            payload = build_payload(body=body, seq=event.seq)
+            results = await asyncio.gather(
+                *(sender.send(d.push_token, d.push_environment or "production", payload) for d in targets),
+                return_exceptions=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Aleph: push for seq %d failed", event.seq, exc_info=True)
+            return
+        for device, result in zip(targets, results):
+            if isinstance(result, BaseException):
+                logger.warning("Aleph: push to %s failed: %s", device.id, result)
+            elif result.token_is_dead:
+                logger.info("Aleph: APNs rejected %s's push token (%d %s); dropping it",
+                            device.id, result.status, result.reason)
+                await asyncio.to_thread(store.drop_push_token, device.push_token)
+            elif result.config_problem:
+                self._report_push_config_problem(result)
+            elif not result.ok:
+                logger.warning("Aleph: push to %s failed: %d %s", device.id, result.status, result.reason)
+            else:
+                self._push_problems_reported.clear()  # fixed: a new breakage gets reported again
+                logger.info("Aleph: pushed seq %d to %s (%s): APNs %d", event.seq, device.id,
+                            device.push_environment or "production", result.status)
 
     def _live(self, event_type: str, payload: dict[str, Any]) -> None:
         """Broadcast a live-only event; safe from any thread (status text arrives off-loop)."""
@@ -374,6 +476,11 @@ class AlephAdapter(BasePlatformAdapter):
     # ── calls ──────────────────────────────────────────────────────────────────────────────────
 
     async def handle_call(self, method: str, params: dict[str, Any], conn: Optional[Connection] = None) -> Any:
+        if method == "push.register":
+            if conn is None or not conn.device_id:
+                raise RpcError(INVALID_PARAMS, "push.register needs a paired device")
+            await self._register_push(conn, params)
+            return {}
         if method == "message.send":
             return {"seq": await self._accept_user_message(params)}
         if method == "chat.stop":

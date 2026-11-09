@@ -8,7 +8,7 @@ description: >
   published through a tunnel or on the home network. Devices pair once by scanning a
   QR code (`hermes aleph pair`) and are known by their keys. One chat
   ("main") with a durable, replayable event log, streaming drafts, typing and status text,
-  read receipts, approval and question cards, attachments, and
+  read receipts, approval and question cards, attachments, content-free APNs push, and
   home-channel delivery for `session: main` cron jobs and webhooks.
 author: clawd-xsl
 requires_env:
@@ -28,6 +28,22 @@ optional_env:
   - name: ALEPH_PUBLIC_URL
     description: "Base URL the phone uses, pairing included, such as https://aleph.xsl.sh (default http://<LAN address>:<port>); goes into pairing links"
     prompt: "Public URL"
+    password: false
+  - name: ALEPH_APNS_KEY_FILE
+    description: "Path to the APNs .p8 key (push is off without the four APNs settings)"
+    prompt: "APNs key file"
+    password: false
+  - name: ALEPH_APNS_KEY_ID
+    description: "The APNs key's id"
+    prompt: "APNs key id"
+    password: false
+  - name: ALEPH_APNS_TEAM_ID
+    description: "Apple developer team id"
+    prompt: "APNs team id"
+    password: false
+  - name: ALEPH_APNS_TOPIC
+    description: "The app's bundle id (APNs topic)"
+    prompt: "APNs topic"
     password: false
   - name: ALEPH_HOME_CHANNEL
     description: "Home channel for cron / webhook delivery (default main; set to off to keep another platform's home)"

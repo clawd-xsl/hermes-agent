@@ -203,10 +203,10 @@ def _cmd_devices(args: argparse.Namespace) -> int:
     if not devices:
         print("No paired devices. Pair one with `hermes aleph pair`.")
         return 0
-    rows = [("ID", "NAME", "MODEL", "KEY", "PAIRED", "LAST SEEN")]
+    rows = [("ID", "NAME", "MODEL", "KEY", "PAIRED", "LAST SEEN", "PUSH")]
     for d in devices:
         rows.append((d.id, d.name, d.model or "-", fingerprint(d.public_key), _when(d.created_at),
-                     _when(d.last_seen_at)))
+                     _when(d.last_seen_at), d.push_environment if d.push_token else "-"))
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
     for row in rows:
         print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
@@ -222,6 +222,6 @@ def _cmd_revoke(args: argparse.Namespace) -> int:
             return 1
     finally:
         store.close()
-    print(f"Revoked {device.name} ({device.id}). Its key no longer connects, and a "
+    print(f"Revoked {device.name} ({device.id}). Its key no longer connects, its push token is gone, and a "
           "running gateway closes its connections within a few seconds.")
     return 0

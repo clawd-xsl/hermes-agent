@@ -56,7 +56,9 @@ CREATE TABLE IF NOT EXISTS devices (
     model TEXT NOT NULL,
     public_key BLOB NOT NULL UNIQUE,
     created_at REAL NOT NULL,
-    last_seen_at REAL
+    last_seen_at REAL,
+    push_token TEXT,
+    push_environment TEXT
 );
 CREATE TABLE IF NOT EXISTS pairing (
     secret BLOB NOT NULL,
@@ -131,14 +133,16 @@ class Device:
     public_key: bytes
     created_at: float
     last_seen_at: Optional[float]
+    push_token: Optional[str]
+    push_environment: Optional[str]
 
 
-_DEVICE_COLUMNS = "id, name, model, public_key, created_at, last_seen_at"
+_DEVICE_COLUMNS = "id, name, model, public_key, created_at, last_seen_at, push_token, push_environment"
 
 
 def _device(row) -> Device:
     return Device(row[0], row[1], row[2], bytes(row[3]), float(row[4]),
-                  float(row[5]) if row[5] is not None else None)
+                  float(row[5]) if row[5] is not None else None, row[6], row[7])
 
 
 class AlephStore:
@@ -287,9 +291,31 @@ class AlephStore:
             self._db.execute("UPDATE devices SET last_seen_at = ? WHERE id = ?", (at or time.time(), device_id))
 
     def revoke_device(self, device_id: str) -> bool:
-        """Forget a device: its key no longer completes a handshake."""
+        """Forget a device: its key no longer completes a handshake, and its push token goes with it."""
         with self._lock:
             return self._db.execute("DELETE FROM devices WHERE id = ?", (device_id,)).rowcount > 0
+
+    def set_push_token(self, device_id: str, token: Optional[str], environment: Optional[str]) -> None:
+        """Register (or with ``None`` drop) a device's APNs token. A token moves: it is cleared from
+        any other device that had it (the same phone paired again), so it is never pushed twice."""
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if token is not None:
+                    self._db.execute("UPDATE devices SET push_token = NULL, push_environment = NULL "
+                                     "WHERE push_token = ? AND id != ?", (token, device_id))
+                self._db.execute("UPDATE devices SET push_token = ?, push_environment = ? WHERE id = ?",
+                                 (token, environment if token is not None else None, device_id))
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+
+    def drop_push_token(self, token: str) -> None:
+        """APNs said the token is dead (410 / BadDeviceToken)."""
+        with self._lock:
+            self._db.execute("UPDATE devices SET push_token = NULL, push_environment = NULL WHERE push_token = ?",
+                             (token,))
 
     # ── pairing ──────────────────────────────────────────────────────────────────────────────
 
