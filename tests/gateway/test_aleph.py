@@ -364,14 +364,21 @@ async def test_typing_and_status_text_are_live(adapter):
         assert adapter.supports_status_text
         await adapter.send_typing("main")
         await adapter.send_typing("main")  # the refresh repeats: one event
-        # The gateway sets the status from the agent's worker thread.
-        await asyncio.to_thread(adapter.set_status_text, "main", "Searching the web…")
+        # Hermes's Slack-style live status ("is searching …") is not what Aleph shows.
+        await asyncio.to_thread(adapter.set_status_text, "main", "is searching the web…")
+        # The gateway reports the tool from the agent's worker thread; Aleph words the line itself.
+        source = SimpleNamespace(chat_id="main")
+        await asyncio.to_thread(adapter.on_tool_activity, source, {
+            "type": "tool.started", "tool": "web_search", "args": {"query": "flights to Tokyo"}, "live_status": "full"})
+        await asyncio.sleep(0.05)
+        await asyncio.to_thread(adapter.on_tool_activity, source, {"type": "tool.completed", "tool": "web_search"})
         await asyncio.sleep(0.05)
         await adapter.stop_typing("main")
-        frames = [(await phone.event())["params"] for _ in range(3)]
+        frames = [f for f in [(await phone.event())["params"] for _ in range(6)] if f["type"] == "typing"]
         assert frames == [
             {"type": "typing", "payload": {"active": True}},
-            {"type": "typing", "payload": {"active": True, "status": "Searching the web…"}},
+            {"type": "typing", "payload": {"active": True, "status": "Searching the web for flights to Tokyo…"}},
+            {"type": "typing", "payload": {"active": True}},
             {"type": "typing", "payload": {"active": False}},
         ]
     finally:

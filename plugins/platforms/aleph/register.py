@@ -86,8 +86,11 @@ def register(ctx) -> None:
         standalone_send=StandaloneSendPolicy(label="Aleph", media=True, text_direct=True),
         standalone_sender_fn=standalone_send, max_message_length=MAX_MESSAGE_LENGTH,
         emoji="ℵ", pii_safe=False, allow_update_command=True, platform_hint=_PLATFORM_HINT,
-        # Drafts stream whenever the global ``streaming.enabled`` switch is on.
-        display_tier="high", display_overrides={"streaming": True},
+        # Drafts stream whenever the global ``streaming.enabled`` switch is on. Tool activity is not
+        # part of the conversation: no progress rows and no "still working" notices; the status line
+        # and activity history say it instead.
+        display_tier="high", display_overrides={"streaming": True, "tool_progress": "off", "live_status": "full",
+                                                "long_running_notifications": False},
     )
     register_tools(ctx)
     ctx.register_cli_command(

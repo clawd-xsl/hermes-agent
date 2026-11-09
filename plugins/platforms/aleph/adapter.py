@@ -45,6 +45,7 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import MessageDeduplicator
 
 from plugins.platforms.aleph import noise
+from plugins.platforms.aleph import activity
 from plugins.platforms.aleph.profile import DEFAULT_NAME, Avatar
 from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file, file_url
 from plugins.platforms.aleph.noise import b64url, from_b64url
@@ -262,6 +263,11 @@ class AlephAdapter(BasePlatformAdapter):
         self._avatar_digest = ""
         self._avatar_updated_at = ""
         self._profile_lock = asyncio.Lock()
+        # Activity (protocol "Activity"): the message each chat's turn answers, its open steps (in
+        # start order), and the status line they give.
+        self._turn_message: dict[str, Optional[str]] = {}
+        self._open_steps: dict[str, list[tuple[str, dict[str, Any]]]] = {}  # chat -> [(raw tool, step)]
+        self._activity_status: dict[str, Optional[str]] = {}
         self._dedup = MessageDeduplicator(max_size=5000, ttl_seconds=3600)
         self._store: Optional[AlephStore] = None
         self._server: Optional[AlephServer] = None
@@ -513,7 +519,8 @@ class AlephAdapter(BasePlatformAdapter):
         self._on_loop(emit)
 
     def live_state_frames(self) -> list[str]:
-        """What a phone connecting mid-turn needs to show the present: typing and the open draft."""
+        """What a phone connecting mid-turn needs to show the present: typing, the open draft, and
+        the steps still running."""
         frames = []
         for chat, status in self._typing.items():
             if chat == self.chat_id:
@@ -524,6 +531,8 @@ class AlephAdapter(BasePlatformAdapter):
         open_draft = self._open_draft.get(self.chat_id)
         if open_draft is not None:
             frames.append(event_frame("draft", {"draft_id": open_draft[0], "text": open_draft[1]}))
+        for _raw, step in self._open_steps.get(self.chat_id) or []:
+            frames.append(event_frame("activity", dict(step)))
         return frames
 
     async def replay_snapshot(self, after: int) -> ReplaySnapshot:
@@ -647,6 +656,8 @@ class AlephAdapter(BasePlatformAdapter):
             return {}
         if method == "file.ticket":
             return await self._file_ticket(params)
+        if method == "activity.list":
+            return await self.list_activity(params)
         if method == "ping":
             return {}
         raise RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
@@ -742,6 +753,10 @@ class AlephAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """A turn started on the person's input: everything they sent so far is being read."""
         source = getattr(event, "source", None)
+        if getattr(source, "platform", None) == self.platform:
+            # The steps of this turn answer the newest of the person's messages (none for a cron run).
+            chat = str(getattr(source, "chat_id", "") or self.chat_id)
+            self._turn_message[chat] = None if getattr(event, "internal", False) else self._last_user_message
         if getattr(event, "internal", False) or getattr(source, "platform", None) != self.platform:
             return
         if str(getattr(source, "chat_id", "")) != self.chat_id or self._store is None:
@@ -761,6 +776,7 @@ class AlephAdapter(BasePlatformAdapter):
             return
         chat = str(getattr(source, "chat_id", "") or self.chat_id)
         self._clear_draft(chat)
+        await self._close_open_steps(chat)
         self._set_typing(chat, active=False)
 
     # ── outbound text ──────────────────────────────────────────────────────────────────────────
@@ -855,21 +871,79 @@ class AlephAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         chat = str(chat_id or self.chat_id)
-        status = (getattr(self, "_status_text", None) or {}).get(chat)
-        self._set_typing(chat, active=True, status=status)
+        self._set_typing(chat, active=True, status=self._activity_status.get(chat))
 
     async def stop_typing(self, chat_id: str) -> None:
         self._set_typing(str(chat_id or self.chat_id), active=False)
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
-        """Called from the agent's worker thread: the typing state is only touched on the loop."""
+        """Hermes's live status is the Slack form ("is searching …"); Aleph words its status line
+        itself from the tool activity (``on_tool_activity``), so this text is not shown."""
         super().set_status_text(chat_id, text)
-        chat, status = str(chat_id), text or None
 
-        def apply() -> None:
-            if chat in self._typing and self._typing.get(chat) != status:
-                self._set_typing(chat, active=True, status=status)
-        self._on_loop(apply)
+    # ── activity ───────────────────────────────────────────────────────────────────────────────
+
+    def on_tool_activity(self, source: Any, event: dict[str, Any]) -> None:
+        """A tool started or finished in a turn this channel answers (the gateway's progress
+        callback, on the agent's worker thread)."""
+        chat = str(getattr(source, "chat_id", "") or self.chat_id)
+        mode = str(event.get("live_status") or "full")
+        tool = str(event.get("tool") or "")
+        if event.get("type") == "tool.started":
+            described = activity.describe(tool, event.get("args"), with_preview=mode == "full")
+            if described is None:
+                return  # looking tools up: no step, and the line stays on "Thinking…"
+            name, summary, detail = described
+            step = activity.new_step(self._turn_message.get(chat), name, summary, detail, now_iso())
+            show = mode != "off"
+            self._on_loop(lambda: asyncio.ensure_future(self._step_started(chat, tool, step, show)))
+        elif event.get("type") == "tool.completed":
+            ok = not event.get("is_error")
+            self._on_loop(lambda: asyncio.ensure_future(self._step_finished(chat, tool, ok)))
+
+    async def _step_started(self, chat: str, tool: str, step: dict[str, Any], show: bool) -> None:
+        if self._store is None:
+            return
+        self._open_steps.setdefault(chat, []).append((tool, step))
+        await asyncio.to_thread(self.store.add_step, step)
+        self._live("activity", dict(step))
+        if show:
+            self._show_status(chat, step["summary"] + "…")
+
+    async def _step_finished(self, chat: str, tool: str, ok: Optional[bool]) -> None:
+        open_steps = self._open_steps.get(chat) or []
+        # Pair by tool name, oldest first: the progress callback carries no call id.
+        index = next((i for i, (raw, _) in enumerate(open_steps) if raw == tool), None)
+        if index is None or self._store is None:
+            return
+        _, step = open_steps.pop(index)
+        step.update({"finished_at": now_iso(), "ok": ok})
+        await asyncio.to_thread(self.store.update_step, step)
+        self._live("activity", dict(step))
+        # Back to the most recent step still running, or to null (the phone shows "Thinking…").
+        self._show_status(chat, open_steps[-1][1]["summary"] + "…" if open_steps else None)
+
+    async def _close_open_steps(self, chat: str) -> None:
+        """The turn ended with steps never reported finished (a stop, an error): they did not work."""
+        for raw, _step in list(self._open_steps.get(chat) or []):
+            await self._step_finished(chat, raw, False)
+        self._open_steps.pop(chat, None)
+        self._activity_status.pop(chat, None)
+
+    def _show_status(self, chat: str, status: Optional[str]) -> None:
+        self._activity_status[chat] = status
+        if chat in self._typing and self._typing.get(chat) != status:
+            self._set_typing(chat, active=True, status=status)
+
+    async def list_activity(self, params: dict[str, Any]) -> dict[str, Any]:
+        """``activity.list {before?, limit?}`` -> ``{steps, more}``, newest first."""
+        before, limit = params.get("before"), params.get("limit", 50)
+        if before is not None and not isinstance(before, str):
+            raise RpcError(INVALID_PARAMS, "before must be a step id")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise RpcError(INVALID_PARAMS, "limit must be from 1 to 200")
+        steps, more = await asyncio.to_thread(self.store.steps, before=before, limit=limit)
+        return {"steps": steps, "more": more}
 
     def _on_loop(self, fn) -> None:
         loop = self._loop

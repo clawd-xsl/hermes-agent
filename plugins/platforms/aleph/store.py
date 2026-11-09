@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS devices (
     push_token TEXT,
     push_environment TEXT
 );
+CREATE TABLE IF NOT EXISTS activity (
+    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    step TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pairing (
     secret BLOB NOT NULL,
     created_at REAL NOT NULL,
@@ -377,6 +382,35 @@ class AlephStore:
                 self._db.execute("ROLLBACK")
                 raise
         return _device(row)
+
+    # ── activity ───────────────────────────────────────────────────────────────────────────────
+
+    def add_step(self, step: dict[str, Any], *, keep: int = 500) -> None:
+        """Record an activity step; only the most recent ``keep`` are kept (not in the event log)."""
+        with self._lock:
+            self._db.execute("INSERT INTO activity (id, step) VALUES (?, ?)",
+                             (step["id"], json.dumps(step, ensure_ascii=False)))
+            self._db.execute("DELETE FROM activity WHERE rowid <= (SELECT MAX(rowid) FROM activity) - ?", (keep,))
+
+    def update_step(self, step: dict[str, Any]) -> None:
+        with self._lock:
+            self._db.execute("UPDATE activity SET step = ? WHERE id = ?",
+                             (json.dumps(step, ensure_ascii=False), step["id"]))
+
+    def steps(self, *, before: Optional[str] = None, limit: int = 50) -> tuple[list[dict[str, Any]], bool]:
+        """The most recent steps, newest first, older than ``before`` (a step id) when given; and
+        whether there are more."""
+        with self._lock:
+            if before:
+                row = self._db.execute("SELECT rowid FROM activity WHERE id = ?", (before,)).fetchone()
+                if row is None:
+                    return [], False
+                rows = self._db.execute("SELECT step FROM activity WHERE rowid < ? ORDER BY rowid DESC LIMIT ?",
+                                        (row[0], limit + 1)).fetchall()
+            else:
+                rows = self._db.execute("SELECT step FROM activity ORDER BY rowid DESC LIMIT ?",
+                                        (limit + 1,)).fetchall()
+        return [json.loads(r[0]) for r in rows[:limit]], len(rows) > limit
 
     # ── meta ───────────────────────────────────────────────────────────────────────────────────
 

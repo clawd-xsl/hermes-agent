@@ -11,7 +11,8 @@ What the channel gives the phone:
   phone that was offline catches up from the last `seq` it stored;
 - streaming drafts of the reply, typing with a status line ("is running …"), and read receipts (two checks
   once a turn that includes the person's messages starts);
-- tool progress as compact rows, gateway notices as system notes;
+- the agent's activity out of the thread: one line saying what it is doing, and a history of its steps;
+- gateway notices as system notes;
 - approval cards for dangerous commands and question cards for the `clarify` tool;
 - attachments both ways, and shared locations (they reach the agent as a location pin with a map link);
 - end-to-end encryption: everything between the phone and the plugin, files included, is ciphertext to
@@ -200,6 +201,28 @@ Without all four, the channel works and pushes nothing; the gateway log says `pu
   machine, not through the tunnel.
 - A token Apple rejects (`410`, or `400 BadDeviceToken`) is dropped. Pushing never delays delivery over the
   WebSocket.
+
+## Activity
+
+What the agent does between a message and its reply is not part of the conversation, so Hermes's
+tool-progress messages are off on Aleph (`display.platforms.aleph.tool_progress: off` by default; set it
+back to `all` to have them in the thread), and so are the "still working" notices
+(`long_running_notifications`). Instead:
+
+- the phone shows one line under the agent's name while it works, such as "Searching the web for flights
+  to Tokyo…", from Hermes's own tool labels, and nothing between tools;
+- each tool call is a step, sent to connected phones as it starts and finishes and kept on the server
+  (the most recent 500) for the history the phone shows; `activity.list` pages through them. A step
+  carries what the tool was given in full (the command, the query, the file and its text, up to 2000
+  characters with its line breaks), with secrets redacted by Hermes's redaction patterns.
+
+A call through the `tool_call` bridge is shown as the tool it runs; looking tools up (`tool_search`,
+`tool_describe`) is no step, and the line stays on "Thinking…". Aleph's own tools have their own words
+("Reacting to a message", "Changing name or avatar").
+
+`display.platforms.aleph.live_status` controls the wording: `full` (the default) names what the tool
+was given, `verb` only what it does ("Searching the web") and leaves the arguments out of the steps
+too, `off` shows no line. Steps are recorded either way.
 
 ## Attachments and locations
 
