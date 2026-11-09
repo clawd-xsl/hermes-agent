@@ -29,6 +29,14 @@ optional_env:
     description: "Base URL the phone uses, pairing included, such as https://aleph.xsl.sh (default http://<LAN address>:<port>); goes into pairing links"
     prompt: "Public URL"
     password: false
+  - name: ALEPH_ACCESS_ID
+    description: "Optional: a Cloudflare Access service token's client id, put into pairing links for the phone to send"
+    prompt: "Cloudflare Access client id"
+    password: false
+  - name: ALEPH_ACCESS_SECRET
+    description: "Optional: that service token's client secret"
+    prompt: "Cloudflare Access client secret"
+    password: true
   - name: ALEPH_APNS_KEY_FILE
     description: "Path to the APNs .p8 key (push is off without the four APNs settings)"
     prompt: "APNs key file"

@@ -65,7 +65,7 @@ since the agent runs there.
   pairing; the server stores only the public half, which is what identifies the device. There are no
   tokens or passwords.
 - Each connection to `/aleph/v1/ws` starts with a `Noise_IK_25519_ChaChaPoly_SHA256` handshake (prologue
-  `aleph/1`). An unknown or revoked device key, or a handshake not finished within 10 seconds, closes with
+  `aleph/1`). An unknown or revoked device key, or a handshake not finished within 5 seconds, closes with
   `4401`. After it, each binary WebSocket message is one JSON-RPC frame, encrypted with ChaCha20-Poly1305.
   The phone accepts only the server key it pinned at pairing.
 - Files are encrypted with a key of their own, which travels only inside the encrypted channel; the HTTP
@@ -110,6 +110,33 @@ hermes aleph revoke d_3f9a…   # the device's key no longer connects
 Revoking closes the device's open connections within a couple of seconds (WebSocket close code `4401`) and
 drops its push token.
 
+## What strangers can reach
+
+The public address is reachable by anyone, and the two WebSockets must answer before anyone is
+authenticated. The plugin keeps that surface small:
+
+1. **Upgrade gate.** Every upgrade to `/aleph/v1/ws` and `/aleph/v1/pair` carries
+   `X-Aleph-Mac: <ts>.<nonce>.<mac>`, an HMAC-SHA256 keyed by `SHA256("aleph/1/mac" ‖ server public key)`
+   over `<ts>.<nonce>.<path>`. A missing or malformed header, a `ts` more than 120 seconds off, a nonce
+   seen in the last 240 seconds or a wrong MAC gets a bare `404`, the same as a path that does not exist.
+   The server key is only in pairing codes and on paired phones (WireGuard's `mac1` idea).
+2. **A small, strict handshake.** At most 16 unauthenticated connections in all and 2 per address. The
+   first message must be binary and exactly 96 bytes (`/ws`) or at most 512 (`/pair`), within 5 seconds;
+   anything else closes before any cryptography. Until the handshake succeeds nothing is parsed, nothing
+   is read from the database (device keys and the pending pairing are held in memory), and nothing the
+   peer sent is logged.
+3. **An edge gate (optional).** Behind Cloudflare, the hostname can also sit behind
+   [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/) with a
+   service token, so requests without it never reach this machine:
+   - In Zero Trust → Access, create a service token, and a self-hosted application for `aleph.xsl.sh`
+     with one policy: action **Service Auth**, include **Service Token** → that token.
+   - Put the token on the Hermes machine: `ALEPH_ACCESS_ID=<client id>` and
+     `ALEPH_ACCESS_SECRET=<client secret>`. `hermes aleph pair` then adds `access_id` and `access_secret` to
+     the link, and the phone sends them on every request as `CF-Access-Client-Id` /
+     `CF-Access-Client-Secret`.
+   - The plugin never checks them; Cloudflare does. Without Cloudflare, leave them out: layers 1 and 2
+     still hold.
+
 ## Reach it from anywhere
 
 The phone must reach the agent away from home, so publish the listener through an outbound tunnel. With
@@ -135,8 +162,11 @@ ingress:
   - service: http_status:404
 ```
 
-The listener serves only `/aleph/v1/ws`, `/aleph/v1/pair` and `/aleph/v1/files/`.
-Hermes's dashboard and its gateway WebSocket (`/api/ws`) run on other ports and are never published.
+The listener serves only `/aleph/v1/ws`, `/aleph/v1/pair` and `/aleph/v1/files/`; Hermes's dashboard and its
+gateway WebSocket (`/api/ws`) run on other ports and are never published. Route the whole name rather than
+path rules: with path rules, the plugin's paths would answer with the plugin's `404` and every other path
+with cloudflared's, and a scanner could tell which paths exist. With one rule, every path a stranger tries
+(an unknown one, `/aleph/v1/ws` without a valid `X-Aleph-Mac`, a wrong method) gets the same bare `404`.
 
 Run it with `cloudflared tunnel run hermes` (or install it as a service: `cloudflared service install`), set
 `ALEPH_PUBLIC_URL=https://aleph.xsl.sh`, restart the gateway, and pair. WebSockets need no extra settings.
@@ -185,6 +215,8 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_HOST` | `127.0.0.1` | Address to bind: loopback behind a tunnel, `0.0.0.0` (or a LAN address) for the home network |
 | `ALEPH_PORT` | `8650` | Port to bind |
 | `ALEPH_PUBLIC_URL` | `http://<LAN address>:<port>` | Base URL the phone uses, pairing included; goes into pairing links |
+| `ALEPH_ACCESS_ID` | | Optional: a Cloudflare Access service token's client id, put into pairing links |
+| `ALEPH_ACCESS_SECRET` | | Optional: that token's client secret |
 | `ALEPH_APNS_KEY_FILE` | | Path to the APNs `.p8` key |
 | `ALEPH_APNS_KEY_ID` | | The key's id |
 | `ALEPH_APNS_TEAM_ID` | | Apple developer team id |
@@ -193,7 +225,7 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` |
 | `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`), and encrypted files |
 
-The same keys can be set under `platforms.aleph.extra` in `config.yaml` (`host`, `port`, `public_url`,
+The same keys can be set under `platforms.aleph.extra` in `config.yaml` (`host`, `port`, `public_url`, `access_id`, `access_secret`,
 `apns_key_file`, `apns_key_id`, `apns_team_id`, `apns_topic`, `history_limit`, `state_dir`); environment
 variables win.
 
@@ -206,5 +238,5 @@ variables win.
 - `PUT /aleph/v1/files/<ticket>`: upload ciphertext of exactly the size the ticket was issued for (`204`).
 - `GET /aleph/v1/files/<ticket>`: download ciphertext; each link works once.
 
-No request carries credentials: connections authenticate inside the Noise handshake, and file transfers by
-their one-time tickets.
+No request carries credentials: the two WebSocket upgrades carry only the `X-Aleph-Mac` filter,
+connections authenticate inside the Noise handshake, and file transfers by their one-time tickets.

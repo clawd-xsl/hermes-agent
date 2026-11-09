@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 
 import aiohttp
 
@@ -19,6 +21,14 @@ def base_url(adapter):
 
 def url(adapter, path):
     return f"{base_url(adapter)}/aleph/v1{path}"
+
+
+def mac_headers(adapter, path, *, ts=None, nonce=None, key=None):
+    """The upgrade gate's ``X-Aleph-Mac`` for ``path`` (``/aleph/v1/ws`` or ``/aleph/v1/pair``)."""
+    from plugins.platforms.aleph.server import mac_key, upgrade_mac
+    ts = int(time.time()) if ts is None else ts
+    nonce = nonce or b64url(os.urandom(16))
+    return {"X-Aleph-Mac": upgrade_mac(key or mac_key(adapter.static.public), ts, nonce, path)}
 
 
 def pair_device(adapter, name="Test phone", model="iPhone"):
@@ -114,7 +124,7 @@ class Phone:
 
 async def handshake(session, adapter, keys, *, server_key=None):
     """Open ``/ws`` and run IK; returns (ws, transport). The server's answer must decrypt."""
-    ws = await session.ws_connect(url(adapter, "/ws"))
+    ws = await session.ws_connect(url(adapter, "/ws"), headers=mac_headers(adapter, "/aleph/v1/ws"))
     hs = noise.initiator(noise.IK, noise.PROLOGUE, keys, server_key or adapter.static.public)
     await ws.send_bytes(hs.write_message(b""))
     msg = await asyncio.wait_for(ws.receive(), 5)
@@ -138,7 +148,8 @@ async def connect(adapter, keys) -> Phone:
 async def run_pairing(session, adapter, secret: bytes, keys, payload: dict, *, headers=None,
                       server_key=None):
     """The phone's side of the pairing handshake: ``(answer payload, None)`` or ``(None, close code)``."""
-    ws = await session.ws_connect(url(adapter, "/pair"), headers=headers or {})
+    ws = await session.ws_connect(url(adapter, "/pair"),
+                                  headers={**mac_headers(adapter, "/aleph/v1/pair"), **(headers or {})})
     hs = noise.initiator(noise.IKPSK1, noise.PAIR_PROLOGUE, keys, server_key or adapter.static.public, psk=secret)
     await ws.send_bytes(hs.write_message(json.dumps(payload).encode()))
     msg = await asyncio.wait_for(ws.receive(), 5)

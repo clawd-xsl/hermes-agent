@@ -64,6 +64,23 @@ def _vector(protocol: str, prologue: bytes, msg1_payload: bytes, msg2_payload: b
     return vector
 
 
+def _upgrade_mac_vector() -> dict:
+    """The upgrade gate's ``X-Aleph-Mac`` (protocol "Exposure", layer 1) for fixed inputs."""
+    from plugins.platforms.aleph.noise import b64url
+    from plugins.platforms.aleph.server import mac_key, upgrade_mac
+    server_public, ts, nonce, path = b"\x07" * 32, 1794200000, b"\xab" * 16, "/aleph/v1/ws"
+    key = mac_key(server_public)
+    return {
+        "server_static_public": server_public.hex(),
+        "mac_key": key.hex(),
+        "ts": ts,
+        "nonce": nonce.hex(),
+        "nonce_b64url": b64url(nonce),
+        "path": path,
+        "header": upgrade_mac(key, ts, b64url(nonce), path),
+    }
+
+
 def build_vectors() -> dict:
     hello = b'{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol":1,"after":0}}'
     answer = b'{"jsonrpc":"2.0","id":1,"result":{"protocol":1,"chat":{"id":"main"},"latest":0,"reset":false}}'
@@ -82,6 +99,7 @@ def build_vectors() -> dict:
                      ("responder", b"fourth")],
                     psk=hashlib.sha256(b"aleph noise vectors: pair secret").digest()),
         ],
+        "upgrade_mac": [_upgrade_mac_vector()],
     }
 
 

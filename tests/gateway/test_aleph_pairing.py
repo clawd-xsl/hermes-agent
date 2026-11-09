@@ -17,7 +17,7 @@ import pytest_asyncio
 from gateway.config import PlatformConfig
 from plugins.platforms.aleph import noise
 from tests.gateway.aleph_phone import (
-    connect, handshake, pair_device, run_pairing, start_pairing, url as _url)
+    connect, handshake, mac_headers, pair_device, run_pairing, start_pairing, url as _url)
 
 PUSH_TOKEN = "ab" * 32
 
@@ -98,10 +98,13 @@ async def test_a_wrong_secret_or_server_key_closes_with_4403(adapter):
     async with aiohttp.ClientSession() as session:
         _, code = await run_pairing(session, adapter, os.urandom(32), noise.KeyPair.generate(), {})
         assert code == 4403
-        # A phone that pinned another server key cannot complete the handshake.
-        _, code = await run_pairing(session, adapter, secret, noise.KeyPair.generate(), {},
-                                    server_key=noise.KeyPair.generate().public)
-        assert code == 4403
+        # A phone that pinned another server key: its MAC fails the gate before any handshake.
+        with pytest.raises(aiohttp.WSServerHandshakeError) as info:
+            await run_pairing(session, adapter, secret, noise.KeyPair.generate(), {},
+                              server_key=noise.KeyPair.generate().public,
+                              headers=mac_headers(adapter, "/aleph/v1/pair",
+                                                  key=b"\x00" * 32))
+        assert info.value.status == 404
         # The secret is still pending after failed attempts.
         answer, code = await run_pairing(session, adapter, secret, noise.KeyPair.generate(), {"model": "iPhone"})
         assert code is None and adapter.store.device(answer["device_id"]).name == "iPhone"
@@ -209,10 +212,13 @@ async def test_a_slow_handshake_closes_with_4401(adapter, monkeypatch):
     from plugins.platforms.aleph import server as server_mod
     monkeypatch.setattr(server_mod, "HANDSHAKE_SECONDS", 0.2)
     async with aiohttp.ClientSession() as session:
-        ws = await session.ws_connect(_url(adapter, "/ws"))
+        ws = await session.ws_connect(_url(adapter, "/ws"), headers=mac_headers(adapter, "/aleph/v1/ws"))
         msg = await ws.receive(timeout=3)
         assert msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED) and ws.close_code == 4401
         await ws.close()
+    assert server_mod.HANDSHAKE_SECONDS == 0.2
+    monkeypatch.undo()
+    assert server_mod.HANDSHAKE_SECONDS == 5.0
 
 
 @pytest.mark.asyncio
@@ -285,7 +291,7 @@ def _link_params(out):
 
 def test_urls_for_the_pairing_link(monkeypatch):
     from plugins.platforms.aleph import cli
-    for name in ("ALEPH_PUBLIC_URL", "ALEPH_HOST", "ALEPH_PORT"):
+    for name in ("ALEPH_PUBLIC_URL", "ALEPH_HOST", "ALEPH_PORT", "ALEPH_ACCESS_ID", "ALEPH_ACCESS_SECRET"):
         monkeypatch.delenv(name, raising=False)
     assert cli.server_url({}) == "http://127.0.0.1:8650"
     assert cli.server_url({"host": "192.168.1.20", "port": 9000}) == "http://192.168.1.20:9000"
@@ -294,9 +300,17 @@ def test_urls_for_the_pairing_link(monkeypatch):
     monkeypatch.setenv("ALEPH_PUBLIC_URL", "https://aleph.xsl.sh/")
     assert cli.server_url({"host": "0.0.0.0"}) == "https://aleph.xsl.sh"
     assert cli.server_url({}, "http://127.0.0.1:8650") == "http://127.0.0.1:8650"
+    assert cli.access_token({}) is None
+    monkeypatch.setenv("ALEPH_ACCESS_ID", "abc.access")
+    assert cli.access_token({}) is None  # both or nothing
+    monkeypatch.setenv("ALEPH_ACCESS_SECRET", "s3cr3t/+=")
+    assert cli.access_token({}) == ("abc.access", "s3cr3t/+=")
     assert cli.pair_link(server="https://aleph.xsl.sh", key=b"\x00" * 32, secret=b"\xff" * 32) == (
         "aleph://pair?server=https%3A%2F%2Faleph.xsl.sh"
         "&key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&secret=__________________________________________8")
+    assert cli.pair_link(server="https://aleph.xsl.sh", key=b"\x00" * 32, secret=b"\xff" * 32,
+                         access=("abc.access", "s3cr3t/+=")).endswith(
+        "&access_id=abc.access&access_secret=s3cr3t%2F%2B%3D")
 
 
 def test_cli_pair_devices_and_revoke(monkeypatch, tmp_path, capsys):
@@ -305,6 +319,8 @@ def test_cli_pair_devices_and_revoke(monkeypatch, tmp_path, capsys):
     from plugins.platforms.aleph.store import AlephStore, fingerprint
     monkeypatch.setenv("ALEPH_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("ALEPH_PUBLIC_URL", "https://aleph.xsl.sh")
+    for name in ("ALEPH_ACCESS_ID", "ALEPH_ACCESS_SECRET"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(cli, "_extra", dict)
     monkeypatch.setattr(cli, "_listening", lambda host, port: True)
     assert _cli(["devices"]) == 0
@@ -332,15 +348,20 @@ def test_cli_pair_devices_and_revoke(monkeypatch, tmp_path, capsys):
     assert _cli(["devices"]) == 0 and "No paired devices" in capsys.readouterr().out
 
 
-def test_cli_pair_warns_before_replacing_and_about_unreachable_addresses(monkeypatch, tmp_path, capsys):
+def test_cli_pair_with_an_access_token_and_its_warnings(monkeypatch, tmp_path, capsys):
     from plugins.platforms.aleph import cli
     monkeypatch.setenv("ALEPH_STATE_DIR", str(tmp_path))
     for name in ("ALEPH_PUBLIC_URL", "ALEPH_HOST"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ALEPH_ACCESS_ID", "abc.access")
+    monkeypatch.setenv("ALEPH_ACCESS_SECRET", "s3cr3t")
     monkeypatch.setattr(cli, "_extra", dict)
     monkeypatch.setattr(cli, "_listening", lambda host, port: True)
     assert _cli(["pair", "--no-wait"]) == 0
-    assert "replaces the pending pairing" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "replaces the pending pairing" not in out
+    params = _link_params(out)
+    assert params["access_id"] == "abc.access" and params["access_secret"] == "s3cr3t"
     assert _cli(["pair", "--no-wait", "--server", "http://192.168.1.20:8650"]) == 0
     out = capsys.readouterr().out
     assert "Warning: this replaces the pending pairing" in out

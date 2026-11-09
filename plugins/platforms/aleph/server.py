@@ -1,9 +1,21 @@
 """Aleph's listener: the encrypted WebSocket, pairing, and ticketed file transfer.
 
+What a stranger can reach is kept small, in layers (protocol "Exposure"):
+
+1. **Upgrade gate.** ``/aleph/v1/ws`` and ``/aleph/v1/pair`` need ``X-Aleph-Mac: <ts>.<nonce>.<mac>``, an
+   HMAC keyed by the server's public key (WireGuard's ``mac1`` idea). Without a fresh, unseen, valid
+   one the answer is a bare ``404``, the same as for a path that does not exist.
+2. **Strict handshake.** At most 16 unauthenticated connections (2 per address). The first message
+   must be exactly 96 bytes (connections) or at most 512 (pairing), binary, within 5 seconds;
+   anything else closes before any cryptography. Before authentication nothing is parsed or looked up
+   in the database (device keys and the pending pairing are held in memory) and nothing the peer sent
+   is logged.
+
+Then:
+
 - ``/aleph/v1/ws``: ``Noise_IK_25519_ChaChaPoly_SHA256`` (prologue ``aleph/1``); afterwards each binary
   message is one JSON-RPC 2.0 frame encrypted with that direction's transport key (up to 16 MB). An
-  unknown or revoked key, or a broken handshake, closes with ``4401``. Device keys are looked up in
-  memory, never in the database, before the peer is authenticated.
+  unknown or revoked key, or a broken handshake, closes with ``4401``.
 - ``/aleph/v1/pair``: ``Noise_IKpsk1`` with the pending pairing secret as PSK; ``404`` unless a pairing is
   pending, 5 attempts a minute per address, ``4403`` for a wrong secret.
 - ``PUT`` / ``GET /aleph/v1/files/<ticket>``: ciphertext only, against a one-time ticket issued over the
@@ -19,11 +31,14 @@ and reaches the connection after ``sync.done``, never inside the replay and neve
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import TYPE_CHECKING, Any, Optional
 
 from aiohttp import WSMsgType, web
@@ -53,12 +68,23 @@ CLOSE_UNAUTHORIZED = 4401  # unknown or revoked device key, a broken or slow han
 CLOSE_BAD_SECRET = 4403  # pairing: wrong or expired secret
 CLOSE_PROTOCOL = 1002  # a transport frame that does not decrypt, or a text frame
 
-HANDSHAKE_SECONDS = 10.0
-# A handshake's first message is small (96 bytes to connect, a little more to pair).
-MAX_HANDSHAKE_MESSAGE = 4096
-# Frames stay under 16 MB; the AEAD tag and a little slack on top.
+# The strict handshake (protocol "Exposure").
+HANDSHAKE_SECONDS = 5.0
+IK_MESSAGE1_BYTES = 96  # e (32) + encrypted s (32 + 16) + empty encrypted payload (16)
+MAX_PAIR_MESSAGE1 = 512
+MAX_UNAUTHENTICATED = 16
+MAX_UNAUTHENTICATED_PER_ADDRESS = 2
+# Frames stay under 16 MB once authenticated. aiohttp fixes a socket's limit at the upgrade, so
+# /ws takes 16 MB there and checks the handshake's exact size itself; /pair never needs more than 512.
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 MAX_WS_MESSAGE = MAX_FRAME_BYTES + 1024
+
+# The upgrade gate (protocol "Exposure", layer 1).
+MAC_HEADER = "X-Aleph-Mac"
+MAC_LABEL = b"aleph/1/mac"
+MAC_WINDOW_SECONDS = 120
+NONCE_MEMORY_SECONDS = 240
+NONCE_CACHE_SIZE = 8192
 
 # A connection whose queue grows past this is too slow to keep up: it is closed, and the phone
 # reconnects and catches up from its last stored seq.
@@ -87,6 +113,95 @@ def event_frame(event_type: str, payload: dict[str, Any], seq: Optional[int] = N
         params["seq"] = seq
     params["payload"] = payload
     return _frame({"jsonrpc": "2.0", "method": "event", "params": params})
+
+
+_B64URL = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+
+def _b64url_decode(text: str) -> bytes:
+    if not text or not set(text) <= _B64URL:
+        raise ValueError("not base64url")
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def mac_key(server_public: bytes) -> bytes:
+    return hashlib.sha256(MAC_LABEL + server_public).digest()
+
+
+def upgrade_mac(key: bytes, ts: int, nonce: str, path: str) -> str:
+    """The ``X-Aleph-Mac`` value for one upgrade request (what the phone sends)."""
+    digest = hmac.new(key, f"{ts}.{nonce}.{path}".encode(), hashlib.sha256).digest()
+    return f"{ts}.{nonce}.{base64.urlsafe_b64encode(digest).rstrip(b'=').decode()}"
+
+
+class UpgradeGate:
+    """Layer 1: a fresh, unseen ``X-Aleph-Mac`` keyed by the server's public key, or ``404``."""
+
+    def __init__(self, server_public: bytes, *, clock=time.time) -> None:
+        self.key = mac_key(server_public)
+        self._clock = clock
+        self._seen: OrderedDict[str, float] = OrderedDict()  # nonce -> when it may be forgotten
+
+    def check(self, header: Optional[str], path: str) -> bool:
+        if not header or len(header) > 128:
+            return False
+        parts = header.split(".")
+        if len(parts) != 3 or not parts[0].isdigit() or len(parts[0]) > 12:
+            return False
+        ts, nonce, mac = parts
+        try:
+            if len(_b64url_decode(nonce)) != 16:
+                return False
+            mac_bytes = _b64url_decode(mac)
+        except ValueError:
+            return False
+        now = self._clock()
+        if abs(now - int(ts)) > MAC_WINDOW_SECONDS:
+            return False
+        expected = hmac.new(self.key, f"{ts}.{nonce}.{path}".encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(mac_bytes, expected):
+            return False
+        # Only a valid MAC is remembered, so strangers cannot fill the cache.
+        while self._seen and (next(iter(self._seen.values())) <= now or len(self._seen) >= NONCE_CACHE_SIZE):
+            self._seen.popitem(last=False)
+        if nonce in self._seen:
+            return False
+        self._seen[nonce] = now + NONCE_MEMORY_SECONDS
+        return True
+
+
+class PreAuthSlots:
+    """Layer 2: few unauthenticated connections at once, in all and per address."""
+
+    def __init__(self, total: int = MAX_UNAUTHENTICATED, per_address: int = MAX_UNAUTHENTICATED_PER_ADDRESS) -> None:
+        self.total, self.per_address = total, per_address
+        self._by_address: dict[str, int] = {}
+        self.in_use = 0
+
+    def acquire(self, address: str) -> bool:
+        if self.in_use >= self.total or self._by_address.get(address, 0) >= self.per_address:
+            return False
+        self.in_use += 1
+        self._by_address[address] = self._by_address.get(address, 0) + 1
+        return True
+
+    def release(self, address: str) -> None:
+        self.in_use -= 1
+        left = self._by_address.get(address, 1) - 1
+        if left > 0:
+            self._by_address[address] = left
+        else:
+            self._by_address.pop(address, None)
+
+
+@web.middleware
+async def _hide_routes(request: web.Request, handler):
+    """A wrong method on a real path answers like a path that does not exist (a bare 404, no
+    ``Allow`` header), so nothing tells a stranger which paths are there."""
+    try:
+        return await handler(request)
+    except web.HTTPMethodNotAllowed:
+        raise web.HTTPNotFound() from None
 
 
 def client_address(request: web.Request) -> str:
@@ -192,8 +307,10 @@ class AlephServer:
         self.static = static
         self.connections: set[Connection] = set()
         self.pair_limiter = PairRateLimiter()
+        self.gate = UpgradeGate(static.public)
+        self.slots = PreAuthSlots()
         self._runner: Optional[web.AppRunner] = None
-        app = web.Application(client_max_size=MAX_UPLOAD_BYTES)
+        app = web.Application(middlewares=[_hide_routes], client_max_size=MAX_UPLOAD_BYTES)
         app.router.add_get(f"{BASE_PATH}/ws", self._ws_handler)
         app.router.add_get(f"{BASE_PATH}/pair", self._pair_handler)
         app.router.add_put(f"{BASE_PATH}/files/{{ticket}}", self._upload_handler)
@@ -256,34 +373,50 @@ class AlephServer:
     # ── handshakes ─────────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    async def _first_message(ws: web.WebSocketResponse, deadline: float) -> Optional[bytes]:
-        """The handshake's first message: one small binary frame before ``deadline``, else ``None``."""
+    async def _first_message(ws: web.WebSocketResponse, deadline: float, *, exact: int = 0,
+                             limit: int = 0) -> Optional[bytes]:
+        """The handshake's first message: one binary frame of the allowed size before ``deadline``,
+        else ``None`` (nothing about it is inspected further)."""
         try:
             msg = await asyncio.wait_for(ws.receive(), max(0.0, deadline - time.monotonic()))
         except TimeoutError:
             return None
-        if msg.type != WSMsgType.BINARY or len(msg.data) > MAX_HANDSHAKE_MESSAGE:
+        if msg.type != WSMsgType.BINARY:
+            return None
+        size = len(msg.data)
+        if (exact and size != exact) or (limit and size > limit):
             return None
         return bytes(msg.data)
 
+    def _gate(self, request: web.Request) -> None:
+        """Layer 1, before anything else: a bare 404 unless the upgrade carries a valid MAC."""
+        if not self.gate.check(request.headers.get(MAC_HEADER), request.path):
+            raise web.HTTPNotFound()
+
     async def _ws_handler(self, request: web.Request) -> web.StreamResponse:
+        self._gate(request)
         address = client_address(request)
-        deadline = time.monotonic() + HANDSHAKE_SECONDS
-        ws = web.WebSocketResponse(heartbeat=30.0, max_msg_size=MAX_WS_MESSAGE)
-        await ws.prepare(request)
-        message = await self._first_message(ws, deadline)
-        device = None
-        handshake = noise.responder(noise.IK, noise.PROLOGUE, self.static)
-        if message is not None:
-            try:
-                handshake.read_message(message)
-                device = self.adapter.known_device(handshake.rs)  # in memory: no database yet
-            except noise.NoiseError:
-                device = None
-        if device is None or time.monotonic() > deadline:
-            await ws.close(code=CLOSE_UNAUTHORIZED, message=b"unauthorized")
-            return ws
-        await ws.send_bytes(handshake.write_message(b""))
+        if not self.slots.acquire(address):
+            return web.Response(status=503, headers={"Retry-After": "5"})
+        try:
+            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            ws = web.WebSocketResponse(heartbeat=30.0, max_msg_size=MAX_WS_MESSAGE)
+            await ws.prepare(request)
+            message = await self._first_message(ws, deadline, exact=IK_MESSAGE1_BYTES)
+            device = None
+            handshake = noise.responder(noise.IK, noise.PROLOGUE, self.static)
+            if message is not None:
+                try:
+                    handshake.read_message(message)
+                    device = self.adapter.known_device(handshake.rs)  # in memory: no database yet
+                except noise.NoiseError:
+                    device = None
+            if device is None or time.monotonic() > deadline:
+                await ws.close(code=CLOSE_UNAUTHORIZED, message=b"unauthorized")
+                return ws
+            await ws.send_bytes(handshake.write_message(b""))
+        finally:
+            self.slots.release(address)
         conn = Connection(ws, address, handshake.transport(), device.id, device.name)
         self.connections.add(conn)
         await self.adapter.device_seen(device)
@@ -310,6 +443,7 @@ class AlephServer:
         return ws
 
     async def _pair_handler(self, request: web.Request) -> web.StreamResponse:
+        self._gate(request)
         if self.adapter.pending_pairing() is None:  # in memory: no database yet
             raise web.HTTPNotFound()
         address = client_address(request)
@@ -318,22 +452,27 @@ class AlephServer:
             logger.warning("Aleph: pairing attempts are being rate limited")
             return web.json_response({"error": "too many attempts"}, status=429,
                                      headers={"Retry-After": str(max(1, int(wait + 0.999)))})
-        deadline = time.monotonic() + HANDSHAKE_SECONDS
-        ws = web.WebSocketResponse(max_msg_size=MAX_HANDSHAKE_MESSAGE)
-        await ws.prepare(request)
-        message = await self._first_message(ws, deadline)
-        pending = self.adapter.pending_pairing()
-        if pending is None or message is None:
-            await ws.close(code=CLOSE_BAD_SECRET, message=b"no pairing")
-            return ws
-        secret = pending[0]
-        handshake = noise.responder(noise.IKPSK1, noise.PAIR_PROLOGUE, self.static, psk=secret)
+        if not self.slots.acquire(address):
+            return web.Response(status=503, headers={"Retry-After": "5"})
         try:
-            payload = handshake.read_message(message)
-        except noise.NoiseError:
-            logger.warning("Aleph: a pairing attempt used the wrong secret")
-            await ws.close(code=CLOSE_BAD_SECRET, message=b"wrong secret")
-            return ws
+            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            ws = web.WebSocketResponse(max_msg_size=MAX_PAIR_MESSAGE1)
+            await ws.prepare(request)
+            message = await self._first_message(ws, deadline, limit=MAX_PAIR_MESSAGE1)
+            pending = self.adapter.pending_pairing()
+            if pending is None or message is None:
+                await ws.close(code=CLOSE_BAD_SECRET, message=b"no pairing")
+                return ws
+            secret = pending[0]
+            handshake = noise.responder(noise.IKPSK1, noise.PAIR_PROLOGUE, self.static, psk=secret)
+            try:
+                payload = handshake.read_message(message)
+            except noise.NoiseError:
+                logger.warning("Aleph: a pairing attempt used the wrong secret")
+                await ws.close(code=CLOSE_BAD_SECRET, message=b"wrong secret")
+                return ws
+        finally:
+            self.slots.release(address)
         # Authenticated: the payload decrypted under the secret. Only now is it parsed.
         name, model = _device_fields(payload)
         result = await self.adapter.complete_pairing(secret, handshake.rs, name=name, model=model)

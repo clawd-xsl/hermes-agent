@@ -12,7 +12,7 @@ import pytest_asyncio
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import ExecApprovalPrompt
-from tests.gateway.aleph_phone import connect, pair_device, url as _url
+from tests.gateway.aleph_phone import connect, mac_headers, pair_device, url as _url
 
 def _register():
     from plugins.platforms.aleph.register import register
@@ -124,7 +124,7 @@ async def test_unknown_keys_and_plain_frames_are_refused(adapter):
             await handshake(session, adapter, noise.KeyPair.generate())
         assert info.value.args[0] == 4401
         # A text frame instead of the handshake.
-        ws = await session.ws_connect(_url(adapter, "/ws"))
+        ws = await session.ws_connect(_url(adapter, "/ws"), headers=mac_headers(adapter, "/aleph/v1/ws"))
         await ws.send_str('{"jsonrpc":"2.0","id":1,"method":"hello","params":{}}')
         msg = await ws.receive(timeout=5)
         assert msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED) and ws.close_code == 4401

@@ -88,9 +88,21 @@ def server_url(extra: dict[str, Any], override: Optional[str] = None) -> str:
     return f"http://{host}:{port}"
 
 
-def pair_link(*, server: str, key: bytes, secret: bytes) -> str:
+def access_token(extra: dict[str, Any]) -> Optional[tuple[str, str]]:
+    """The optional edge gate (protocol "Exposure", layer 3): a Cloudflare Access service token the
+    phone sends on every request. The plugin never checks it; Cloudflare does."""
+    from plugins.platforms.aleph.adapter import setting
+    access_id = setting(extra, "access_id", "ALEPH_ACCESS_ID")
+    access_secret = setting(extra, "access_secret", "ALEPH_ACCESS_SECRET")
+    return (access_id, access_secret) if access_id and access_secret else None
+
+
+def pair_link(*, server: str, key: bytes, secret: bytes, access: Optional[tuple[str, str]] = None) -> str:
     from plugins.platforms.aleph.noise import b64url
-    return f"aleph://pair?server={quote(server, safe='')}&key={b64url(key)}&secret={b64url(secret)}"
+    link = f"aleph://pair?server={quote(server, safe='')}&key={b64url(key)}&secret={b64url(secret)}"
+    if access:
+        link += f"&access_id={quote(access[0], safe='')}&access_secret={quote(access[1], safe='')}"
+    return link
 
 
 def _lan_address() -> Optional[str]:
@@ -145,6 +157,7 @@ def _cmd_pair(args: argparse.Namespace) -> int:
     try:
         server_key = KeyPair.from_private(load_or_create_server_key(_state_dir(extra)))
         server = server_url(extra, args.server)
+        access = access_token(extra)
         before = {device.id for device in store.devices()}
         pending = store.pending_pairing()
         if pending is not None:
@@ -152,14 +165,14 @@ def _cmd_pair(args: argparse.Namespace) -> int:
             print(f"\n  Warning: this replaces the pending pairing (valid until {_clock(pending[1])}); "
                   "its link stops working now.")
         secret, expires_at = store.new_pairing()
-        link = pair_link(server=server, key=server_key.public, secret=secret)
+        link = pair_link(server=server, key=server_key.public, secret=secret, access=access)
         print()
         qr = _qr(link)
         if qr:
             print(qr)
         else:
             print("  (No QR code: the qrcode package is not installed. Paste the link into Aleph instead.)\n")
-        print(f"  Server: {server}")
+        print(f"  Server: {server}" + ("  (with the Cloudflare Access token)" if access else ""))
         print(f"  Link:   {link}")
         print(f"  Valid until {_clock(expires_at)} (10 minutes), for one device. Anyone who sees this code "
               "can pair, so show it only to the phone.\n")
