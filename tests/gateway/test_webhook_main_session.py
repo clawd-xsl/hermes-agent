@@ -107,6 +107,22 @@ class TestReviewedMainRoute:
         assert len(text.split("\n\n", 1)[1]) == webhook_main.MAX_MAIN_HANDOFF_CHARS and text.endswith("…")
 
     @pytest.mark.asyncio
+    async def test_reviewer_turn_may_end_in_silence(self):
+        """The gateway must keep a reviewer's NO_REPLY as silence, not swap in its unexpected-silence
+        fallback (which the handoff would then forward to main as if it were content)."""
+        from gateway.response_filters import silence_allowed
+        adapter = _adapter({"mail": _route(session="main"), "ci": _route()})
+        events = []
+        adapter.handle_message = AsyncMock(side_effect=events.append)
+        async with TestClient(TestServer(_app(adapter))) as cli:
+            assert (await _post(cli, "mail", "d-silent")).status == 202
+            assert (await _post(cli, "ci", "d-isolated")).status == 202
+        reviewer, isolated = events
+        assert reviewer.reply_expected is False
+        assert silence_allowed(None, reviewer.reply_expected) is True
+        assert isolated.reply_expected is None  # non-review routes keep the gateway default
+
+    @pytest.mark.asyncio
     async def test_a_failed_handoff_fails_the_send(self, monkeypatch):
         adapter = _adapter({"mail": _route(session="main")})
         monkeypatch.setattr(webhook_main, "enqueue_main", AsyncMock(side_effect=MainSessionUnavailable("down")))
