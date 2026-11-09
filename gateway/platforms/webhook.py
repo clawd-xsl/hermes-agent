@@ -849,8 +849,12 @@ class WebhookAdapter(BasePlatformAdapter):
         if main_mode == "review":
             prompt = webhook_main.build_review_prompt(route_name=route_name, event_type=event_type,
                                                       rendered_event=prompt)
+        # A reviewer's NO_REPLY is its normal "skip" verdict, not a human turn left unanswered: declare
+        # that no reply is expected so the gateway keeps the silence instead of substituting its
+        # "returned only a silence marker" fallback, which would then be handed to main as content.
         event = MessageEvent(text=prompt, message_type=MessageType.TEXT, source=source, raw_message=payload,
-                             message_id=delivery_id, timestamp=datetime.fromtimestamp(0, UTC))
+                             message_id=delivery_id, timestamp=datetime.fromtimestamp(0, UTC),
+                             reply_expected=False if main_mode == "review" else None)
         from gateway.platforms.webhook_ingress import admit_producer
         try:
             receipt = await admit_producer(self, event)
