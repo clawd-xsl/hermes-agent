@@ -291,6 +291,21 @@ nothing; an invalid request changes nothing and tells the agent what to fix.
 The tools are defined as MCP tools (revision 2025-06-18, with title, output schema and annotations) and
 answer with an MCP `CallToolResult` as JSON; in Hermes the input schema is the tool's parameters.
 
+## Scheduled tasks
+
+The agent's page shows its cron jobs (`cron/jobs.py`): what each one is told, when it fires (the cron
+expression with its time zone, the interval, or the one time), whether it is scheduled, paused, running,
+finished or stopped, its next run, how its last run went, and where its result goes, as platform names.
+The person can pause, resume, delete or run one from there; creating or changing a task stays with the
+agent's `cronjob` tool, asked for in the conversation.
+
+- Run is the same extra fire as `cronjob(action="run")`: it starts at once, and the task keeps its next
+  run, its repeat count and its state. Only a scheduled task runs; resume a paused one first. A finished
+  task (a one-time task that ran, or a repeat count used up) can be deleted, not resumed or run.
+- Every connected phone hears `schedule.changed` whenever a task is added, changed, removed, starts or
+  finishes, whoever did it (the agent, `hermes cron`, the scheduler, another device): the adapter checks
+  the job store and the executions ledger every two seconds and compares what it would show.
+
 ## Home channel
 
 The plugin registers `aleph:main` as its home channel. `session: main` needs exactly one connected platform

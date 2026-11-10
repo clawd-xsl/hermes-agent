@@ -57,6 +57,7 @@ from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file
 from plugins.platforms.aleph.noise import b64url, from_b64url
 from plugins.platforms.aleph.push import (
     BODY_MESSAGE, ENVIRONMENTS, ApnsConfig, ApnsSender, build_payload, push_body_for)
+from plugins.platforms.aleph.schedule import Schedule, ScheduleError
 from plugins.platforms.aleph.server import (
     INVALID_PARAMS, METHOD_NOT_FOUND, AlephServer, Connection, RpcError, event_frame)
 from plugins.platforms.aleph.store import AlephStore, Chat, Device, LoggedEvent, load_or_create_server_key
@@ -64,6 +65,8 @@ from plugins.platforms.aleph.store import AlephStore, Chat, Device, LoggedEvent,
 logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "aleph"
+SCHEDULE_CALLS = frozenset({"schedule.list", "schedule.pause", "schedule.resume", "schedule.run",
+                            "schedule.delete"})
 CHAT_ID = "main"  # the main chat: the home channel, always there
 CHAT_NAME = "Aleph"
 MAX_CHAT_ID = 128
@@ -285,6 +288,7 @@ class AlephAdapter(BasePlatformAdapter):
         self._push_problems_reported: set[tuple[str, str]] = set()
         self._device_watch: Optional[asyncio.Task] = None
         self._idle_sweep: Optional[asyncio.Task] = None
+        self._schedule: Optional[Schedule] = None
         # The side chats that exist (``main`` always does), and those deleted while running: what the
         # gateway still sends them (the /new that ended the session, a late reply) goes nowhere.
         self._chats: dict[str, Chat] = {}
@@ -388,6 +392,8 @@ class AlephAdapter(BasePlatformAdapter):
         logger.info("Aleph: %d paired device(s); push %s", len(devices),
                     f"on ({self.apns_config.topic})" if self._push else "off")
         self._device_watch = asyncio.create_task(self._watch_devices())
+        self._schedule = Schedule(lambda: self._live("schedule.changed", {}))
+        self._schedule.start()
         if self.side_chat_idle_days > 0:
             self._idle_sweep = asyncio.create_task(self._sweep_idle_chats())
         self._mark_connected(listener_base=f"http://{self.host}:{port}")
@@ -396,6 +402,9 @@ class AlephAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         server, store, push, watch = self._server, self._store, self._push, self._device_watch
         sweep, self._idle_sweep = self._idle_sweep, None
+        schedule, self._schedule = self._schedule, None
+        if schedule is not None:
+            await schedule.stop()
         self._server = self._store = self._push = self._device_watch = None
         for task in (watch, sweep):
             if task is not None:
@@ -724,6 +733,13 @@ class AlephAdapter(BasePlatformAdapter):
             return await self.list_activity(params)
         if method == "reaction.set":
             return {"seq": await self._user_reaction(params)}
+        if method in SCHEDULE_CALLS:
+            if self._schedule is None:
+                raise RpcError(INVALID_PARAMS, "scheduled tasks are not available")
+            try:
+                return await self._schedule.call(method, params)
+            except ScheduleError as exc:
+                raise RpcError(INVALID_PARAMS, str(exc)) from exc
         if method == "ping":
             return {}
         raise RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
