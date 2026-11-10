@@ -190,7 +190,11 @@ def release_one_shot_session(authority, receipt) -> None:
 
 async def drop_unretained_session(adapter, authority, receipt, chat_id: str) -> None:
     """``retain_sessions: false``: delete a settled, successful delivery's one-shot session (with its
-    compression chain). A failed run, or a reviewer whose handoff failed, is kept for debugging."""
+    compression chain). A failed run, or a reviewer whose handoff failed, is kept for debugging.
+
+    The admission settles before its drain exits: the drain still claims the FIFO once more. Deleting
+    the row under it paused the drain with ``not_found`` and left the ``LiveSession`` in memory, so
+    the delete waits for the drain, then retires the live state as a prune does."""
     failed_handoff = chat_id in adapter._failed_main_handoffs
     adapter._failed_main_handoffs.discard(chat_id)
     from gateway.platforms.webhook import _WebhookDeliveryIdentity
@@ -200,7 +204,25 @@ async def drop_unretained_session(adapter, authority, receipt, chat_id: str) -> 
         return
     import asyncio
     sid = receipt.ref.session_id
+    live = getattr(authority, "sessions", {}).get(sid)
+    drain = getattr(live, "task", None)
+    if drain is not None and not drain.done() and drain is not asyncio.current_task():
+        await asyncio.wait({drain})
+    ids = await asyncio.to_thread(_chain_ids, authority.db, sid)
     sessions_dir = getattr(getattr(adapter.gateway_runner, "config", None), "sessions_dir", None)
     await asyncio.to_thread(authority.db.delete_session, sid, sessions_dir=sessions_dir,
                             include_compression_chain=True)
+    if hasattr(authority, "sessions"):
+        from gateway.session_mutations import retire_live_sessions
+        retire_live_sessions(authority, ids)
     logger.info("[webhook] Deleted one-shot session %s (retain_sessions=false)", sid)
+
+
+def _chain_ids(db, sid: str) -> list[str]:
+    """Every session the compression-chain delete removes: root through tip."""
+    try:
+        tip = db.get_compression_tip(sid) or sid
+        return list(dict.fromkeys([sid, *db.get_compression_lineage(tip)]))
+    except Exception:
+        logger.debug("[webhook] Compression lineage lookup failed for %s", sid, exc_info=True)
+        return [sid]

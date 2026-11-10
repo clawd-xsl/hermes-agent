@@ -84,3 +84,37 @@ def test_a_real_session_row_and_its_messages_are_deleted(tmp_path):
         assert db.get_session("hook-1") is None
     finally:
         db.close()
+
+
+def test_the_delete_waits_for_the_drain_and_retires_the_live_session(tmp_path, monkeypatch):
+    """The admission settles before its drain's last FIFO claim: deleting under it paused the drain
+    with ``not_found`` and left the LiveSession in memory."""
+    import asyncio
+    from gateway import session_mutations
+    from gateway.platforms.webhook import _WebhookDeliveryIdentity
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    retired = []
+    monkeypatch.setattr(session_mutations, "retire_live_sessions",
+                        lambda authority, ids, **kw: retired.append(list(ids)))
+    try:
+        db.create_session("hook-1", source="webhook")
+        adapter = _adapter({"mail": _route(retain_sessions=False)})
+        chat_id = _WebhookDeliveryIdentity.from_parts(None, "mail", "d").session_chat_id
+        receipt = SimpleNamespace(ref=SimpleNamespace(session_id="hook-1"), status="terminal", outcome="completed")
+        seen_by_drain = []
+
+        async def run():
+            async def drain():
+                await asyncio.sleep(0.05)  # the drain's final claim, after the waiter resolved
+                seen_by_drain.append(db.get_session("hook-1") is not None)
+
+            authority = SimpleNamespace(db=db, sessions={"hook-1": SimpleNamespace(task=asyncio.create_task(drain()))})
+            await webhook_main.drop_unretained_session(adapter, authority, receipt, chat_id)
+
+        asyncio.run(run())
+        assert seen_by_drain == [True]
+        assert db.get_session("hook-1") is None
+        assert retired == [["hook-1"]]
+    finally:
+        db.close()
