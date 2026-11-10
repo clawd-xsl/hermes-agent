@@ -37,7 +37,12 @@ REDACT_WALK_DEPTH_MARKER = "[redacted: nesting limit]"
 # bounded per profile: a fill-heavy session evicts its oldest entries rather than growing forever.
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
-_VAULT_REDACTION_LOCK = threading.Lock()
+# Reentrant: anything that allocates inside the critical section can run a GC finalizer, and a
+# finalizer that logs (e.g. aiohttp's "Unclosed client session") re-enters here through
+# RedactingFormatter on the same thread. A plain Lock deadlocks the thread, and with it the logging
+# handler lock it holds, so every other thread that logs or redacts waits forever. Re-entry only
+# reads the registry, so it is safe.
+_VAULT_REDACTION_LOCK = threading.RLock()
 
 
 def _vault_scope() -> str:
@@ -55,8 +60,9 @@ def register_vault_redaction_value(value) -> None:
     if not isinstance(value, str) or not value:
         return
     normalized = value.replace("\r", "").replace("\n", "")
+    scope = _vault_scope()
     with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
+        bucket = _VAULT_REDACTION_VALUES.setdefault(scope, {})
         for v in (value, normalized):
             if v:
                 bucket.pop(v, None)  # re-registering refreshes recency
@@ -67,17 +73,20 @@ def register_vault_redaction_value(value) -> None:
 
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
+    scope = _vault_scope()
     with _VAULT_REDACTION_LOCK:
-        _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
+        _VAULT_REDACTION_VALUES.pop(scope, None)
 
 
 def redact_registered_vault_values(text: str) -> str:
     """Exact-substring scrub of every vault secret value registered for the current profile."""
     if not isinstance(text, str) or not text:
         return text
+    scope = _vault_scope()
     with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
-        values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
+        bucket = _VAULT_REDACTION_VALUES.get(scope)
+        values = tuple(bucket) if bucket else ()
+    values = sorted(values, key=len, reverse=True)  # longest first: a substring never shadows its superstring
     for value in values:
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
