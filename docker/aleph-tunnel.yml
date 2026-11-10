@@ -1,0 +1,6 @@
+# Ingress for the Aleph tunnel (docker/s6-rc.d/aleph-tunnel). Route the whole
+# name to the plugin: every path a stranger tries gets the plugin's bare 404.
+ingress:
+  - hostname: aleph.xsl.sh
+    service: http://127.0.0.1:8650
+  - service: http_status:404

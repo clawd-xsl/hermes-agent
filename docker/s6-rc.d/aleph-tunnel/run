@@ -1,0 +1,10 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Aleph's own Cloudflare Tunnel (plugins/platforms/aleph). It routes only the
+# Aleph hostname to the plugin's loopback listener, so the plugin keeps seeing
+# loopback peers and CF-Connecting-IP. Without ALEPH_TUNNEL_TOKEN the slot
+# exits cleanly and the finish script tells s6 not to restart it.
+if [ -z "${ALEPH_TUNNEL_TOKEN:-}" ]; then
+    exit 0
+fi
+exec cloudflared tunnel --no-autoupdate --config /opt/hermes/docker/aleph-tunnel.yml run --token "$ALEPH_TUNNEL_TOKEN"

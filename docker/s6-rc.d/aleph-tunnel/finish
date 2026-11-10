@@ -1,0 +1,7 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# No token configured: report a permanent failure (125) so s6 does not respin.
+if [ -z "${ALEPH_TUNNEL_TOKEN:-}" ]; then
+    exit 125
+fi
+exit 0
