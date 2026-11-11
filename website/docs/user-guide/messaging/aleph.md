@@ -268,6 +268,19 @@ replaces the old, and either can be taken back. Every device shows them; they ar
 - The agent reacts with the `aleph_react` tool (by default to the person's latest message;
   `messages_back` reaches earlier ones), or with `send_message` and `action: "react"` / `"unreact"`.
 
+## Replies
+
+A message can quote an earlier one in its chat. The server keeps a snapshot of the quoted message on
+the `message.new` it logs (who wrote it, its first 200 characters on one line, and the kind of its first
+attachment, or `location`), so every device draws the same quote, even one that catches up later or after
+the original is gone. A quote of a message the server does not have in that chat is dropped; the message
+itself is still sent.
+
+- The person's quote reaches the agent as Hermes's reply context, like on other channels.
+- The gateway anchors each of the agent's replies to the message that started the turn. Aleph quotes it
+  only when that is not the person's latest message in the chat, such as an answer to an earlier
+  message after the person sent another.
+
 ## The agent's name and avatar
 
 On Aleph the agent has a name (`Aleph` until it picks one) and an avatar (none until it sets one; the

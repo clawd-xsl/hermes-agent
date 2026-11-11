@@ -51,7 +51,7 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import MessageDeduplicator
 
 from plugins.platforms.aleph import noise
-from plugins.platforms.aleph import activity, reactions
+from plugins.platforms.aleph import activity, reactions, replies
 from plugins.platforms.aleph.profile import DEFAULT_NAME, Avatar
 from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file, file_url
 from plugins.platforms.aleph.noise import b64url, from_b64url
@@ -780,11 +780,25 @@ class AlephAdapter(BasePlatformAdapter):
                        "attachments": self._with_links(attachments)}
             if location is not None:
                 payload["location"] = location
+            quoted = await self._reply_snapshot(chat, reply_to)
+            if quoted is not None:
+                payload["reply_to"] = quoted
             payload["created_at"] = now_iso()
             event = await self._log("message.new", payload, message={
                 "id": message_id, "sender": "user", "kind": "text", "text": text, "attachments": attachments})
             await self._dispatch_user_message(chat, message_id, text, attachments, reply_to, location)
             return event.seq
+
+    async def _reply_snapshot(self, chat: str, reply_to: Any) -> Optional[dict[str, Any]]:
+        """The quote a message carries: a snapshot of ``reply_to`` taken now, or None when that id is
+        no message of this chat (never sent, deleted, pruned, or in another chat)."""
+        if not isinstance(reply_to, str) or not reply_to:
+            return None
+        quoted = await asyncio.to_thread(self.store.message, reply_to)
+        if quoted is None or quoted.chat != chat:
+            return None
+        location = None if quoted.attachments else await self._logged_location(quoted.seq)
+        return replies.snapshot(quoted.id, quoted.sender, quoted.text, quoted.attachments, location)
 
     async def _logged_location(self, seq: int) -> Optional[dict[str, Any]]:
         """The location a logged message carried (for handing over a resend that never reached the
@@ -1017,10 +1031,10 @@ class AlephAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Aleph is not connected", retryable=True)
         meta = metadata or {}
         kind = "tool" if meta.get("_tool_progress") else "system" if meta.get("_interim_send") else "text"
-        return await self._send_message(chat_id, content or "", [], kind=kind)
+        return await self._send_message(chat_id, content or "", [], kind=kind, reply_to=reply_to)
 
     async def _send_message(self, chat_id: Any, text: str, attachments: list[dict[str, Any]], *,
-                            kind: str = "text") -> SendResult:
+                            kind: str = "text", reply_to: Optional[str] = None) -> SendResult:
         chat = self._outbound_chat(chat_id)
         if chat is None:
             # A deleted chat: the reply has nowhere to go (not an error the gateway should retry).
@@ -1036,6 +1050,13 @@ class AlephAdapter(BasePlatformAdapter):
             open_draft = self._open_draft.pop(chat_id, None)
             if open_draft is not None:
                 payload["draft_id"] = open_draft[0]
+            # The gateway anchors every reply to the message that started the turn; answering the
+            # person's latest message needs no quote. Anything else it names (an earlier message, one
+            # the person sent after the turn began) is quoted.
+            if reply_to and str(reply_to) != self._last_user_message.get(chat):
+                quoted = await self._reply_snapshot(chat, str(reply_to))
+                if quoted is not None:
+                    payload["reply_to"] = quoted
         try:
             await self._log("message.new", payload, message={
                 "id": message_id, "sender": "agent", "kind": kind, "text": text, "attachments": attachments})
@@ -1564,7 +1585,7 @@ class AlephAdapter(BasePlatformAdapter):
         return description
 
     async def _send_file(self, chat_id: str, path: str, caption: Optional[str], *, kind: str,
-                         name: Optional[str] = None) -> SendResult:
+                         name: Optional[str] = None, reply_to: Optional[str] = None) -> SendResult:
         if self._store is None:
             return SendResult(success=False, error="Aleph is not connected", retryable=True)
         try:
@@ -1572,27 +1593,27 @@ class AlephAdapter(BasePlatformAdapter):
         except (OSError, ValueError) as exc:
             logger.warning("Aleph: cannot attach %s: %s", path, exc)
             return SendResult(success=False, error=f"cannot read {path}: {exc}")
-        return await self._send_message(chat_id, caption or "", [description])
+        return await self._send_message(chat_id, caption or "", [description], reply_to=reply_to)
 
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
                               reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
                               **kwargs) -> SendResult:
-        return await self._send_file(chat_id, image_path, caption, kind="image")
+        return await self._send_file(chat_id, image_path, caption, kind="image", reply_to=reply_to)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
                             file_name: Optional[str] = None, reply_to: Optional[str] = None,
                             metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
-        return await self._send_file(chat_id, file_path, caption, kind="file", name=file_name)
+        return await self._send_file(chat_id, file_path, caption, kind="file", name=file_name, reply_to=reply_to)
 
     async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
                          **kwargs) -> SendResult:
-        return await self._send_file(chat_id, audio_path, caption, kind="voice")
+        return await self._send_file(chat_id, audio_path, caption, kind="voice", reply_to=reply_to)
 
     async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
                          **kwargs) -> SendResult:
-        return await self._send_file(chat_id, video_path, caption, kind="video")
+        return await self._send_file(chat_id, video_path, caption, kind="video", reply_to=reply_to)
 
     async def send_files(self, chat_id: str, file_paths: list[str], caption: str = "") -> SendResult:
         """Several files on one message (send_message with media)."""
