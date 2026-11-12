@@ -8,7 +8,8 @@ jobs and webhooks land in it), and the side chats the person opens beside it.
 What the channel gives the phone:
 
 - a durable, replayable history: every message, edit, deletion, receipt and card is logged with a `seq`, all
-  chats in one log, and a phone that was offline catches up from the last `seq` it stored;
+  chats in one log, and a phone that was offline catches up from the last `seq` it stored; a new phone
+  starts from the present and pages older messages in, as they stand now (`history.load`);
 - side chats: a quick question beside the main conversation, each in a Hermes session of its own;
 - streaming drafts of the reply, typing with a status line ("is running …"), and read receipts (two checks
   once a turn that includes the person's messages starts);
@@ -341,7 +342,7 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_APNS_TEAM_ID` | | Apple developer team id |
 | `ALEPH_APNS_TOPIC` | | The app's bundle id |
 | `ALEPH_HOME_CHANNEL` | `main` | Home channel; `off` leaves the home to another platform |
-| `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` |
+| `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` and pages its history in again. Messages themselves are kept as history either way |
 | `ALEPH_SIDE_CHAT_IDLE_DAYS` | `30` | Days after which a side chat nobody has written in is deleted; `0` keeps them |
 | `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`), and encrypted files |
 

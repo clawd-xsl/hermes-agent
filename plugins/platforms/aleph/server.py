@@ -25,7 +25,9 @@ Frames on a connection go out through one queue drained by one writer task, whic
 encrypts them, so nonces follow the send order and a call's answer, the replay and live events can
 never interleave. ``hello`` enqueues its answer, the replay and ``sync.done`` while holding the
 adapter's append lock, then subscribes the connection: an event logged meanwhile waits for the lock
-and reaches the connection after ``sync.done``, never inside the replay and never twice.
+and reaches the connection after ``sync.done``, never inside the replay and never twice. A
+``history.page`` is read and queued under the same lock, so it sits in the stream exactly where the
+state it shows was current.
 """
 
 from __future__ import annotations
@@ -578,6 +580,8 @@ class AlephServer:
             snapshot = await self.adapter.replay_snapshot(after)
             result = {"protocol": PROTOCOL_VERSION, "chat": {"id": self.adapter.chat_id},
                       "agent": self.adapter.agent_info(), "latest": snapshot.latest, "reset": snapshot.reset}
+            if snapshot.chats is not None:
+                result["chats"] = snapshot.chats
             conn.enqueue(_frame({"jsonrpc": "2.0", "id": call_id, "result": result}))
             for event in snapshot.events:
                 conn.enqueue(event_frame(event.type, event.payload, event.seq))

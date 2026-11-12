@@ -59,12 +59,16 @@ from plugins.platforms.aleph.push import (
     BODY_MESSAGE, ENVIRONMENTS, ApnsConfig, ApnsSender, build_payload, push_body_for)
 from plugins.platforms.aleph.schedule import Schedule, ScheduleError
 from plugins.platforms.aleph.server import (
-    INVALID_PARAMS, METHOD_NOT_FOUND, AlephServer, Connection, RpcError, event_frame)
+    BUSY, INVALID_PARAMS, METHOD_NOT_FOUND, AlephServer, Connection, RpcError, event_frame)
 from plugins.platforms.aleph.store import AlephStore, Chat, Device, LoggedEvent, load_or_create_server_key
 
 logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "aleph"
+HISTORY_PAGE_DEFAULT = 200
+HISTORY_PAGE_MAX = 500
+# Pages being read at once across connections; a load past this is told to try again (4002).
+MAX_HISTORY_LOADS = 4
 SCHEDULE_CALLS = frozenset({"schedule.list", "schedule.pause", "schedule.resume", "schedule.run",
                             "schedule.delete"})
 CHAT_ID = "main"  # the main chat: the home channel, always there
@@ -257,6 +261,8 @@ class ReplaySnapshot:
     latest: int
     reset: bool
     events: list[LoggedEvent]
+    # On a reset: every side chat that exists, as its ``chat.new`` payload.
+    chats: Optional[list[dict[str, Any]]] = None
 
 
 class AlephAdapter(BasePlatformAdapter):
@@ -289,6 +295,7 @@ class AlephAdapter(BasePlatformAdapter):
         self._device_watch: Optional[asyncio.Task] = None
         self._idle_sweep: Optional[asyncio.Task] = None
         self._schedule: Optional[Schedule] = None
+        self._history_loads = 0
         # The side chats that exist (``main`` always does), and those deleted while running: what the
         # gateway still sends them (the /new that ended the session, a late reply) goes nowhere.
         self._chats: dict[str, Chat] = {}
@@ -604,19 +611,44 @@ class AlephAdapter(BasePlatformAdapter):
         return frames
 
     async def replay_snapshot(self, after: int) -> ReplaySnapshot:
-        """Under ``append_lock``: the events a phone that stored ``after`` is missing."""
+        """Under ``append_lock``: the events a phone that stored ``after`` is missing, or a reset.
+
+        A reset replays nothing: the phone starts from the present (``latest``, the side chats) and
+        pages older messages in with ``history.load``. It is the answer to a phone with nothing yet
+        (``after`` 0), to one ahead of this log (a wiped or replaced server), and to one whose missing
+        events were pruned for age."""
         latest = await asyncio.to_thread(self.store.latest)
         pruned = await asyncio.to_thread(self.store.pruned_through)
-        reset = False
-        start = after
-        if after > latest:
-            # The phone is ahead of this log (a wiped or replaced server): start over.
-            reset, start = True, 0
-        elif after < pruned:
-            # What it is missing was pruned for age.
-            reset, start = True, 0
-        events = await asyncio.to_thread(self.store.events_after, start, until=latest) if latest > start else []
-        return ReplaySnapshot(latest, reset, events)
+        if latest > 0 and (after == 0 or after > latest or after < pruned):
+            chats = [{"chat": chat.id, "title": chat.title, "created_at": chat.created_at}
+                     for chat in await asyncio.to_thread(self.store.chats)]
+            return ReplaySnapshot(latest, True, [], chats)
+        events = await asyncio.to_thread(self.store.events_after, after, until=latest) if latest > after else []
+        return ReplaySnapshot(latest, False, events)
+
+    async def load_history(self, params: dict[str, Any], conn: Optional[Connection]) -> dict[str, Any]:
+        """``history.load {chat, before, limit}``: write one ``history.page`` into the connection's
+        stream. Read and queued under ``append_lock``, so the page reflects every logged event queued
+        on the connection before it and none after."""
+        chat = self._chat_param(params)
+        before, limit = params.get("before"), params.get("limit", HISTORY_PAGE_DEFAULT)
+        if isinstance(before, bool) or not isinstance(before, int) or before < 1:
+            raise RpcError(INVALID_PARAMS, "before must be a seq (a positive integer)")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= HISTORY_PAGE_MAX:
+            raise RpcError(INVALID_PARAMS, f"limit must be from 1 to {HISTORY_PAGE_MAX}")
+        if conn is None:
+            raise RpcError(INVALID_PARAMS, "history.load needs a connection")
+        if self._history_loads >= MAX_HISTORY_LOADS:
+            raise RpcError(BUSY, "busy loading history; try again shortly")
+        self._history_loads += 1
+        try:
+            async with self.append_lock:
+                messages, older = await asyncio.to_thread(self.store.history, chat, before, limit)
+                conn.enqueue(event_frame("history.page", {"chat": chat, "before": before, "messages": messages,
+                                                          "next": older}))
+        finally:
+            self._history_loads -= 1
+        return {}
 
     def agent_info(self) -> dict[str, Any]:
         """``hello``'s ``agent``: the profile as it is now, the avatar with a fresh download link."""
@@ -729,6 +761,8 @@ class AlephAdapter(BasePlatformAdapter):
             return {}
         if method == "file.ticket":
             return await self._file_ticket(params)
+        if method == "history.load":
+            return await self.load_history(params, conn)
         if method == "activity.list":
             return await self.list_activity(params)
         if method == "reaction.set":
@@ -1073,7 +1107,6 @@ class AlephAdapter(BasePlatformAdapter):
         if stored is None or stored.sender != "agent":
             return SendResult(success=False, error="unknown message")
         if stored.text != content:
-            await asyncio.to_thread(self.store.update_message_text, stored.id, content)
             await self._log("message.edit", {"chat": stored.chat, "id": stored.id, "text": content})
         return SendResult(success=True, message_id=stored.id)
 
@@ -1083,7 +1116,6 @@ class AlephAdapter(BasePlatformAdapter):
         stored = await asyncio.to_thread(self.store.message, str(message_id))
         if stored is None or stored.sender != "agent":
             return False
-        await asyncio.to_thread(self.store.forget_message, stored.id)
         await self._log("message.delete", {"chat": stored.chat, "id": stored.id})
         return True
 

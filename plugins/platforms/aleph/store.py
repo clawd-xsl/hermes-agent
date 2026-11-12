@@ -22,12 +22,16 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 # The conversation's layout. A store written under another one is not converted: its conversation
 # (events, messages, chats, steps and their files) is dropped, keeping pairings and the agent's profile.
-SCHEMA_VERSION = "2"
+# Until Aleph's first release the number stays 1 (the current layout is always v1), and a deploy that
+# changes the layout drops or converts the store by hand. From the first release on, every layout
+# change bumps it.
+SCHEMA_VERSION = "1"
 _CONVERSATION_TABLES = ("events", "messages", "chats", "activity")
 _META = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
 _SCHEMA = """
@@ -46,7 +50,11 @@ CREATE TABLE IF NOT EXISTS messages (
     kind TEXT NOT NULL,
     text TEXT NOT NULL,
     attachments TEXT NOT NULL,
-    dispatched INTEGER NOT NULL DEFAULT 0
+    dispatched INTEGER NOT NULL DEFAULT 0,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    reactions TEXT NOT NULL DEFAULT '{}',
+    read INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS messages_chat ON messages (chat, seq);
 CREATE TABLE IF NOT EXISTS chats (
@@ -265,20 +273,68 @@ class AlephStore:
 
     def _append_locked(self, event_type: str, payload: dict[str, Any],
                        message: Optional[dict[str, Any]] = None) -> LoggedEvent:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         chat = payload.get("chat")
+        if message is not None:
+            self._keep_time_order_locked(chat, payload)
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         seq = self._latest_locked() + 1
         self._db.execute("INSERT INTO events (seq, type, chat, payload) VALUES (?, ?, ?, ?)",
                          (seq, event_type, chat, body))
         if message is not None:
+            current = {key: value for key, value in payload.items() if key != "draft_id"}
             self._db.execute(
-                "INSERT INTO messages (id, seq, chat, sender, kind, text, attachments, dispatched) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                "INSERT INTO messages (id, seq, chat, sender, kind, text, attachments, dispatched, payload, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                 (message["id"], seq, chat, message["sender"], message.get("kind") or "text",
-                 message.get("text") or "", json.dumps(message.get("attachments") or [])))
+                 message.get("text") or "", json.dumps(message.get("attachments") or []),
+                 json.dumps(current, ensure_ascii=False, separators=(",", ":")), payload.get("created_at") or ""))
             self._db.execute("UPDATE chats SET last_active_at = ? WHERE id = ?", (time.time(), chat))
+        else:
+            self._fold_locked(event_type, chat, payload)
         self._prune_locked(seq)
         return LoggedEvent(seq, event_type, payload)
+
+    def _keep_time_order_locked(self, chat: Any, payload: dict[str, Any]) -> None:
+        """A message is never older than the one logged before it in its chat (the clock stepped
+        back, or two sends raced to the log): it takes that one's time."""
+        stamp = payload.get("created_at")
+        row = self._db.execute("SELECT created_at FROM messages WHERE chat = ? ORDER BY seq DESC LIMIT 1",
+                               (chat,)).fetchone()
+        if not isinstance(stamp, str) or row is None or not row[0]:
+            return
+        try:
+            if datetime.fromisoformat(stamp) < datetime.fromisoformat(row[0]):
+                payload["created_at"] = row[0]
+        except ValueError:
+            pass
+
+    def _fold_locked(self, event_type: str, chat: Any, payload: dict[str, Any]) -> None:
+        """Keep each message's current state in step with the event that changes it, in the same
+        transaction, so a history page never disagrees with the events around it."""
+        if event_type == "message.edit":
+            row = self._db.execute("SELECT payload FROM messages WHERE id = ?", (payload.get("id"),)).fetchone()
+            if row is not None:
+                current = json.loads(row[0])
+                current["text"] = payload.get("text") or ""
+                self._db.execute("UPDATE messages SET text = ?, payload = ? WHERE id = ?",
+                                 (current["text"], json.dumps(current, ensure_ascii=False, separators=(",", ":")),
+                                  payload.get("id")))
+        elif event_type == "message.delete":
+            self._db.execute("DELETE FROM messages WHERE id = ?", (payload.get("id"),))
+        elif event_type == "reaction":
+            row = self._db.execute("SELECT reactions FROM messages WHERE id = ?",
+                                   (payload.get("message_id"),)).fetchone()
+            if row is not None:
+                reactions = json.loads(row[0])
+                reactions[str(payload.get("by"))] = payload.get("emoji")
+                self._db.execute("UPDATE messages SET reactions = ? WHERE id = ?",
+                                 (json.dumps(reactions, ensure_ascii=False), payload.get("message_id")))
+        elif event_type == "receipt":
+            row = self._db.execute("SELECT seq FROM messages WHERE id = ? AND chat = ?",
+                                   (payload.get("read_up_to"), chat)).fetchone()
+            if row is not None:
+                self._db.execute("UPDATE messages SET read = 1 WHERE chat = ? AND sender = 'user' AND seq <= ? "
+                                 "AND read = 0", (chat, int(row[0])))
 
     def _prune_locked(self, latest: int) -> None:
         # Prune in batches (10% slack) so a full log does not delete one row per append.
@@ -313,13 +369,25 @@ class AlephStore:
         with self._lock:
             self._db.execute("UPDATE messages SET dispatched = 1 WHERE id = ?", (message_id,))
 
-    def update_message_text(self, message_id: str, text: str) -> None:
+    def history(self, chat: str, before: int, limit: int) -> tuple[list[dict[str, Any]], Optional[int]]:
+        """A history page: the newest ``limit`` messages of ``chat`` logged before ``before`` (a seq),
+        oldest first, each as its ``message.new`` stands now (edits applied, deleted ones gone) with its
+        ``seq``, ``reactions`` and, for the person's, ``read``; and the ``before`` of the next page, or
+        None when nothing older exists."""
         with self._lock:
-            self._db.execute("UPDATE messages SET text = ? WHERE id = ?", (text, message_id))
-
-    def forget_message(self, message_id: str) -> None:
-        with self._lock:
-            self._db.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+            rows = self._db.execute(
+                "SELECT seq, sender, payload, reactions, read FROM messages WHERE chat = ? AND seq < ? "
+                "ORDER BY seq DESC LIMIT ?", (chat, int(before), int(limit) + 1)).fetchall()
+        more = len(rows) > limit
+        page = []
+        for seq, sender, body, reactions, read in reversed(rows[:limit]):
+            message = json.loads(body)
+            marks = json.loads(reactions)
+            message.update(seq=int(seq), reactions={"user": marks.get("user"), "agent": marks.get("agent")})
+            if sender == "user":
+                message["read"] = bool(read)
+            page.append(message)
+        return page, (page[0]["seq"] if more and page else None)
 
     def user_message_ids(self, chat: str, limit: int) -> list[str]:
         """The person's most recent message ids in a chat, newest first."""

@@ -211,14 +211,15 @@ async def test_phone_ahead_of_the_log_gets_a_reset(adapter):
     phone = await _phone(adapter)
     try:
         answer, replay = await phone.hello(after=50)
-        assert answer["result"]["reset"] is True
-        assert [e.get("seq") for e in replay] == [1, None]
+        assert answer["result"]["reset"] is True and answer["result"]["chats"] == []
+        # Nothing is replayed: the phone starts from the present and pages history in.
+        assert replay == [{"type": "sync.done", "payload": {"seq": 1}}]
     finally:
         await phone.close()
 
 
 @pytest.mark.asyncio
-async def test_pruned_history_resets_from_the_oldest_event(adapter):
+async def test_pruned_history_resets_to_the_present(adapter):
     adapter.store.history_limit = 100
     for i in range(130):
         await adapter.send("main", f"m{i}")
@@ -227,9 +228,12 @@ async def test_pruned_history_resets_from_the_oldest_event(adapter):
     phone = await _phone(adapter)
     try:
         answer, replay = await phone.hello(after=2)
-        assert answer["result"]["reset"] is True
-        assert replay[0]["seq"] == oldest and replay[-2]["seq"] == 130
-        assert [e["seq"] for e in replay[:-1]] == list(range(oldest, 131))
+        assert answer["result"]["reset"] is True and answer["result"]["latest"] == 130
+        assert replay == [{"type": "sync.done", "payload": {"seq": 130}}]
+        # What was pruned from the log is still there as history.
+        await phone.call("history.load", {"chat": "main", "before": 131, "limit": 500})
+        page = (await phone.event())["params"]["payload"]
+        assert [m["text"] for m in page["messages"]] == [f"m{i}" for i in range(130)] and page["next"] is None
     finally:
         await phone.close()
 
@@ -240,13 +244,13 @@ async def test_event_logged_during_hello_arrives_after_sync_done_exactly_once(ad
         await adapter.send("main", f"m{i}")
     phone = await _phone(adapter)
     try:
-        hello = asyncio.create_task(phone.hello(after=0))
+        hello = asyncio.create_task(phone.hello(after=1))
         racer = asyncio.create_task(adapter.send("main", "racer"))
         answer, replay = await hello
         await racer
         seqs = [e["seq"] for e in replay[:-1]]
         latest = answer["result"]["latest"]
-        assert seqs == list(range(1, latest + 1))
+        assert seqs == list(range(2, latest + 1))
         if latest == 50:  # the racer landed after the snapshot: it must follow sync.done
             live = await phone.event()
             assert live["params"]["seq"] == 51 and live["params"]["payload"]["text"] == "racer"

@@ -63,7 +63,7 @@ optional_env:
     prompt: "Home channel"
     password: false
   - name: ALEPH_HISTORY_LIMIT
-    description: "How many logged events the server keeps for phones to catch up from (default 20000)"
+    description: "How many logged events the server keeps for phones to catch up from (default 20000); messages stay as history"
     prompt: "History limit"
     password: false
   - name: ALEPH_STATE_DIR
