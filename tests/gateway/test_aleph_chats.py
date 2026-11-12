@@ -263,6 +263,11 @@ async def test_deleting_ends_the_session_and_drops_the_chat(adapter):
         assert (await phone.call("chat.delete", {"id": "nope"}))["error"]["code"] == -32602
         deleted = await phone.call("chat.delete", {"id": SIDE})
         assert deleted["result"]["seq"] == cursor + 1
+        for _ in range(200):  # the /new hand-off runs as its own task
+            new = [e for e in adapter.received if e.text == "/new"]
+            if new:
+                break
+            await asyncio.sleep(0.01)
         await _settle()
         new = [e for e in adapter.received if e.text == "/new"]
         assert len(new) == 1 and new[0].source.chat_id == SIDE  # its Hermes session ends
