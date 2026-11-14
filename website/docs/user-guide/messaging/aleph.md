@@ -70,8 +70,8 @@ since the agent runs there.
   pairing; the server stores only the public half, which is what identifies the device. There are no
   tokens or passwords.
 - Each connection to `/aleph/v1/ws` starts with a `Noise_IK_25519_ChaChaPoly_SHA256` handshake (prologue
-  `aleph/1`). An unknown or revoked device key, or a handshake not finished within 5 seconds, closes with
-  `4401`. After it, each binary WebSocket message is one JSON-RPC frame, encrypted with ChaCha20-Poly1305.
+  `aleph/1`). An unknown or revoked device key closes with `4401`; a handshake not finished within 5 seconds closes with
+  `4408` (the phone retries). After it, each binary WebSocket message is one JSON-RPC frame, encrypted with ChaCha20-Poly1305.
   The phone accepts only the server key it pinned at pairing.
 - Files are encrypted with a key of their own, which travels only inside the encrypted channel; the HTTP
   side moves ciphertext against one-time tickets.
