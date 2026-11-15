@@ -197,6 +197,8 @@ class TestBusySessionAck:
             content = str(call_kwargs)
         assert "Interrupting" in content or "respond" in content
         assert "/stop" not in content  # no need — we ARE interrupting
+        # A notice, not the turn's final: it must not seal a streaming reply.
+        assert call_kwargs.kwargs["metadata"]["_interim_send"] is True
 
         # Verify agent interrupt was called
         agent.interrupt.assert_called_once_with("Are you working?")
