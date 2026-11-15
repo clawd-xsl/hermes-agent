@@ -330,6 +330,8 @@ class AlephAdapter(BasePlatformAdapter):
         # Live state replayed to a phone that connects mid-turn.
         self._draft_wire_ids: dict[int, str] = {}  # stream consumer draft id -> wire draft id
         self._open_draft: dict[str, tuple[str, str]] = {}  # chat -> (wire draft id, latest text)
+        # Wire ids of drafts a message took over or the turn dropped: a late frame never reopens one.
+        self._ended_drafts: dict[str, None] = {}
         self._typing: dict[str, Optional[str]] = {}  # chat -> status while the agent works
         self._draft_prefix = secrets.token_hex(3)
         # Cards awaiting an answer.
@@ -1080,14 +1082,17 @@ class AlephAdapter(BasePlatformAdapter):
         if kind != "text":
             payload["kind"] = kind
         else:
-            # The reply's real message replaces its draft on the phone.
+            # The reply's real message replaces its draft on the phone. Only a reply does: a notice the
+            # gateway sends meanwhile (a busy ack, "stopped") comes marked interim, as kind "system".
             open_draft = self._open_draft.pop(chat_id, None)
             if open_draft is not None:
                 payload["draft_id"] = open_draft[0]
+                self._end_draft(open_draft[0])
             # The gateway anchors every reply to the message that started the turn; answering the
-            # person's latest message needs no quote. Anything else it names (an earlier message, one
-            # the person sent after the turn began) is quoted.
-            if reply_to and str(reply_to) != self._last_user_message.get(chat):
+            # person's latest message needs no quote, and neither does a reply that takes over its draft
+            # (it stands where the draft streamed, under that message). Anything else it names (an
+            # earlier message, one the person sent after the turn began) is quoted.
+            elif reply_to and str(reply_to) != self._last_user_message.get(chat):
                 quoted = await self._reply_snapshot(chat, str(reply_to))
                 if quoted is not None:
                     payload["reply_to"] = quoted
@@ -1139,6 +1144,8 @@ class AlephAdapter(BasePlatformAdapter):
             if len(self._draft_wire_ids) > 512:
                 for stale in list(self._draft_wire_ids)[:256]:
                     self._draft_wire_ids.pop(stale, None)
+        if wire_id in self._ended_drafts:
+            return SendResult(success=True)  # its message already landed, or its turn dropped it
         previous = self._open_draft.get(chat)
         if previous is not None and previous[0] != wire_id:
             self._live("draft.clear", {"chat": chat, "draft_id": previous[0]})
@@ -1155,7 +1162,14 @@ class AlephAdapter(BasePlatformAdapter):
     def _clear_draft(self, chat: str) -> None:
         open_draft = self._open_draft.pop(chat, None)
         if open_draft is not None:
+            self._end_draft(open_draft[0])
             self._live("draft.clear", {"chat": chat, "draft_id": open_draft[0]})
+
+    def _end_draft(self, wire_id: str) -> None:
+        self._ended_drafts[wire_id] = None
+        if len(self._ended_drafts) > 512:
+            for stale in list(self._ended_drafts)[:256]:
+                self._ended_drafts.pop(stale, None)
 
     # ── typing ─────────────────────────────────────────────────────────────────────────────────
 
