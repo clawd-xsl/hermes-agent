@@ -816,8 +816,9 @@ class GatewayBusySessionMixin:
                 turn.ctx.reply_expected = turn.event.reply_expected
         return turn
 
-    async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
-        """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point."""
+    async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> bool:
+        """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point.
+        False when the agent declined: its turn had already ended (it is only winding down)."""
         from gateway.run import _build_media_placeholder
         try:
             _interrupt_text = event.text
@@ -828,9 +829,9 @@ class GatewayBusySessionMixin:
                 )
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
-            running_agent.interrupt(_interrupt_text)
+            return running_agent.interrupt(_interrupt_text) is not False
         except Exception:
-            pass  # don't let interrupt failure block the ack
+            return True  # don't let interrupt failure block the ack
 
     def _busy_steer_ack_enabled(self, event: MessageEvent, session_key: str) -> bool:
         # Some mobile chat setups want silent steering — keep the behavior, drop the bubble.
@@ -1017,7 +1018,10 @@ class GatewayBusySessionMixin:
             effective_mode == "interrupt" and not redirected
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
         ):
-            await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
+            if not await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent):
+                # The run already ended and is only winding down: nothing to interrupt or announce.
+                # The message is queued and answered as the next turn.
+                return
 
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.

@@ -155,6 +155,23 @@ def _ic_signal_tool_workers(agent, active: bool, **kw) -> None:
             pass
 
 
+def open_turn(agent) -> None:
+    """A turn starts on ``agent``: interrupts reach it again (an interrupt sent before a fresh agent's
+    first turn already does; nothing about it is cleared here)."""
+    with _ic_lock(agent, "_pending_redirect_lock"):
+        agent._turn_closed = False
+
+
+def close_turn(agent) -> None:
+    """The turn on ``agent`` has ended. An interrupt aimed at it is cleared, and one that comes later is
+    declined until the next turn opens: a cached agent's next turn (often the very message that sent the
+    interrupt, queued behind this one) must never inherit it. Closing and the decline in ``interrupt``
+    share one lock, so no interrupt lands between them."""
+    with _ic_lock(agent, "_pending_redirect_lock"):
+        agent._turn_closed = True
+    agent.clear_interrupt()
+
+
 class InterruptControlMixin:
     """interrupt()/hard_interrupt()/clear_interrupt()/steer()/redirect() (see module docstring)."""
 
@@ -167,7 +184,8 @@ class InterruptControlMixin:
         ``hard_cancel``: explicit stop; compression may honor it even while ordinary interrupts are masked.
         ``tool_reason``: trusted fixed category safe for tool output. ``require_generation``: activity-
         generation claim — published only if the turn's generation still matches at the final mutation edge;
-        returns False if the turn resumed meanwhile.
+        returns False if the turn resumed meanwhile. Also returns False, doing nothing, once the turn has
+        ended (``close_turn``) and until the next one opens.
         """
         if require_generation is not None:
             # RESERVE the claim under the SAME lock `_touch_activity` stamps with; real progress invalidates
@@ -211,6 +229,9 @@ class InterruptControlMixin:
         # claim edge (redirect lock still held); the destructive pending-commit cancel runs AFTER the claim
         # survives (#99758 P1).
         with _ic_lock(self, "_pending_redirect_lock"):
+            if getattr(self, "_turn_closed", False) is True:
+                # The turn this was aimed at has ended (see close_turn); the next turn is not its target.
+                return False
             _fence_cancel_before_commit(
                 _fence(), when_in_flight=True, failure_log="Compression hard-cancel fence wait failed"
             )

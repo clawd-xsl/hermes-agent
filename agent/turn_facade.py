@@ -37,7 +37,9 @@ class TurnFacadeMixin:
         # Foreground priority is retained if the review does not acknowledge within the bounded deadline
         # (#84423).
         from agent.background_review import cancel_background_review_for_live_turn
+        from agent.interrupt_control import close_turn, open_turn
 
+        open_turn(self)
         cancel_background_review_for_live_turn(self)
 
         from agent import relay_runtime
@@ -201,6 +203,9 @@ class TurnFacadeMixin:
                         lease.join_threads()
                         lease.clear_interrupt()  # refresher interrupt between stop and join; AFTER join
                         lease.release()
+                    # Every exit, including the early returns that skip finalize_turn.
+                    with suppress(Exception):
+                        close_turn(self)
                     # Always clear mid-turn labels on exit — including interrupted early returns
                     # that skip finalize_turn. Keep ts.
                     with suppress(Exception):

@@ -203,6 +203,26 @@ class TestBusySessionAck:
 
 
     @pytest.mark.asyncio
+    async def test_a_turn_winding_down_queues_without_an_interrupt_ack(self):
+        """The run already ended (the agent declines the interrupt): the message waits for its own turn,
+        with no "Interrupting" ack, since there is nothing left to interrupt."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+        event = _make_event(text="Next question")
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        agent.interrupt.return_value = False
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time()
+        runner.adapters[event.source.platform] = adapter
+
+        assert await runner._handle_active_session_busy_message(event, sk) is True
+        agent.interrupt.assert_called_once_with("Next question")
+        adapter._send_with_retry.assert_not_called()
+        assert adapter._pending_messages.get(sk) is event
+
+    @pytest.mark.asyncio
     async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self, monkeypatch):
         """busy_input_mode='steer' injects via agent.steer() and skips queueing."""
         import gateway.run as _gr
