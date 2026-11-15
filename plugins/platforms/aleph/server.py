@@ -66,7 +66,10 @@ NOT_READY = 4001
 BUSY = 4002
 
 # WebSocket close codes (4000-4999 is application use).
-CLOSE_UNAUTHORIZED = 4401  # unknown or revoked device key, a broken or slow handshake, revoked later
+CLOSE_UNAUTHORIZED = 4401  # unknown or revoked device key, a broken handshake, revoked later
+# A handshake that did not finish in time. Distinct from 4401, which tells the phone to pair again: a
+# phone resuming from the background or on a slow network just retries.
+CLOSE_HANDSHAKE_TIMEOUT = 4408
 CLOSE_BAD_SECRET = 4403  # pairing: wrong or expired secret
 CLOSE_PROTOCOL = 1002  # a transport frame that does not decrypt, or a text frame
 
@@ -413,7 +416,12 @@ class AlephServer:
                     device = self.adapter.known_device(handshake.rs)  # in memory: no database yet
                 except noise.NoiseError:
                     device = None
-            if device is None or time.monotonic() > deadline:
+            # Out of time: nothing arrived, or a paired device's handshake finished too late. A first
+            # message that came in time but names no paired device stays 4401.
+            if time.monotonic() >= deadline and (message is None or device is not None):
+                await ws.close(code=CLOSE_HANDSHAKE_TIMEOUT, message=b"handshake timeout")
+                return ws
+            if device is None:
                 await ws.close(code=CLOSE_UNAUTHORIZED, message=b"unauthorized")
                 return ws
             await ws.send_bytes(handshake.write_message(b""))
@@ -585,10 +593,13 @@ class AlephServer:
             conn.enqueue(_frame({"jsonrpc": "2.0", "id": call_id, "result": result}))
             for event in snapshot.events:
                 conn.enqueue(event_frame(event.type, event.payload, event.seq))
-            conn.enqueue(event_frame("sync.done", {"seq": snapshot.latest}))
+            # With nothing awaited from here on, no live frame can slip between what sync.done says
+            # is working and the frames that show it.
+            working, live = self.adapter.live_state()
+            conn.enqueue(event_frame("sync.done", {"seq": snapshot.latest, "working": working}))
             conn.ready = True
-        for text in self.adapter.live_state_frames():
-            conn.enqueue(text)
+            for text in live:
+                conn.enqueue(text)
         logger.info("Aleph: %s caught up from %d to %d%s (%s)", conn.peer, after, snapshot.latest,
                     " after a reset" if snapshot.reset else "", conn.client.get("device") or "unknown device")
 

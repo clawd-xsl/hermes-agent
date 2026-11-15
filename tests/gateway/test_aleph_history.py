@@ -54,7 +54,7 @@ async def test_a_fresh_phone_starts_from_the_present(adapter):
         assert result["reset"] is True and result["latest"] == 4
         (chat,) = result["chats"]
         assert chat["chat"] == "side-1" and chat["title"] == "Trip" and chat["created_at"]
-        assert replay == [{"type": "sync.done", "payload": {"seq": 4}}]
+        assert replay == [{"type": "sync.done", "payload": {"seq": 4, "working": [{"chat": "main", "draft": None, "typing": {"status": None}}]}}]
         assert (await phone.event())["params"]["type"] == "typing"  # the present follows, as before
     finally:
         await phone.close()
@@ -66,7 +66,7 @@ async def test_an_empty_log_and_a_caught_up_phone_are_no_reset(adapter):
     try:
         answer, replay = await phone.hello(after=0)
         assert answer["result"]["reset"] is False and "chats" not in answer["result"]
-        assert replay == [{"type": "sync.done", "payload": {"seq": 0}}]
+        assert replay == [{"type": "sync.done", "payload": {"seq": 0, "working": []}}]
     finally:
         await phone.close()
     await adapter.send("main", "one")

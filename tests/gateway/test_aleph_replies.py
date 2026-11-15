@@ -162,3 +162,38 @@ async def test_the_agents_reply_quotes_only_what_is_not_the_latest_message(adapt
         assert "reply_to" not in (await _message(phone))
     finally:
         await phone.close()
+
+
+@pytest.mark.asyncio
+async def test_a_notice_mid_reply_leaves_the_draft_to_the_reply(adapter):
+    """A reply streams as a draft; the person sends another message and the gateway acks it; the reply's
+    final message still takes the draft over (no quote: it stands where it streamed), and a late frame of
+    that draft does not open it again."""
+    phone = await connect(adapter, adapter.keys)
+    try:
+        await phone.hello()
+        await _send(phone, "m-1", text="Book the train")
+        await _message(phone)
+        await _send(phone, "m-2", text="And a hotel")
+        await _message(phone)
+        for _ in range(100):
+            if adapter._last_user_message.get("main") == "m-2" and len(adapter.received) == 2:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)  # this test's handler returns at once: let both turns settle
+        await adapter.send_draft("main", 5, "Booking")  # the m-1 reply, still streaming
+
+        await adapter.send("main", "⚡ Interrupting current task.", reply_to="m-2",
+                           metadata={"_interim_send": True})
+        ack = await _message(phone)
+        assert ack["kind"] == "system" and "draft_id" not in ack and "reply_to" not in ack
+        await adapter.send("main", "Train booked.", reply_to="m-1")
+        final = await _message(phone)
+        assert final["draft_id"] and "reply_to" not in final
+
+        await adapter.send_draft("main", 5, "Train booked.")
+        await adapter.send("main", "Later.")
+        later = await _message(phone)
+        assert later["text"] == "Later." and "draft_id" not in later  # nothing reopened the draft
+    finally:
+        await phone.close()

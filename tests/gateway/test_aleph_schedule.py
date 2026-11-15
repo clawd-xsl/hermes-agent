@@ -46,8 +46,29 @@ class TestProject:
         job = _job(deliver="signal:+15551234567, origin,local,telegram:42,signal",
                    origin={"platform": "Discord", "chat_id": "c1"})
         assert schedule.project(job)["deliver"] == ["signal", "discord", "telegram"]
-        assert schedule.project(_job(deliver="local"))["deliver"] == []
-        assert schedule.project(_job(deliver=["aleph", "origin"], origin=None))["deliver"] == ["aleph"]
+        assert schedule.project(_job(deliver="aleph,signal"))["deliver"] == ["aleph", "signal"]
+
+    def test_deliver_is_never_empty(self, monkeypatch):
+        """``local`` is said out loud, and a recordless ``origin`` goes where the scheduler sends it: the
+        first platform with a home channel, else nowhere (local)."""
+        from cron import scheduler_delivery
+        homes = {}
+        monkeypatch.setattr(scheduler_delivery, "_iter_home_target_platforms", lambda: iter(["telegram", "aleph"]))
+        monkeypatch.setattr(scheduler_delivery, "_get_home_target_chat_id", lambda name: homes.get(name, ""))
+        assert schedule.project(_job(deliver="local"))["deliver"] == ["local"]
+        assert schedule.project(_job(deliver=""))["deliver"] == ["local"]
+        assert schedule.project(_job(deliver="origin", origin=None))["deliver"] == ["local"]
+        assert schedule.project(_job(deliver="all"))["deliver"] == ["local"]
+        homes["aleph"] = "main"
+        assert schedule.project(_job(deliver="origin", origin=None))["deliver"] == ["aleph"]
+        homes["telegram"] = "42"
+        assert schedule.project(_job(deliver="origin", origin={"note": "no chat"}))["deliver"] == ["telegram"]
+        assert schedule.project(_job(deliver="all"))["deliver"] == ["telegram", "aleph"]
+        assert schedule.project(_job(deliver="origin", origin={"platform": "Signal", "chat_id": "+1"}))[
+            "deliver"] == ["signal"]
+        # Each platform once, however many tokens resolve to it.
+        assert schedule.project(_job(deliver="origin,signal:+2,all", origin={"platform": "signal", "chat_id": "+1"}))[
+            "deliver"] == ["signal", "telegram", "aleph"]
 
     def test_state_running_paused_and_next_run(self):
         assert schedule.project(_job(live_execution={"id": "e1"}))["state"] == "running"

@@ -208,17 +208,22 @@ def test_a_new_pairing_replaces_the_pending_one_and_a_known_key_keeps_its_device
 
 
 @pytest.mark.asyncio
-async def test_a_slow_handshake_closes_with_4401(adapter, monkeypatch):
+async def test_a_slow_handshake_closes_with_4408_and_a_wrong_first_message_with_4401(adapter, monkeypatch):
+    """A slow handshake is transient (the phone retries); only a handshake that fails is 4401 (pair again)."""
     from plugins.platforms.aleph import server as server_mod
     monkeypatch.setattr(server_mod, "HANDSHAKE_SECONDS", 0.2)
     async with aiohttp.ClientSession() as session:
         ws = await session.ws_connect(_url(adapter, "/ws"), headers=mac_headers(adapter, "/aleph/v1/ws"))
         msg = await ws.receive(timeout=3)
+        assert msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED)
+        assert (ws.close_code, msg.extra) == (4408, "handshake timeout")
+        await ws.close()
+
+        ws = await session.ws_connect(_url(adapter, "/ws"), headers=mac_headers(adapter, "/aleph/v1/ws"))
+        await ws.send_bytes(bytes(96))  # in time, but not a handshake
+        msg = await ws.receive(timeout=3)
         assert msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED) and ws.close_code == 4401
         await ws.close()
-    assert server_mod.HANDSHAKE_SECONDS == 0.2
-    monkeypatch.undo()
-    assert server_mod.HANDSHAKE_SECONDS == 5.0
 
 
 @pytest.mark.asyncio

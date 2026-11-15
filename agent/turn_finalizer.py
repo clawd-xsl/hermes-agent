@@ -864,7 +864,8 @@ def finalize_turn(
     agent._reused_response_text = None
     if interrupted and agent._interrupt_message:
         result["interrupt_message"] = agent._interrupt_message
-    agent.clear_interrupt()
+    from agent.interrupt_control import close_turn
+    close_turn(agent)
     agent._stream_callback = None  # don't leak into future calls
 
     # A voice turn's model route ends with the turn: memory sync and the background review

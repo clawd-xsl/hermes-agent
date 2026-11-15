@@ -84,19 +84,33 @@ def _schedule(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def _deliver(job: dict[str, Any]) -> list[str]:
-    """Where the result goes, as platform names: no chat ids, ``origin`` replaced by the platform the
-    task came from, ``local`` (kept on the server) left out."""
+    """Where the result goes, as platform names without chat ids, never empty: ``origin`` and ``all``
+    resolved as the scheduler resolves them when the task fires, ``local`` (kept on the agent's machine,
+    no message) when nothing is sent."""
+    from cron.scheduler_delivery import _ROUTING_TOKENS, _expand_routing_tokens
     raw = job.get("deliver")
     targets = raw if isinstance(raw, list) else str(raw or "").split(",")
     names: list[str] = []
     for target in targets:
-        name = str(target or "").strip().split(":", 1)[0].strip().lower()
-        if name == "origin":
-            origin = job.get("origin")
-            name = str(origin.get("platform") or "").strip().lower() if isinstance(origin, dict) else ""
-        if name and name != "local" and name not in names:
-            names.append(name)
-    return names
+        token = str(target or "").strip().lower()
+        if token == "origin":
+            resolved = [_origin_platform(job)]
+        elif token in _ROUTING_TOKENS:
+            resolved = _expand_routing_tokens(token)
+        else:
+            resolved = [token.split(":", 1)[0].strip()]
+        names += [name for name in resolved if name and name != "local" and name not in names]
+    return names or ["local"]
+
+
+def _origin_platform(job: dict[str, Any]) -> Optional[str]:
+    """The scheduler's ``origin``: the platform the task was created from, else the first platform with a
+    home channel, else nothing (the result stays local)."""
+    from cron.scheduler_delivery import _get_home_target_chat_id, _iter_home_target_platforms, _resolve_origin
+    origin = _resolve_origin(job)
+    if origin:
+        return str(origin["platform"]).lower()
+    return next((name for name in _iter_home_target_platforms() if _get_home_target_chat_id(name)), None)
 
 
 def _last(job: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:

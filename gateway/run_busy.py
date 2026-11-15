@@ -619,6 +619,7 @@ class GatewayBusySessionMixin:
         """Send a busy-path reply anchored to the event (thread metadata included). Never to a bot:
         an ack, redirect or drain notice is a new inbound message for its turn loop (#137027)."""
         from gateway.bot_peer_notices import automatic_notices_allowed
+        from gateway.run import _interim_metadata
         if not automatic_notices_allowed(event.source):
             logger.debug("Busy-path notice suppressed for bot-authored message in %s", event.source.chat_id)
             return
@@ -626,7 +627,8 @@ class GatewayBusySessionMixin:
         await adapter._send_with_retry(
             chat_id=event.source.chat_id, content=content,
             reply_to=reply_anchor if plain_anchor else self._busy_reply_to(event, reply_anchor),
-            metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+            # A notice, never the turn's final: a streaming platform must not seal the live reply with it.
+            metadata=_interim_metadata(self._thread_metadata_for_source(event.source, reply_anchor)),
         )
 
     async def _send_busy_drain_notice(self, event: MessageEvent, session_key: str, effective_mode: str) -> None:
@@ -816,8 +818,9 @@ class GatewayBusySessionMixin:
                 turn.ctx.reply_expected = turn.event.reply_expected
         return turn
 
-    async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
-        """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point."""
+    async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> bool:
+        """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point.
+        False when the agent declined: its turn had already ended (it is only winding down)."""
         from gateway.run import _build_media_placeholder
         try:
             _interrupt_text = event.text
@@ -828,9 +831,9 @@ class GatewayBusySessionMixin:
                 )
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
-            running_agent.interrupt(_interrupt_text)
+            return running_agent.interrupt(_interrupt_text) is not False
         except Exception:
-            pass  # don't let interrupt failure block the ack
+            return True  # don't let interrupt failure block the ack
 
     def _busy_steer_ack_enabled(self, event: MessageEvent, session_key: str) -> bool:
         # Some mobile chat setups want silent steering — keep the behavior, drop the bubble.
@@ -1017,7 +1020,10 @@ class GatewayBusySessionMixin:
             effective_mode == "interrupt" and not redirected
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
         ):
-            await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
+            if not await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent):
+                # The run already ended and is only winding down: nothing to interrupt or announce.
+                # The message is queued and answered as the next turn.
+                return
 
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.
