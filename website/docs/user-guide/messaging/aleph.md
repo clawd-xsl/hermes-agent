@@ -354,7 +354,7 @@ variables win.
 
 - `GET /aleph/v1/ws`: the WebSocket. Binary messages only: the Noise IK handshake, then one encrypted
   JSON-RPC 2.0 frame per message. `hello {protocol: 1, after}` first; the server replays what the phone
-  lacks, sends `sync.done`, then live events. Also `push.register`, `presence` and `file.ticket`.
+  lacks, sends `sync.done` (naming the chats where the agent is working, each with its open draft and typing state), then live events. Also `push.register`, `presence` and `file.ticket`.
 - `GET /aleph/v1/pair`: the pairing WebSocket (Noise IKpsk1), there only while a pairing is pending.
 - `PUT /aleph/v1/files/<ticket>`: upload ciphertext of exactly the size the ticket was issued for (`204`).
 - `GET /aleph/v1/files/<ticket>`: download ciphertext; each link works once.

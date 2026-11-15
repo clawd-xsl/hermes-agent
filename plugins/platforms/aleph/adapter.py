@@ -597,20 +597,29 @@ class AlephAdapter(BasePlatformAdapter):
                 self._server.broadcast(event_frame(event_type, payload))
         self._on_loop(emit)
 
-    def live_state_frames(self) -> list[str]:
-        """What a phone connecting mid-turn needs to show the present, in every chat: typing, the open
-        draft, and the steps still running."""
-        frames = []
+    def live_state(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """The present, for a phone catching up, and the frames that show it. One entry for each chat
+        where the agent is working now (typing, an open draft or a step still running), saying all of
+        its state: the wire id of its open draft or None, and its typing ({"status"}) or None. A phone
+        that missed a frame while away (a typing stop, a draft.clear) sets that state from here."""
+        frames, working = [], {}
+
+        def entry(chat: str) -> dict[str, Any]:
+            return working.setdefault(chat, {"chat": chat, "draft": None, "typing": None})
+
         for chat, status in self._typing.items():
             if self._exists(chat):
                 frames.append(event_frame("typing", self._typing_payload(chat, True, status)))
+                entry(chat)["typing"] = {"status": status or None}
         for chat, (wire_id, text) in self._open_draft.items():
             if self._exists(chat):
                 frames.append(event_frame("draft", {"chat": chat, "draft_id": wire_id, "text": text}))
+                entry(chat)["draft"] = wire_id
         for chat, open_steps in self._open_steps.items():
-            if self._exists(chat):
+            if self._exists(chat) and open_steps:
                 frames += [event_frame("activity", dict(step)) for _raw, step in open_steps]
-        return frames
+                entry(chat)
+        return list(working.values()), frames
 
     async def replay_snapshot(self, after: int) -> ReplaySnapshot:
         """Under ``append_lock``: the events a phone that stored ``after`` is missing, or a reset.

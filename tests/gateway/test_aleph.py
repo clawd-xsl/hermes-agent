@@ -150,7 +150,7 @@ async def test_hello_must_come_first_and_names_supported_protocols(adapter):
         answer, replay = await phone.hello()
         assert answer["result"]["chat"] == {"id": "main"} and answer["result"]["latest"] == 0
         assert answer["result"]["reset"] is False and answer["result"]["agent"]["name"] == "Aleph"
-        assert replay == [{"type": "sync.done", "payload": {"seq": 0}}]
+        assert replay == [{"type": "sync.done", "payload": {"seq": 0, "working": []}}]
         unknown = await phone.call("nope")
         assert unknown["error"]["code"] == -32601
         assert (await phone.call("ping"))["result"] == {}
@@ -197,7 +197,7 @@ async def test_reconnect_replays_only_what_the_phone_lacks(adapter):
         answer, replay = await phone.hello(after=1)
         assert answer["result"]["latest"] == 3 and answer["result"]["reset"] is False
         assert [(e["seq"], e["payload"]["text"]) for e in replay[:-1]] == [(2, "two"), (3, "three")]
-        assert replay[-1] == {"type": "sync.done", "payload": {"seq": 3}}
+        assert replay[-1] == {"type": "sync.done", "payload": {"seq": 3, "working": []}}
         await adapter.send("main", "four")
         live = await phone.event()
         assert live["params"]["seq"] == 4 and live["params"]["payload"]["sender"] == "agent"
@@ -213,7 +213,7 @@ async def test_phone_ahead_of_the_log_gets_a_reset(adapter):
         answer, replay = await phone.hello(after=50)
         assert answer["result"]["reset"] is True and answer["result"]["chats"] == []
         # Nothing is replayed: the phone starts from the present and pages history in.
-        assert replay == [{"type": "sync.done", "payload": {"seq": 1}}]
+        assert replay == [{"type": "sync.done", "payload": {"seq": 1, "working": []}}]
     finally:
         await phone.close()
 
@@ -229,7 +229,7 @@ async def test_pruned_history_resets_to_the_present(adapter):
     try:
         answer, replay = await phone.hello(after=2)
         assert answer["result"]["reset"] is True and answer["result"]["latest"] == 130
-        assert replay == [{"type": "sync.done", "payload": {"seq": 130}}]
+        assert replay == [{"type": "sync.done", "payload": {"seq": 130, "working": []}}]
         # What was pruned from the log is still there as history.
         await phone.call("history.load", {"chat": "main", "before": 131, "limit": 500})
         page = (await phone.event())["params"]["payload"]
@@ -392,14 +392,30 @@ async def test_typing_and_status_text_are_live(adapter):
 
 @pytest.mark.asyncio
 async def test_phone_connecting_mid_turn_sees_typing_and_the_open_draft(adapter):
+    """sync.done gives each chat where the agent is working all of its state (the open draft, the
+    typing and its status); the frames that show it follow."""
+    await adapter.handle_call("chat.create", {"id": "side-1"})
+    await adapter.handle_call("chat.create", {"id": "side-2"})
     await adapter.send_typing("main")
+    adapter._set_typing("main", active=True, status="Running terminal")
     await adapter.send_draft("main", 9, "so far")
+    await adapter.send_draft("side-1", 10, "meanwhile")  # typing already stopped (/stop), the draft not yet
+    await adapter.send_typing("side-2")
+    await adapter.send_draft("side-2", 11, "dropped")
+    await adapter.abandon_open_draft("side-2", "dropped")  # cleared while the turn goes on
     phone = await _phone(adapter)
     try:
-        await phone.hello()
-        frames = [(await phone.event())["params"] for _ in range(2)]
-        assert frames[0] == {"type": "typing", "payload": {"chat": "main", "active": True}}
-        assert frames[1]["type"] == "draft" and frames[1]["payload"]["text"] == "so far"
+        _answer, replay = await phone.hello(after=adapter.store.latest())
+        frames = [(await phone.event())["params"] for _ in range(4)]
+        drafts = {f["payload"]["chat"]: f["payload"]["draft_id"] for f in frames if f["type"] == "draft"}
+        assert replay[-1]["payload"]["working"] == [
+            {"chat": "main", "draft": drafts["main"], "typing": {"status": "Running terminal"}},
+            {"chat": "side-2", "draft": None, "typing": {"status": None}},
+            {"chat": "side-1", "draft": drafts["side-1"], "typing": None}]
+        assert frames[0] == {"type": "typing",
+                             "payload": {"chat": "main", "active": True, "status": "Running terminal"}}
+        assert [f["type"] for f in frames[1:]] == ["typing", "draft", "draft"]
+        assert frames[2]["payload"]["text"] == "so far" and frames[3]["payload"]["chat"] == "side-1"
     finally:
         await phone.close()
 

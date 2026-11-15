@@ -593,10 +593,13 @@ class AlephServer:
             conn.enqueue(_frame({"jsonrpc": "2.0", "id": call_id, "result": result}))
             for event in snapshot.events:
                 conn.enqueue(event_frame(event.type, event.payload, event.seq))
-            conn.enqueue(event_frame("sync.done", {"seq": snapshot.latest}))
+            # With nothing awaited from here on, no live frame can slip between what sync.done says
+            # is working and the frames that show it.
+            working, live = self.adapter.live_state()
+            conn.enqueue(event_frame("sync.done", {"seq": snapshot.latest, "working": working}))
             conn.ready = True
-        for text in self.adapter.live_state_frames():
-            conn.enqueue(text)
+            for text in live:
+                conn.enqueue(text)
         logger.info("Aleph: %s caught up from %d to %d%s (%s)", conn.peer, after, snapshot.latest,
                     " after a reset" if snapshot.reset else "", conn.client.get("device") or "unknown device")
 
