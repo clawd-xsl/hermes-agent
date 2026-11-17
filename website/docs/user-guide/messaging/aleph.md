@@ -217,6 +217,9 @@ source's `chat_id` (a DM), so the gateway keys a session for it. The main chat's
   go to `main`.
 - Hermes's session titles name a side chat: the quick title from its opening message and then the model's,
   each logged as `chat.update` (the gateway calls the adapter's `on_session_title`). `main` has no title.
+- The person can rename a side chat (`chat.rename`). Their title is the session's title at `user` authority, as
+  `/title` sets it (with a `#N` suffix if another session has it), and Hermes's
+  own titles no longer change the chat, even after a new session starts in it.
 - Deleting a side chat (`chat.delete`, from the phone; the agent cannot) ends its session, as `/new` would,
   and drops its events, messages, steps and files from the server. What the gateway still sends there goes
   nowhere. `main` cannot be deleted.

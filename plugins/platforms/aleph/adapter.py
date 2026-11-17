@@ -29,6 +29,7 @@ active (protocol "Push"); pushing never holds up logging or delivery.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -74,7 +75,7 @@ SCHEDULE_CALLS = frozenset({"schedule.list", "schedule.pause", "schedule.resume"
 CHAT_ID = "main"  # the main chat: the home channel, always there
 CHAT_NAME = "Aleph"
 MAX_CHAT_ID = 128
-MAX_CHAT_TITLE = 200
+MAX_CHAT_TITLE = 100  # code points, as Hermes's session titles (SessionDB.MAX_TITLE_LENGTH)
 # A side chat nobody has written in for this long is deleted (``side_chat_idle_days``; 0 keeps them).
 DEFAULT_SIDE_CHAT_IDLE_DAYS = 30
 IDLE_SWEEP_SECONDS = 3600
@@ -264,6 +265,12 @@ class ReplaySnapshot:
     # On a reset: every side chat that exists, as its ``chat.new`` payload.
     chats: Optional[list[dict[str, Any]]] = None
 
+
+
+def _chat_title(text: str) -> str:
+    """A chat title: one line, whitespace runs collapsed, at most ``MAX_CHAT_TITLE`` code points; ""
+    when nothing is left."""
+    return " ".join(text.split())[:MAX_CHAT_TITLE].rstrip()
 
 class AlephAdapter(BasePlatformAdapter):
     """The Aleph channel; see the module docstring for the mapping."""
@@ -764,6 +771,8 @@ class AlephAdapter(BasePlatformAdapter):
             return {"seq": await self._create_chat(params)}
         if method == "chat.delete":
             return {"seq": await self._delete_chat_call(params)}
+        if method == "chat.rename":
+            return {"seq": await self._rename_chat(params)}
         if method == "approval.respond":
             await self._respond_approval(params)
             return {}
@@ -946,7 +955,7 @@ class AlephAdapter(BasePlatformAdapter):
         if title is not None:
             if not isinstance(title, str):
                 raise RpcError(INVALID_PARAMS, "title must be a string or null")
-            title = " ".join(title.split())[:MAX_CHAT_TITLE] or None
+            title = _chat_title(title) or None
         async with self._chat_lock, self.append_lock:
             chat, event = await asyncio.to_thread(self.store.create_chat, chat_id, title, now_iso())
             if chat.deleted_seq is not None:
@@ -956,6 +965,54 @@ class AlephAdapter(BasePlatformAdapter):
                 self._broadcast(event)
                 logger.info("Aleph: opened side chat %s", chat.id)
         return chat.created_seq
+
+    async def _rename_chat(self, params: dict[str, Any]) -> Optional[int]:
+        """``chat.rename {id, title}``: the person names a side chat. The title is theirs from then on:
+        Hermes's own titles for it no longer reach the chat (``_retitle``). None when it is unchanged."""
+        chat_id, title = params.get("id"), params.get("title")
+        if chat_id == CHAT_ID:
+            raise RpcError(INVALID_PARAMS, "main has no title")
+        if not isinstance(chat_id, str) or not chat_id:
+            raise RpcError(INVALID_PARAMS, "id is required")
+        if not isinstance(title, str) or not (title := _chat_title(title)):
+            raise RpcError(INVALID_PARAMS, "title must be a non-empty string")
+        async with self._chat_lock:
+            chat = self._chats.get(chat_id)
+            if chat is None:
+                raise RpcError(INVALID_PARAMS, "no chat with that id")
+            await asyncio.to_thread(self._title_session, chat_id, title)
+            await asyncio.to_thread(self.store.set_chat_title, chat_id, title, by_person=True)
+            if chat.title == title:
+                return None
+            self._chats[chat_id] = dataclasses.replace(chat, title=title)
+            return (await self._log("chat.update", {"chat": chat_id, "title": title})).seq
+
+    def _title_session(self, chat_id: str, title: str) -> None:
+        """Make ``title`` the chat's Hermes session title at the person's authority (``/title``'s), so the
+        title generator leaves the session alone too. Hermes titles are unique across sessions: a taken
+        one gets the next ``#N``, its text cut so the whole stays within the length. Best effort: the chat's own title, which is what the phone shows, does
+        not depend on it."""
+        store = getattr(self, "_session_store", None)
+        db = getattr(store, "_db", None)
+        if store is None or db is None:
+            return
+        try:
+            from hermes_state import SessionDB
+            source = self._source(chat_id)
+            session_id = store.get_or_create_session(source, touch_activity=False).session_id
+            if db.get_session_title(session_id) is None:
+                with contextlib.suppress(Exception):  # the row may exist already, untitled
+                    db.create_session(session_id=session_id, source=self.platform.value, user_id=source.user_id,
+                                      chat_id=source.chat_id, chat_type=source.chat_type)
+            name = SessionDB.sanitize_title(title)
+            try:
+                db.set_session_title(session_id, name)
+            except ValueError:  # another session has that title: the next "#N", cut to fit
+                base, number = db.get_next_title_in_lineage(name).rsplit(" #", 1)
+                suffix = f" #{number}"
+                db.set_session_title(session_id, base[:SessionDB.MAX_TITLE_LENGTH - len(suffix)].rstrip() + suffix)
+        except Exception:
+            logger.warning("Aleph: naming side chat %s's session failed", chat_id, exc_info=True)
 
     async def _delete_chat_call(self, params: dict[str, Any]) -> int:
         chat_id = params.get("id")
@@ -1024,7 +1081,7 @@ class AlephAdapter(BasePlatformAdapter):
         """Hermes named a session (on the agent's thread): a side chat's title, logged as ``chat.update``.
         ``main`` has none."""
         chat = str(getattr(source, "chat_id", "") or "")
-        title = " ".join(str(title or "").split())[:MAX_CHAT_TITLE]
+        title = _chat_title(str(title or ""))
         if chat and chat != CHAT_ID and title:
             self._on_loop(lambda: asyncio.ensure_future(self._retitle(chat, title)))
 
@@ -1033,6 +1090,8 @@ class AlephAdapter(BasePlatformAdapter):
             chat = self._chats.get(chat_id)
             if chat is None or chat.title == title or self._store is None:
                 return
+            if await asyncio.to_thread(self.store.renamed_by_person, chat_id):
+                return  # the person's name stands (a new session in the chat titles itself anew)
             await asyncio.to_thread(self.store.set_chat_title, chat_id, title)
             self._chats[chat_id] = dataclasses.replace(chat, title=title)
             await self._log("chat.update", {"chat": chat_id, "title": title})
