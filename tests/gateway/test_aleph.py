@@ -539,9 +539,8 @@ async def test_approval_card_round_trip(adapter, monkeypatch):
             {"label": "Allow once", "choice": "once", "style": "primary"},
             {"label": "Always", "choice": "always", "style": "default"},
             {"label": "Deny", "choice": "deny", "style": "destructive"}]
-        assert request["payload"]["command"] == "rm -rf build" and request["payload"]["reason"] == "deletes files"
+        assert request["payload"]["command"] == "rm -rf build" and "reason" not in request["payload"]
         assert request["payload"]["created_at"] and "expires_at" not in request["payload"]
-        assert "warning" not in request["payload"]
         bad = await phone.call("approval.respond", {"request_id": "req-1", "choice": "session"})
         assert bad["error"]["code"] == -32602
         ok = await phone.call("approval.respond", {"request_id": "req-1", "choice": "once"})
@@ -552,12 +551,6 @@ async def test_approval_card_round_trip(adapter, monkeypatch):
         assert resolved["payload"] == {"chat": "main", "request_id": "req-1", "choice": "once", "by": "user"}
         gone = await phone.call("approval.respond", {"request_id": "req-1", "choice": "once"})
         assert gone["error"]["code"] == -32602
-        # Hermes's own safety check flagged it: its line rides along as the warning.
-        flagged = _approval_prompt("req-smart")
-        flagged.smart_denied = True
-        await adapter._send_exec_approval_prompt(flagged)
-        from gateway.platforms.base_exec_approval import ea_smart_deny_line_text
-        assert (await phone.event())["params"]["payload"]["warning"] == ea_smart_deny_line_text()
     finally:
         await phone.close()
 

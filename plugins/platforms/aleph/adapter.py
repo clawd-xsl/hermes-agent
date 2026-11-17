@@ -1583,11 +1583,6 @@ class AlephAdapter(BasePlatformAdapter):
                                    "created_at": now_iso()}
         if prompt.command:
             payload["command"] = prompt.command
-        if prompt.description:
-            payload["reason"] = prompt.description
-        if prompt.smart_denied:
-            from gateway.platforms.base_exec_approval import ea_smart_deny_line_text
-            payload["warning"] = ea_smart_deny_line_text()
         self._approvals[request_id] = {"chat": chat, "session_key": prompt.session_key, "choices": prompt.choices,
                                        "card_request_id": prompt.request_id, "answered": False}
         await self._log("approval.request", payload)
