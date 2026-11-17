@@ -15,7 +15,11 @@ What the channel gives the phone:
   once a turn that includes the person's messages starts);
 - the agent's activity out of the thread: one line saying what it is doing, and a history of its steps;
 - gateway notices as system notes;
-- approval cards for dangerous commands and question cards for the `clarify` tool;
+- approval cards for dangerous commands and question cards for the `clarify` tool (single or multiple
+  choice, the recommended one marked, a series one card at a time; a typed message in the chat always
+  answers the open question). Every card ends settled: one left waiting when the gateway stops is settled
+  on its next start, an approval as `cancelled`, a question as `timeout`. History pages carry the cards in
+  their place;
 - attachments both ways, and shared locations (they reach the agent as a location pin with a map link);
 - end-to-end encryption: everything between the phone and the plugin, files included, is ciphertext to
   the network, the tunnel and Cloudflare;
@@ -356,7 +360,7 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_APNS_TEAM_ID` | | Apple developer team id |
 | `ALEPH_APNS_TOPIC` | | The app's bundle id |
 | `ALEPH_HOME_CHANNEL` | `main` | Home channel; `off` leaves the home to another platform |
-| `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` and pages its history in again. Messages themselves are kept as history either way |
+| `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` and pages its history in again. Messages themselves are kept as history either way; cards live in the log, so history pages lose the oldest ones with it |
 | `ALEPH_SIDE_CHAT_IDLE_DAYS` | `30` | Days after which a side chat nobody has written in is deleted; `0` keeps them |
 | `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`), and encrypted files |
 

@@ -52,13 +52,17 @@ def push_body_for(event_type: str, payload: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def build_payload(*, body: str, seq: int, chat: str, sound: bool = True) -> dict[str, Any]:
+def build_payload(*, body: str, seq: int, chat: str, sound: bool = True,
+                  time_sensitive: bool = False) -> dict[str, Any]:
     """No title: the agent goes by the name the person gave it on the phone, which the server does
     not know; the notification service extension sets it. Notifications group by chat. Without
-    ``sound`` the notification arrives silently (a bubble right after another)."""
+    ``sound`` the notification arrives silently (a bubble right after another); ``time_sensitive``
+    (an approval the agent waits on) breaks through a Focus that allows it."""
     aps: dict[str, Any] = {"alert": {"body": body}, "mutable-content": 1, "thread-id": chat}
     if sound:
         aps["sound"] = "default"
+    if time_sensitive:
+        aps["interruption-level"] = "time-sensitive"
     return {"aps": aps, "aleph": {"seq": seq, "chat": chat}}
 
 

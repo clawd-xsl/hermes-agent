@@ -163,6 +163,10 @@ class Chat:
 _CHAT_COLUMNS = "id, title, created_at, created_seq, last_active_at, deleted_seq"
 
 
+# request type -> (history card kind, its id field, its resolved type)
+_CARD_KINDS = {"approval.request": ("approval", "request_id", "approval.resolved"),
+               "clarify.request": ("question", "clarify_id", "clarify.resolved")}
+
 def _chat(row) -> Chat:
     return Chat(row[0], row[1], row[2], int(row[3]), float(row[4]), int(row[5]) if row[5] is not None else None)
 
@@ -372,8 +376,9 @@ class AlephStore:
     def history(self, chat: str, before: int, limit: int) -> tuple[list[dict[str, Any]], Optional[int]]:
         """A history page: the newest ``limit`` messages of ``chat`` logged before ``before`` (a seq),
         oldest first, each as its ``message.new`` stands now (edits applied, deleted ones gone) with its
-        ``seq``, ``reactions`` and, for the person's, ``read``; and the ``before`` of the next page, or
-        None when nothing older exists."""
+        ``seq``, ``reactions`` and, for the person's, ``read``, with the approval and question cards in
+        their place (``_cards_locked``); and the ``before`` of the next page, or None when nothing older
+        exists."""
         with self._lock:
             rows = self._db.execute(
                 "SELECT seq, sender, payload, reactions, read FROM messages WHERE chat = ? AND seq < ? "
@@ -387,7 +392,49 @@ class AlephStore:
             if sender == "user":
                 message["read"] = bool(read)
             page.append(message)
-        return page, (page[0]["seq"] if more and page else None)
+        older = page[0]["seq"] if more and page else None
+        # Cards in their place: those among this page's messages, or, on the oldest page, all before.
+        with self._lock:
+            cards = self._cards_locked(chat, older if older is not None else 0, before)
+        return sorted(page + cards, key=lambda item: item["seq"]), older
+
+    def _cards_locked(self, chat: str, since: int, before: int) -> list[dict[str, Any]]:
+        """The approval and question cards of ``chat`` logged in ``[since, before)``, each with its
+        ``resolved`` payload (logged at any time since) or None while it waits."""
+        rows = self._db.execute(
+            "SELECT seq, type, payload FROM events WHERE chat = ? AND seq >= ? AND seq < ? AND type IN "
+            "('approval.request', 'clarify.request') ORDER BY seq", (chat, int(since), int(before))).fetchall()
+        if not rows:
+            return []
+        resolved = {}
+        for kind, body in self._db.execute(
+                "SELECT type, payload FROM events WHERE chat = ? AND seq >= ? AND type IN "
+                "('approval.resolved', 'clarify.resolved')", (chat, int(since))):
+            payload = json.loads(body)
+            resolved[(kind, payload.get("request_id") or payload.get("clarify_id"))] = payload
+        cards = []
+        for seq, kind, body in rows:
+            request = json.loads(body)
+            card, key, settled = _CARD_KINDS[kind]
+            cards.append({"seq": int(seq), "card": card, "request": request,
+                          "resolved": resolved.get((settled, request.get(key)))})
+        return cards
+
+    def unsettled_cards(self) -> list[tuple[str, dict[str, Any]]]:
+        """``(type, payload)`` of every logged approval or question request without its ``resolved``."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT type, payload FROM events WHERE type IN ('approval.request', 'clarify.request', "
+                "'approval.resolved', 'clarify.resolved') ORDER BY seq").fetchall()
+        waiting: dict[tuple[str, Any], tuple[str, dict[str, Any]]] = {}
+        for kind, body in rows:
+            payload = json.loads(body)
+            if kind in _CARD_KINDS:
+                waiting[(kind, payload.get(_CARD_KINDS[kind][1]))] = (kind, payload)
+            else:
+                request_kind = kind.replace(".resolved", ".request")
+                waiting.pop((request_kind, payload.get(_CARD_KINDS[request_kind][1])), None)
+        return list(waiting.values())
 
     def user_message_ids(self, chat: str, limit: int) -> list[str]:
         """The person's most recent message ids in a chat, newest first."""

@@ -280,6 +280,34 @@ class _BubbleRun:
     def wire_id(self) -> str:
         return self.base if not self.parts else f"{self.base}.{len(self.parts)}"
 
+
+def _bare_question(question: str) -> str:
+    """The question without the typed-"skip" hint the gateway appends for text platforms."""
+    from agent.i18n import t
+    hint = t("gateway.clarify.skip_hint")
+    text = str(question or "")
+    return text[: -len(hint)].rstrip() if hint and text.endswith(hint) else text.strip()
+
+
+def _clarify_answer(card: dict[str, Any], response: str) -> dict[str, Any]:
+    """``{answer, choices}`` for what the agent got: the labels it names and their indices (a typed
+    "2" resolves to its label), or the typed text with no choices."""
+    from tools.clarify_tool import strip_recommended
+    labels = card["labels"]
+    names: Any = [response]
+    if card["multi"]:
+        try:
+            names = json.loads(response)
+        except ValueError:
+            names = [response]
+        if not isinstance(names, list):
+            names = [response]
+    picks = [labels.index(strip_recommended(str(name))) if strip_recommended(str(name)) in labels else None
+             for name in names]
+    if picks and None not in picks:
+        return {"answer": ", ".join(labels[i] for i in picks), "choices": picks}
+    return {"answer": response, "choices": None}
+
 def _chat_title(text: str) -> str:
     """A chat title: one line, whitespace runs collapsed, at most ``MAX_CHAT_TITLE`` code points; ""
     when nothing is left."""
@@ -408,6 +436,7 @@ class AlephAdapter(BasePlatformAdapter):
             self._pending_reactions = pending if isinstance(pending, dict) else {}
         except ValueError:
             self._pending_reactions = {}
+        await self._settle_stale_cards()
         self._server = AlephServer(self, host=self.host, port=self.port, static=self.static)
         try:
             await self._server.start()
@@ -596,7 +625,7 @@ class AlephAdapter(BasePlatformAdapter):
             if not targets:
                 return
             payload = build_payload(body=body, seq=event.seq, chat=str(event.payload.get("chat") or CHAT_ID),
-                                    sound=sound)
+                                    sound=sound, time_sensitive=event.type == "approval.request")
             results = await asyncio.gather(
                 *(sender.send(d.push_token, d.push_environment or "production", payload) for d in targets),
                 return_exceptions=True)
@@ -1545,11 +1574,15 @@ class AlephAdapter(BasePlatformAdapter):
         chat = self._outbound_chat(prompt.chat_id)
         if chat is None:
             return SendResult(success=False, error="the chat was deleted")
-        payload: dict[str, Any] = {"chat": chat, "request_id": request_id, "text": prompt.text, "choices": choices}
+        payload: dict[str, Any] = {"chat": chat, "request_id": request_id, "text": prompt.text, "choices": choices,
+                                   "created_at": now_iso()}
         if prompt.command:
             payload["command"] = prompt.command
         if prompt.description:
             payload["reason"] = prompt.description
+        if prompt.smart_denied:
+            from gateway.platforms.base_exec_approval import ea_smart_deny_line_text
+            payload["warning"] = ea_smart_deny_line_text()
         self._approvals[request_id] = {"chat": chat, "session_key": prompt.session_key, "choices": prompt.choices,
                                        "card_request_id": prompt.request_id, "answered": False}
         await self._log("approval.request", payload)
@@ -1603,22 +1636,33 @@ class AlephAdapter(BasePlatformAdapter):
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
                            session_key: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        """A question card. Its labels lose Hermes's "(Recommended)" mark (``recommended`` says which),
+        its question the gateway's typed-skip hint; a question in a series says which of how many. A
+        typed message in the chat always answers it (``mark_awaiting_text``)."""
         if self._store is None:
             return SendResult(success=False, error="Aleph is not connected", retryable=True)
         chat = self._outbound_chat(chat_id)
         if chat is None:
             return SendResult(success=False, error="the chat was deleted")
-        labels = [str(choice) for choice in (choices or [])]
-        entry = None
-        try:
-            from tools.clarify_gateway import get_pending
-            entry = get_pending(clarify_id)
-        except ImportError:
-            pass
+        from tools.clarify_gateway import get_pending, mark_awaiting_text
+        from tools.clarify_tool import strip_recommended
+        raw = [str(choice) for choice in (choices or [])]
+        labels = [strip_recommended(label) for label in raw]
+        entry = get_pending(clarify_id)
+        multi = bool(getattr(entry, "multi_select", False)) and bool(labels)
+        payload: dict[str, Any] = {"chat": chat, "clarify_id": clarify_id, "question": _bare_question(question),
+                                   "choices": labels, "multi_select": multi, "created_at": now_iso()}
+        recommended = next((i for i, label in enumerate(raw) if label.strip() != labels[i]), None)
+        if recommended is not None:
+            payload["recommended"] = recommended
+        series = (metadata or {}).get("_clarify_series")
+        if isinstance(series, dict) and int(series.get("count") or 0) > 1:
+            payload["index"], payload["count"] = int(series["index"]), int(series["count"])
+        mark_awaiting_text(clarify_id)
         # The entry is kept to read the answer when the clarify ends some other way.
-        self._clarifies[clarify_id] = {"chat": chat, "choices": labels, "answered": False, "entry": entry}
-        await self._log("clarify.request", {"chat": chat, "clarify_id": clarify_id, "question": question,
-                                            "choices": labels, "allows_text": True})
+        self._clarifies[clarify_id] = {"chat": chat, "raw": raw, "labels": labels, "multi": multi,
+                                       "answered": False, "entry": entry}
+        await self._log("clarify.request", payload)
         return SendResult(success=True, message_id=clarify_id)
 
     async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
@@ -1627,37 +1671,60 @@ class AlephAdapter(BasePlatformAdapter):
         card = self._clarifies.pop(clarify_id, None)
         if card is None or card.get("answered") or self._store is None:
             return
-        answer = getattr(card.get("entry"), "response", None)
-        if not isinstance(answer, str) or not answer or answer.startswith("\x00"):
-            answer = None  # the SKIPPED / CANCELLED sentinels are not answers
-        await self._log("clarify.resolved", {"chat": card["chat"], "clarify_id": clarify_id, "answer": answer,
-                                             "by": "user" if answer else "timeout"})
+        from tools.clarify_gateway import SKIPPED
+        response = getattr(card.get("entry"), "response", None)
+        if response == SKIPPED:
+            outcome = {"answer": None, "choices": None, "by": "user"}
+        elif not isinstance(response, str) or not response or response.startswith("\x00"):
+            outcome = {"answer": None, "choices": None, "by": "timeout"}  # CANCELLED is no answer
+        else:
+            outcome = {**_clarify_answer(card, response), "by": "user"}
+        await self._log("clarify.resolved", {"chat": card["chat"], "clarify_id": clarify_id, **outcome})
 
     async def _respond_clarify(self, params: dict[str, Any]) -> None:
+        """``clarify.respond {clarify_id, choices: [index]}`` or ``{clarify_id, skip: true}``; a typed
+        answer is an ordinary ``message.send``."""
         clarify_id = params.get("clarify_id")
         if not isinstance(clarify_id, str):
             raise RpcError(INVALID_PARAMS, "clarify_id is required")
         card = self._clarifies.get(clarify_id)
         if card is None:
             raise RpcError(INVALID_PARAMS, "no pending question with that clarify_id")
-        if "choice" in params and params["choice"] is not None:
-            index = params["choice"]
-            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(card["choices"]):
-                raise RpcError(INVALID_PARAMS, "choice is out of range")
-            answer = card["choices"][index]
+        from tools.clarify_gateway import SKIPPED, resolve_gateway_clarify
+        picks = params.get("choices")
+        if params.get("skip") is True and picks is None:
+            response, outcome = SKIPPED, {"answer": None, "choices": None}
         else:
-            answer = params.get("text")
-            if not isinstance(answer, str) or not answer.strip():
-                raise RpcError(INVALID_PARAMS, "choice or text is required")
-        from tools.clarify_gateway import resolve_gateway_clarify
+            count = len(card["labels"])
+            if (not isinstance(picks, list) or not picks or len(set(map(repr, picks))) != len(picks)
+                    or any(isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < count for i in picks)):
+                raise RpcError(INVALID_PARAMS, "choices must be distinct indices of the listed choices, or skip: true")
+            if len(picks) > 1 and not card["multi"]:
+                raise RpcError(INVALID_PARAMS, "this question takes one choice")
+            # What Hermes's own typed-pick path hands the agent: the label, or for several a JSON list.
+            response = (json.dumps([card["raw"][i].strip() for i in picks], ensure_ascii=False) if card["multi"]
+                        else card["raw"][picks[0]])
+            outcome = {"answer": ", ".join(card["labels"][i] for i in picks), "choices": list(picks)}
         card["answered"] = True
-        resolved = resolve_gateway_clarify(clarify_id, answer)
+        resolved = resolve_gateway_clarify(clarify_id, response)
         self._clarifies.pop(clarify_id, None)
-        chat = card["chat"]
-        if resolved:
-            await self._log("clarify.resolved", {"chat": chat, "clarify_id": clarify_id, "answer": answer, "by": "user"})
-        else:
-            await self._log("clarify.resolved", {"chat": chat, "clarify_id": clarify_id, "answer": None, "by": "timeout"})
+        if not resolved:
+            outcome = {"answer": None, "choices": None}
+        await self._log("clarify.resolved", {"chat": card["chat"], "clarify_id": clarify_id,
+                                             **outcome, "by": "user" if resolved else "timeout"})
+
+    async def _settle_stale_cards(self) -> None:
+        """Every request in the log ends in its ``resolved``: one this process is not waiting on (it
+        restarted, the session ended) is settled now, an approval as ``cancelled``, a question as
+        ``timeout``."""
+        for kind, request in await asyncio.to_thread(self.store.unsettled_cards):
+            chat = request.get("chat") or CHAT_ID
+            if kind == "approval.request" and request.get("request_id") not in self._approvals:
+                await self._log("approval.resolved", {"chat": chat, "request_id": request.get("request_id"),
+                                                      "choice": None, "by": "cancelled"})
+            elif kind == "clarify.request" and request.get("clarify_id") not in self._clarifies:
+                await self._log("clarify.resolved", {"chat": chat, "clarify_id": request.get("clarify_id"),
+                                                     "answer": None, "choices": None, "by": "timeout"})
 
     # ── files ──────────────────────────────────────────────────────────────────────────────────
 

@@ -236,6 +236,8 @@ async def test_a_reply_in_bubbles_sounds_once(adapter):
         assert sounds == [("main", "New message", True), ("main", "New message", False),
                           ("main", "New message", False), ("main", "Approval needed", True),
                           ("side-1", "New message", True)]
+        # Only the approval the agent waits on is time-sensitive.
+        assert [p["aps"].get("interruption-level") for p in pushed] == [None, None, None, "time-sensitive", None]
     finally:
         await phone.close()
 
