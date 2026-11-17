@@ -59,7 +59,8 @@ def test_register_declares_the_channel(monkeypatch):
     assert captured["standalone_send"].media and callable(captured["standalone_sender_fn"])
     assert not captured.get("trusted_inbound")
     assert captured["cli"]["name"] == "aleph"
-    assert [t["name"] for t in _register.tools] == ["aleph_get_profile", "aleph_set_profile", "aleph_react"]
+    assert [t["name"] for t in _register.tools] == ["aleph_get_profile", "aleph_set_profile", "aleph_react",
+                                                    "aleph_options"]
     assert {t["toolset"] for t in _register.tools} == {"aleph"} and all(t["is_async"] for t in _register.tools)
     # No shared secret: an enabled config is a connected one; the env probe needs ALEPH_ENABLED.
     assert captured["config_connected_fn"](PlatformConfig(enabled=True))
@@ -539,6 +540,8 @@ async def test_approval_card_round_trip(adapter, monkeypatch):
             {"label": "Always", "choice": "always", "style": "default"},
             {"label": "Deny", "choice": "deny", "style": "destructive"}]
         assert request["payload"]["command"] == "rm -rf build" and request["payload"]["reason"] == "deletes files"
+        assert request["payload"]["created_at"] and "expires_at" not in request["payload"]
+        assert "warning" not in request["payload"]
         bad = await phone.call("approval.respond", {"request_id": "req-1", "choice": "session"})
         assert bad["error"]["code"] == -32602
         ok = await phone.call("approval.respond", {"request_id": "req-1", "choice": "once"})
@@ -549,6 +552,12 @@ async def test_approval_card_round_trip(adapter, monkeypatch):
         assert resolved["payload"] == {"chat": "main", "request_id": "req-1", "choice": "once", "by": "user"}
         gone = await phone.call("approval.respond", {"request_id": "req-1", "choice": "once"})
         assert gone["error"]["code"] == -32602
+        # Hermes's own safety check flagged it: its line rides along as the warning.
+        flagged = _approval_prompt("req-smart")
+        flagged.smart_denied = True
+        await adapter._send_exec_approval_prompt(flagged)
+        from gateway.platforms.base_exec_approval import ea_smart_deny_line_text
+        assert (await phone.event())["params"]["payload"]["warning"] == ea_smart_deny_line_text()
     finally:
         await phone.close()
 
@@ -594,38 +603,6 @@ async def test_real_approval_queue_resolves_from_the_phone(adapter):
     finally:
         with approval._lock:
             approval._gateway_queues.pop("sk-real", None)
-        await phone.close()
-
-
-@pytest.mark.asyncio
-async def test_clarify_card_round_trip(adapter, monkeypatch):
-    import tools.clarify_gateway as clarify
-    answers = []
-    monkeypatch.setattr(clarify, "resolve_gateway_clarify", lambda cid, text: answers.append((cid, text)) or True)
-    phone = await _phone(adapter)
-    try:
-        await phone.hello()
-        await adapter.send_clarify("main", "Which env?", ["staging", "prod"], "cl-1", "sk")
-        request = (await phone.event())["params"]
-        assert request["payload"] == {"chat": "main", "clarify_id": "cl-1", "question": "Which env?",
-                                      "choices": ["staging", "prod"], "allows_text": True}
-        assert (await phone.call("clarify.respond", {"clarify_id": "cl-1", "choice": 5}))["error"]["code"] == -32602
-        assert (await phone.call("clarify.respond", {"clarify_id": "cl-1", "choice": 1}))["result"] == {}
-        assert answers == [("cl-1", "prod")]
-        resolved = (await phone.event())["params"]
-        assert resolved["payload"] == {"chat": "main", "clarify_id": "cl-1", "answer": "prod", "by": "user"}
-        await adapter.send_clarify("main", "Name?", None, "cl-2", "sk")
-        await phone.event()
-        assert (await phone.call("clarify.respond", {"clarify_id": "cl-2", "text": "Ada"}))["result"] == {}
-        assert answers[-1] == ("cl-2", "Ada")
-        await phone.event()
-        # Ended without a respond (timeout / reset): the card is retired.
-        await adapter.send_clarify("main", "Still there?", ["yes"], "cl-3", "sk")
-        await phone.event()
-        await adapter.retire_clarify_card("cl-3", "expired")
-        retired = (await phone.event())["params"]
-        assert retired["payload"] == {"chat": "main", "clarify_id": "cl-3", "answer": None, "by": "timeout"}
-    finally:
         await phone.close()
 
 

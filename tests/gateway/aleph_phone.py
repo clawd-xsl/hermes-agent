@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 
 import aiohttp
 
@@ -109,7 +110,8 @@ class Phone:
         ticket = answer["result"]
         async with self.session.put(base_url(adapter) + ticket["url"], data=ciphertext) as resp:
             assert resp.status == 204, await resp.text()
-        return {"ticket": ticket["ticket"], "key": b64url(key), "name": name, "mime": mime}
+        return {"id": f"f_{uuid.uuid4().hex}", "ticket": ticket["ticket"], "key": b64url(key), "name": name,
+                "mime": mime}
 
     async def download(self, adapter, attachment: dict) -> bytes:
         from plugins.platforms.aleph.noise import from_b64url

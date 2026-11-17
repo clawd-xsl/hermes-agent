@@ -16,6 +16,7 @@ provides_tools:
   - aleph_get_profile
   - aleph_set_profile
   - aleph_react
+  - aleph_options
 requires_env:
   - name: ALEPH_ENABLED
     description: "Turn the Aleph channel on (true); devices then pair with `hermes aleph pair`"

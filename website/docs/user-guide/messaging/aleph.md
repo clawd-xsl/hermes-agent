@@ -15,7 +15,11 @@ What the channel gives the phone:
   once a turn that includes the person's messages starts);
 - the agent's activity out of the thread: one line saying what it is doing, and a history of its steps;
 - gateway notices as system notes;
-- approval cards for dangerous commands and question cards for the `clarify` tool;
+- approval cards for dangerous commands and question cards for the `clarify` tool (single or multiple
+  choice, the recommended one marked, a series one card at a time; a typed message in the chat always
+  answers the open question). Every card ends settled: one left waiting when the gateway stops is settled
+  on its next start, an approval as `cancelled`, a question as `timeout`. History pages carry the cards in
+  their place;
 - attachments both ways, and shared locations (they reach the agent as a location pin with a map link);
 - end-to-end encryption: everything between the phone and the plugin, files included, is ciphertext to
   the network, the tunnel and Cloudflare;
@@ -255,6 +259,8 @@ the model natively when it has vision, voice notes are transcribed, a text file 
 (Markdown, code, CSV, JSON…) is put into the message, and other files are noted with their paths.
 The phone converts camera formats such as HEIC to JPEG first; videos and other files go as they are, with
 the width, height and duration the phone knows, so every device can lay them out before downloading.
+Each file the phone sends keeps the id the phone gave it (`f_` and 32 hex digits), so the phone finds its
+own copy again after refilling its history; the agent's files get ids from the server.
 
 An upload may be up to 200 MB, but never more than the gateway accepts for inbound media
 (`gateway.max_inbound_media_bytes` in `config.yaml`, 128 MB by default); raise that to allow longer videos.
@@ -284,6 +290,17 @@ itself is still sent.
 - The gateway anchors each of the agent's replies to the message that started the turn. Aleph quotes it
   only when that is not the person's latest message in the chat, such as an answer to an earlier
   message after the person sent another.
+
+The agent can send one reply as a few bubbles by writing `<message_break/>` between the parts (the
+platform hint tells it how). Each part is a message of its own: while the reply streams, a part is
+logged as soon as the text passes its marker and the rest streams as a new draft; the final text is
+reconciled with the parts already logged, so none is logged twice. Inside a code block the marker is
+text. Files follow the last part. Each part is pushed, and one within 10 seconds of the chat's last
+pushed message arrives without a sound, so a reply in three bubbles sounds once.
+
+With `aleph_options` the agent offers 2 to 4 short replies the person can send with one tap. They ride
+on the last part of the agent's next reply in that chat this turn; a turn that sends no text afterwards
+drops them.
 
 ## The agent's name and avatar
 
@@ -345,7 +362,7 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_APNS_TEAM_ID` | | Apple developer team id |
 | `ALEPH_APNS_TOPIC` | | The app's bundle id |
 | `ALEPH_HOME_CHANNEL` | `main` | Home channel; `off` leaves the home to another platform |
-| `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` and pages its history in again. Messages themselves are kept as history either way |
+| `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` and pages its history in again. Messages themselves are kept as history either way; cards live in the log, so history pages lose the oldest ones with it |
 | `ALEPH_SIDE_CHAT_IDLE_DAYS` | `30` | Days after which a side chat nobody has written in is deleted; `0` keeps them |
 | `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`), and encrypted files |
 

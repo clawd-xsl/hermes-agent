@@ -52,7 +52,7 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import MessageDeduplicator
 
 from plugins.platforms.aleph import noise
-from plugins.platforms.aleph import activity, reactions, replies
+from plugins.platforms.aleph import activity, bubbles, reactions, replies
 from plugins.platforms.aleph.profile import DEFAULT_NAME, Avatar
 from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file, file_url
 from plugins.platforms.aleph.noise import b64url, from_b64url
@@ -75,6 +75,8 @@ SCHEDULE_CALLS = frozenset({"schedule.list", "schedule.pause", "schedule.resume"
 CHAT_ID = "main"  # the main chat: the home channel, always there
 CHAT_NAME = "Aleph"
 MAX_CHAT_ID = 128
+QUIET_PUSH_SECONDS = 10.0
+FILE_ID = re.compile(r"f_[0-9a-f]{32}")  # the server's own form, f_<uuid4 hex>, which the phone also picks
 MAX_CHAT_TITLE = 100  # code points, as Hermes's session titles (SessionDB.MAX_TITLE_LENGTH)
 # A side chat nobody has written in for this long is deleted (``side_chat_idle_days``; 0 keeps them).
 DEFAULT_SIDE_CHAT_IDLE_DAYS = 30
@@ -267,6 +269,46 @@ class ReplaySnapshot:
 
 
 
+
+@dataclasses.dataclass
+class _BubbleRun:
+    """A reply streaming in bubbles: its parts logged so far. Part n streams as draft ``base`` (n = 0)
+    or ``base.n``."""
+    base: str
+    parts: list[tuple[str, str]] = dataclasses.field(default_factory=list)  # (message id, text)
+
+    @property
+    def wire_id(self) -> str:
+        return self.base if not self.parts else f"{self.base}.{len(self.parts)}"
+
+
+def _bare_question(question: str) -> str:
+    """The question without the typed-"skip" hint the gateway appends for text platforms."""
+    from agent.i18n import t
+    hint = t("gateway.clarify.skip_hint")
+    text = str(question or "")
+    return text[: -len(hint)].rstrip() if hint and text.endswith(hint) else text.strip()
+
+
+def _clarify_answer(card: dict[str, Any], response: str) -> dict[str, Any]:
+    """``{answer, choices}`` for what the agent got: the labels it names and their indices (a typed
+    "2" resolves to its label), or the typed text with no choices."""
+    from tools.clarify_tool import strip_recommended
+    labels = card["labels"]
+    names: Any = [response]
+    if card["multi"]:
+        try:
+            names = json.loads(response)
+        except ValueError:
+            names = [response]
+        if not isinstance(names, list):
+            names = [response]
+    picks = [labels.index(strip_recommended(str(name))) if strip_recommended(str(name)) in labels else None
+             for name in names]
+    if picks and None not in picks:
+        return {"answer": ", ".join(labels[i] for i in picks), "choices": picks}
+    return {"answer": response, "choices": None}
+
 def _chat_title(text: str) -> str:
     """A chat title: one line, whitespace runs collapsed, at most ``MAX_CHAT_TITLE`` code points; ""
     when nothing is left."""
@@ -339,6 +381,9 @@ class AlephAdapter(BasePlatformAdapter):
         self._open_draft: dict[str, tuple[str, str]] = {}  # chat -> (wire draft id, latest text)
         # Wire ids of drafts a message took over or the turn dropped: a late frame never reopens one.
         self._ended_drafts: dict[str, None] = {}
+        self._bubbles: dict[str, _BubbleRun] = {}  # chat -> the streamed reply's parts already logged
+        self._options: dict[str, list[str]] = {}  # chat -> aleph_options for the turn's next reply
+        self._last_push_at: dict[str, float] = {}  # chat -> its last pushed message (monotonic)
         self._typing: dict[str, Optional[str]] = {}  # chat -> status while the agent works
         self._draft_prefix = secrets.token_hex(3)
         # Cards awaiting an answer.
@@ -392,6 +437,7 @@ class AlephAdapter(BasePlatformAdapter):
             self._pending_reactions = pending if isinstance(pending, dict) else {}
         except ValueError:
             self._pending_reactions = {}
+        await self._settle_stale_cards()
         self._server = AlephServer(self, host=self.host, port=self.port, static=self.static)
         try:
             await self._server.start()
@@ -558,11 +604,18 @@ class AlephAdapter(BasePlatformAdapter):
         body = body or push_body_for(event.type, event.payload)
         if body is None:
             return
-        task = asyncio.create_task(self._push_event(event, body))
+        # A reply in a few bubbles sounds once: a message pushed soon after the chat's last pushed one
+        # comes silently. An approval or a question always sounds.
+        sound = True
+        if event.type == "message.new":
+            chat, now = str(event.payload.get("chat") or CHAT_ID), time.monotonic()
+            sound = now - self._last_push_at.get(chat, -math.inf) >= QUIET_PUSH_SECONDS
+            self._last_push_at[chat] = now
+        task = asyncio.create_task(self._push_event(event, body, sound=sound))
         self._push_tasks.add(task)
         task.add_done_callback(self._push_tasks.discard)
 
-    async def _push_event(self, event: LoggedEvent, body: str) -> None:
+    async def _push_event(self, event: LoggedEvent, body: str, *, sound: bool = True) -> None:
         sender, store, server = self._push, self._store, self._server
         if sender is None or store is None:
             return
@@ -572,7 +625,8 @@ class AlephAdapter(BasePlatformAdapter):
             targets = [d for d in devices if d.push_token and d.id not in active]
             if not targets:
                 return
-            payload = build_payload(body=body, seq=event.seq, chat=str(event.payload.get("chat") or CHAT_ID))
+            payload = build_payload(body=body, seq=event.seq, chat=str(event.payload.get("chat") or CHAT_ID),
+                                    sound=sound, time_sensitive=event.type == "approval.request")
             results = await asyncio.gather(
                 *(sender.send(d.push_token, d.push_environment or "production", payload) for d in targets),
                 return_exceptions=True)
@@ -809,7 +863,7 @@ class AlephAdapter(BasePlatformAdapter):
         uploads = params.get("attachments") or []
         if not isinstance(uploads, list) or len(uploads) > MAX_ATTACHMENTS or not all(
                 isinstance(item, dict) for item in uploads):
-            raise RpcError(INVALID_PARAMS, "attachments must be a list of {ticket, key, name, mime}")
+            raise RpcError(INVALID_PARAMS, "attachments must be a list of {id, ticket, key, name, mime}")
         reply_to = params.get("reply_to")
         if reply_to is not None and not isinstance(reply_to, str):
             raise RpcError(INVALID_PARAMS, "reply_to must be a message id or null")
@@ -1044,6 +1098,7 @@ class AlephAdapter(BasePlatformAdapter):
             self._turn_message.pop(chat_id, None)
             self._last_user_message.pop(chat_id, None)
             self._last_receipt.pop(chat_id, None)
+            self._options.pop(chat_id, None)
             if self._pending_reactions.pop(chat_id, None) is not None:
                 await self._save_pending_reactions()
             for cards in (self._approvals, self._clarifies):
@@ -1124,6 +1179,7 @@ class AlephAdapter(BasePlatformAdapter):
             return
         chat = str(getattr(source, "chat_id", "") or CHAT_ID)
         self._clear_draft(chat)
+        self._options.pop(chat, None)  # the turn sent no text after them
         await self._close_open_steps(chat)
         self._set_typing(chat, active=False)
 
@@ -1143,34 +1199,73 @@ class AlephAdapter(BasePlatformAdapter):
         if chat is None:
             # A deleted chat: the reply has nowhere to go (not an error the gateway should retry).
             return SendResult(success=True, message_id=None)
-        chat_id = chat
+        try:
+            if kind != "text":
+                return SendResult(success=True, message_id=await self._log_agent_message(chat, text, attachments,
+                                                                                         kind=kind))
+            return SendResult(success=True, message_id=await self._send_reply(chat, text, attachments, reply_to))
+        except Exception as exc:
+            logger.error("Aleph: logging an outbound message failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _send_reply(self, chat: str, text: str, attachments: list[dict[str, Any]],
+                          reply_to: Optional[str]) -> Optional[str]:
+        """A reply's text, as the bubbles its ``<message_break/>`` markers make. The parts its draft
+        already logged while it streamed stand (re-worded or dropped if the final text differs); the
+        rest are logged in order, the first completing the open draft and the last carrying the files
+        and the turn's options. Only a reply does this: a notice the gateway sends meanwhile (a busy
+        ack, "stopped") comes marked interim, as kind "system", and leaves the draft alone."""
+        run = self._bubbles.pop(chat, None)
+        logged = run.parts if run is not None else []
+        parts = bubbles.split(text)
+        for (message_id, was), now in zip(logged, parts):
+            if was != now:
+                await self._log("message.edit", {"chat": chat, "id": message_id, "text": now})
+        for message_id, _was in logged[len(parts):]:
+            await self._log("message.delete", {"chat": chat, "id": message_id})
+        fresh = parts[len(logged):] or ([""] if attachments else [])
+        open_draft = self._open_draft.pop(chat, None)
+        if open_draft is not None:
+            self._end_draft(open_draft[0])
+        if not fresh:
+            if open_draft is not None:
+                self._live("draft.clear", {"chat": chat, "draft_id": open_draft[0]})
+            return logged[-1][0] if logged else None
+        options = self._options.pop(chat, None)
+        last_id = None
+        for index, part in enumerate(fresh):
+            extra: dict[str, Any] = {}
+            if index == 0 and open_draft is not None:
+                extra["draft_id"] = open_draft[0]  # the part's real message replaces its draft
+            elif index == 0 and not logged and reply_to and str(reply_to) != self._last_user_message.get(chat):
+                # The gateway anchors every reply to the message that started the turn; answering the
+                # person's latest message needs no quote, and neither does a reply that takes over its
+                # draft (it stands where the draft streamed, under that message). Anything else it names
+                # (an earlier message, one the person sent after the turn began) is quoted.
+                quoted = await self._reply_snapshot(chat, str(reply_to))
+                if quoted is not None:
+                    extra["reply_to"] = quoted
+            last = index == len(fresh) - 1
+            if last and options:
+                extra["options"] = options
+            last_id = await self._log_agent_message(chat, part, attachments if last else [], extra=extra)
+        return last_id
+
+    async def _log_agent_message(self, chat: str, text: str, attachments: list[dict[str, Any]], *,
+                                 kind: str = "text", extra: Optional[dict[str, Any]] = None) -> str:
         message_id = str(uuid.uuid4())
         payload: dict[str, Any] = {"chat": chat, "id": message_id, "sender": "agent", "text": text,
                                    "attachments": self._with_links(attachments), "created_at": now_iso()}
         if kind != "text":
             payload["kind"] = kind
-        else:
-            # The reply's real message replaces its draft on the phone. Only a reply does: a notice the
-            # gateway sends meanwhile (a busy ack, "stopped") comes marked interim, as kind "system".
-            open_draft = self._open_draft.pop(chat_id, None)
-            if open_draft is not None:
-                payload["draft_id"] = open_draft[0]
-                self._end_draft(open_draft[0])
-            # The gateway anchors every reply to the message that started the turn; answering the
-            # person's latest message needs no quote, and neither does a reply that takes over its draft
-            # (it stands where the draft streamed, under that message). Anything else it names (an
-            # earlier message, one the person sent after the turn began) is quoted.
-            elif reply_to and str(reply_to) != self._last_user_message.get(chat):
-                quoted = await self._reply_snapshot(chat, str(reply_to))
-                if quoted is not None:
-                    payload["reply_to"] = quoted
-        try:
-            await self._log("message.new", payload, message={
-                "id": message_id, "sender": "agent", "kind": kind, "text": text, "attachments": attachments})
-        except Exception as exc:
-            logger.error("Aleph: logging an outbound message failed: %s", exc)
-            return SendResult(success=False, error=str(exc))
-        return SendResult(success=True, message_id=message_id)
+        payload.update(extra or {})
+        await self._log("message.new", payload, message={
+            "id": message_id, "sender": "agent", "kind": kind, "text": text, "attachments": attachments})
+        return message_id
+
+    def set_options(self, chat: str, options: list[str]) -> None:
+        """``aleph_options``: the choices ride on the turn's next reply in ``chat`` (its last part)."""
+        self._options[chat] = list(options)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
                            metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -1200,25 +1295,46 @@ class AlephAdapter(BasePlatformAdapter):
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str,
                          metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        """The reply so far. Each part a ``<message_break/>`` closes is logged as its message at once,
+        completing the draft it streamed in; the part still being written streams under a draft of its
+        own."""
         chat = self._outbound_chat(chat_id)
         if chat is None:
             return SendResult(success=True)
-        # A segment after a tool call opens with blank lines the final message does not have.
-        content = (content or "").lstrip("\n")
-        wire_id = self._draft_wire_ids.get(draft_id)
-        if wire_id is None:
+        base = self._draft_wire_ids.get(draft_id)
+        if base is None:
             # Wire ids are unique across restarts (the consumer's counter starts over).
-            wire_id = self._draft_wire_ids[draft_id] = f"{self._draft_prefix}-{draft_id}"
+            base = self._draft_wire_ids[draft_id] = f"{self._draft_prefix}-{draft_id}"
             if len(self._draft_wire_ids) > 512:
                 for stale in list(self._draft_wire_ids)[:256]:
                     self._draft_wire_ids.pop(stale, None)
-        if wire_id in self._ended_drafts:
-            return SendResult(success=True)  # its message already landed, or its turn dropped it
+        run = self._bubbles.get(chat)
+        if run is None or run.base != base:
+            if base in self._ended_drafts:
+                return SendResult(success=True)  # its message already landed, or its turn dropped it
+            run = self._bubbles[chat] = _BubbleRun(base)
+        # A segment after a tool call opens with blank lines the final message does not have.
+        closed, writing = bubbles.split_streaming(content or "")
+        try:
+            for part in closed[len(run.parts):]:
+                wire_id = run.wire_id
+                open_draft = self._open_draft.get(chat)
+                extra = {"draft_id": wire_id} if open_draft is not None and open_draft[0] == wire_id else {}
+                if extra:
+                    self._open_draft.pop(chat)
+                    self._end_draft(wire_id)
+                run.parts.append((await self._log_agent_message(chat, part, [], extra=extra), part))
+        except Exception as exc:
+            logger.error("Aleph: logging a reply's part failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+        if not writing:
+            return SendResult(success=True)
+        wire_id = run.wire_id
         previous = self._open_draft.get(chat)
         if previous is not None and previous[0] != wire_id:
             self._live("draft.clear", {"chat": chat, "draft_id": previous[0]})
-        self._open_draft[chat] = (wire_id, content)
-        self._live("draft", {"chat": chat, "draft_id": wire_id, "text": content})
+        self._open_draft[chat] = (wire_id, writing)
+        self._live("draft", {"chat": chat, "draft_id": wire_id, "text": writing})
         return SendResult(success=True)
 
     async def abandon_open_draft(self, chat_id: str, content: str,
@@ -1228,6 +1344,7 @@ class AlephAdapter(BasePlatformAdapter):
         return SendResult(success=True)
 
     def _clear_draft(self, chat: str) -> None:
+        self._bubbles.pop(chat, None)  # the parts it logged stand
         open_draft = self._open_draft.pop(chat, None)
         if open_draft is not None:
             self._end_draft(open_draft[0])
@@ -1458,11 +1575,15 @@ class AlephAdapter(BasePlatformAdapter):
         chat = self._outbound_chat(prompt.chat_id)
         if chat is None:
             return SendResult(success=False, error="the chat was deleted")
-        payload: dict[str, Any] = {"chat": chat, "request_id": request_id, "text": prompt.text, "choices": choices}
+        payload: dict[str, Any] = {"chat": chat, "request_id": request_id, "text": prompt.text, "choices": choices,
+                                   "created_at": now_iso()}
         if prompt.command:
             payload["command"] = prompt.command
         if prompt.description:
             payload["reason"] = prompt.description
+        if prompt.smart_denied:
+            from gateway.platforms.base_exec_approval import ea_smart_deny_line_text
+            payload["warning"] = ea_smart_deny_line_text()
         self._approvals[request_id] = {"chat": chat, "session_key": prompt.session_key, "choices": prompt.choices,
                                        "card_request_id": prompt.request_id, "answered": False}
         await self._log("approval.request", payload)
@@ -1516,22 +1637,33 @@ class AlephAdapter(BasePlatformAdapter):
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
                            session_key: str, metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        """A question card. Its labels lose Hermes's "(Recommended)" mark (``recommended`` says which),
+        its question the gateway's typed-skip hint; a question in a series says which of how many. A
+        typed message in the chat always answers it (``mark_awaiting_text``)."""
         if self._store is None:
             return SendResult(success=False, error="Aleph is not connected", retryable=True)
         chat = self._outbound_chat(chat_id)
         if chat is None:
             return SendResult(success=False, error="the chat was deleted")
-        labels = [str(choice) for choice in (choices or [])]
-        entry = None
-        try:
-            from tools.clarify_gateway import get_pending
-            entry = get_pending(clarify_id)
-        except ImportError:
-            pass
+        from tools.clarify_gateway import get_pending, mark_awaiting_text
+        from tools.clarify_tool import strip_recommended
+        raw = [str(choice) for choice in (choices or [])]
+        labels = [strip_recommended(label) for label in raw]
+        entry = get_pending(clarify_id)
+        multi = bool(getattr(entry, "multi_select", False)) and bool(labels)
+        payload: dict[str, Any] = {"chat": chat, "clarify_id": clarify_id, "question": _bare_question(question),
+                                   "choices": labels, "multi_select": multi, "created_at": now_iso()}
+        recommended = next((i for i, label in enumerate(raw) if label.strip() != labels[i]), None)
+        if recommended is not None:
+            payload["recommended"] = recommended
+        series = (metadata or {}).get("_clarify_series")
+        if isinstance(series, dict) and int(series.get("count") or 0) > 1:
+            payload["index"], payload["count"] = int(series["index"]), int(series["count"])
+        mark_awaiting_text(clarify_id)
         # The entry is kept to read the answer when the clarify ends some other way.
-        self._clarifies[clarify_id] = {"chat": chat, "choices": labels, "answered": False, "entry": entry}
-        await self._log("clarify.request", {"chat": chat, "clarify_id": clarify_id, "question": question,
-                                            "choices": labels, "allows_text": True})
+        self._clarifies[clarify_id] = {"chat": chat, "raw": raw, "labels": labels, "multi": multi,
+                                       "answered": False, "entry": entry}
+        await self._log("clarify.request", payload)
         return SendResult(success=True, message_id=clarify_id)
 
     async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
@@ -1540,37 +1672,60 @@ class AlephAdapter(BasePlatformAdapter):
         card = self._clarifies.pop(clarify_id, None)
         if card is None or card.get("answered") or self._store is None:
             return
-        answer = getattr(card.get("entry"), "response", None)
-        if not isinstance(answer, str) or not answer or answer.startswith("\x00"):
-            answer = None  # the SKIPPED / CANCELLED sentinels are not answers
-        await self._log("clarify.resolved", {"chat": card["chat"], "clarify_id": clarify_id, "answer": answer,
-                                             "by": "user" if answer else "timeout"})
+        from tools.clarify_gateway import SKIPPED
+        response = getattr(card.get("entry"), "response", None)
+        if response == SKIPPED:
+            outcome = {"answer": None, "choices": None, "by": "user"}
+        elif not isinstance(response, str) or not response or response.startswith("\x00"):
+            outcome = {"answer": None, "choices": None, "by": "timeout"}  # CANCELLED is no answer
+        else:
+            outcome = {**_clarify_answer(card, response), "by": "user"}
+        await self._log("clarify.resolved", {"chat": card["chat"], "clarify_id": clarify_id, **outcome})
 
     async def _respond_clarify(self, params: dict[str, Any]) -> None:
+        """``clarify.respond {clarify_id, choices: [index]}`` or ``{clarify_id, skip: true}``; a typed
+        answer is an ordinary ``message.send``."""
         clarify_id = params.get("clarify_id")
         if not isinstance(clarify_id, str):
             raise RpcError(INVALID_PARAMS, "clarify_id is required")
         card = self._clarifies.get(clarify_id)
         if card is None:
             raise RpcError(INVALID_PARAMS, "no pending question with that clarify_id")
-        if "choice" in params and params["choice"] is not None:
-            index = params["choice"]
-            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(card["choices"]):
-                raise RpcError(INVALID_PARAMS, "choice is out of range")
-            answer = card["choices"][index]
+        from tools.clarify_gateway import SKIPPED, resolve_gateway_clarify
+        picks = params.get("choices")
+        if params.get("skip") is True and picks is None:
+            response, outcome = SKIPPED, {"answer": None, "choices": None}
         else:
-            answer = params.get("text")
-            if not isinstance(answer, str) or not answer.strip():
-                raise RpcError(INVALID_PARAMS, "choice or text is required")
-        from tools.clarify_gateway import resolve_gateway_clarify
+            count = len(card["labels"])
+            if (not isinstance(picks, list) or not picks or len(set(map(repr, picks))) != len(picks)
+                    or any(isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < count for i in picks)):
+                raise RpcError(INVALID_PARAMS, "choices must be distinct indices of the listed choices, or skip: true")
+            if len(picks) > 1 and not card["multi"]:
+                raise RpcError(INVALID_PARAMS, "this question takes one choice")
+            # What Hermes's own typed-pick path hands the agent: the label, or for several a JSON list.
+            response = (json.dumps([card["raw"][i].strip() for i in picks], ensure_ascii=False) if card["multi"]
+                        else card["raw"][picks[0]])
+            outcome = {"answer": ", ".join(card["labels"][i] for i in picks), "choices": list(picks)}
         card["answered"] = True
-        resolved = resolve_gateway_clarify(clarify_id, answer)
+        resolved = resolve_gateway_clarify(clarify_id, response)
         self._clarifies.pop(clarify_id, None)
-        chat = card["chat"]
-        if resolved:
-            await self._log("clarify.resolved", {"chat": chat, "clarify_id": clarify_id, "answer": answer, "by": "user"})
-        else:
-            await self._log("clarify.resolved", {"chat": chat, "clarify_id": clarify_id, "answer": None, "by": "timeout"})
+        if not resolved:
+            outcome = {"answer": None, "choices": None}
+        await self._log("clarify.resolved", {"chat": card["chat"], "clarify_id": clarify_id,
+                                             **outcome, "by": "user" if resolved else "timeout"})
+
+    async def _settle_stale_cards(self) -> None:
+        """Every request in the log ends in its ``resolved``: one this process is not waiting on (it
+        restarted, the session ended) is settled now, an approval as ``cancelled``, a question as
+        ``timeout``."""
+        for kind, request in await asyncio.to_thread(self.store.unsettled_cards):
+            chat = request.get("chat") or CHAT_ID
+            if kind == "approval.request" and request.get("request_id") not in self._approvals:
+                await self._log("approval.resolved", {"chat": chat, "request_id": request.get("request_id"),
+                                                      "choice": None, "by": "cancelled"})
+            elif kind == "clarify.request" and request.get("clarify_id") not in self._clarifies:
+                await self._log("clarify.resolved", {"chat": chat, "clarify_id": request.get("clarify_id"),
+                                                     "answer": None, "choices": None, "by": "timeout"})
 
     # ── files ──────────────────────────────────────────────────────────────────────────────────
 
@@ -1619,13 +1774,21 @@ class AlephAdapter(BasePlatformAdapter):
                 for description in attachments]
 
     async def _take_uploads(self, uploads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """``message.send`` attachments ``{ticket, key, name, mime}``: decrypt each upload, hand the
+        """``message.send`` attachments ``{id, ticket, key, name, mime}``: decrypt each upload, hand the
         plaintext to the gateway's media cache (what the agent reads) and keep the ciphertext (what
-        downloads serve). All are checked before any is spent."""
+        downloads serve), filed under the id the phone chose, so the phone finds its own copy by it
+        again after refilling from history. All are checked before any is spent. Runs under
+        ``_intake_lock``, so two sends cannot claim one id."""
         if self._tickets is None:
             raise RpcError(INVALID_PARAMS, "not connected")
-        opened = []
+        opened, ids = [], set()
         for upload in uploads:
+            file_id = upload.get("id")
+            if not isinstance(file_id, str) or not FILE_ID.fullmatch(file_id):
+                raise RpcError(INVALID_PARAMS, "an attachment's id must be f_ and 32 lowercase hex digits")
+            if file_id in ids or await asyncio.to_thread(self.store.file, file_id) is not None:
+                raise RpcError(INVALID_PARAMS, f"the file id {file_id} is already taken")
+            ids.add(file_id)
             ticket, key = upload.get("ticket"), upload.get("key")
             name, mime = upload.get("name"), upload.get("mime")
             path = self._tickets.uploaded(ticket) if isinstance(ticket, str) else None
@@ -1638,12 +1801,12 @@ class AlephAdapter(BasePlatformAdapter):
                 raise RpcError(INVALID_PARAMS, f"the upload does not decrypt with its key: {exc}") from exc
             name = Path(name).name.replace("\x00", "").strip()[:200] if isinstance(name, str) else ""
             mime = (mime.split(";", 1)[0].strip().lower() if isinstance(mime, str) else "") or "application/octet-stream"
-            opened.append((ticket, str(key), name or "file" + (mimetypes.guess_extension(mime) or ""), mime,
-                           path, plaintext, _upload_hints(upload)))
+            opened.append((file_id, ticket, str(key), name or "file" + (mimetypes.guess_extension(mime) or ""),
+                           mime, path, plaintext, _upload_hints(upload)))
         # Into the media cache first, all of them: a file the gateway refuses (too big, not what its
         # type claims) fails the send before any ticket is spent.
         cached_files = []
-        for ticket, key, name, mime, path, plaintext, hints in opened:
+        for _file_id, _ticket, _key, name, mime, _path, plaintext, _hints in opened:
             try:
                 cached = await cache_media_bytes_async(plaintext, filename=name, mime_type=mime)
             except ValueError as exc:
@@ -1652,8 +1815,7 @@ class AlephAdapter(BasePlatformAdapter):
                 raise RpcError(INVALID_PARAMS, f"{name} could not be read")
             cached_files.append(cached)
         attachments = []
-        for (ticket, key, name, mime, path, plaintext, hints), cached in zip(opened, cached_files):
-            file_id = f"f_{uuid.uuid4().hex}"
+        for (file_id, ticket, key, name, mime, path, plaintext, hints), cached in zip(opened, cached_files):
             dest = self.store.files_dir / f"{file_id}.bin"
             await asyncio.to_thread(os.replace, path, dest)
             self._tickets.spend_upload(ticket)
