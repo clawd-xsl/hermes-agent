@@ -314,6 +314,8 @@ async def test_deleting_ends_the_session_and_drops_the_chat(adapter):
         await adapter.send_typing(SIDE)
         await adapter.send(SIDE, "Looks fine")
         await adapter.send("main", "after")
+        await _received(adapter, "s-1")
+        await _settle()  # s-1's turn has started and logged its receipt
         cursor = adapter.store.latest()
 
         assert (await phone.call("chat.delete", {"id": "main"}))["error"]["code"] == -32602

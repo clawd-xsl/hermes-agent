@@ -204,7 +204,8 @@ async def test_only_notifying_events_push_and_only_to_inactive_devices(adapter):
             command="rm -rf build", description="dangerous", smart_denied=False, request_id=None))
         await adapter.send_clarify("main", "Which one?", ["a", "b"], "c1", "s")
         await _settle()
-        assert [p["aps"]["alert"]["body"] for _, _, p in sender.sent[1:]] == ["Approval needed", "Question"]
+        later = sorted(sender.sent[1:], key=lambda sent: sent[2]["aleph"]["seq"])  # pushes go out concurrently
+        assert [p["aps"]["alert"]["body"] for _, _, p in later] == ["Approval needed", "Question"]
         # The looking device leaves: now both get pushed.
         await phone_looking.call("presence", {"active": False})
         await adapter.send("main", "another")
