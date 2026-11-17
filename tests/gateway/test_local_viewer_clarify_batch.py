@@ -88,10 +88,10 @@ def test_a_cli_source_turn_the_classic_cli_did_not_submit_keeps_one_card_per_que
     runner = run_turn_runner.TurnRunner.__new__(run_turn_runner.TurnRunner)
     runner._ctx = SimpleNamespace(inbound_message_id='adm-1', source=SimpleNamespace(platform=Platform.LOCAL))
     asked = []
-    runner._ask_clarify_question = lambda question, *a, **k: asked.append(question) or ('blue', True)
+    runner._ask_clarify_question = lambda question, *a, **k: asked.append((question, k.get('series'))) or ('blue', True)
     with session_cli_turn.cli_turn_scope('adm-1', {'api_text': 'x'}):
         reply = runner._clarify_callback_sync(QUESTIONS)
-    assert asked == ['colour?', 'size?']
+    assert asked == [('colour?', (0, 2)), ('size?', (1, 2))]  # each card knows its place in the series
     assert reply == {'answers': {'q0': 'blue', 'q1': 'blue'}, 'outcome': 'submitted'}
 
 

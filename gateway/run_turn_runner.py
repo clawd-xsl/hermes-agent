@@ -605,7 +605,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         for index, entry in enumerate(questions):
             question = f"{entry['question']}{hint}"
             raw, answered = self._ask_clarify_question(
-                question, entry["choices"], bool(entry["multi_select"]), rearm=index == last)
+                question, entry["choices"], bool(entry["multi_select"]), rearm=index == last,
+                series=(index, len(questions)) if len(questions) > 1 else None)
             if raw == CANCELLED:
                 reply["outcome"] = "cancelled"
                 break
@@ -619,9 +620,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             answers[entry["qid"]] = None if raw == SKIPPED else raw
         return reply
 
-    def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
+    def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True,
+                              series: tuple[int, int] | None = None) -> tuple[str, bool]:
         """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
-        Returns ``(response, answered)``; the caller decides what "no answer" means."""
+        Returns ``(response, answered)``; the caller decides what "no answer" means. ``series`` is
+        ``(index, count)`` for one of several questions asked in turn; it reaches the adapter as the
+        gateway-internal ``_clarify_series`` metadata, for a card that says "2 of 3"."""
         from gateway.run_turn_runner_clarify_delivery import (
             UNDELIVERED_NO_SURFACE, _clarify_send_then_wait, text_fallback_coro)
         from tools import clarify_gateway as clarify_mod
@@ -634,9 +638,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         session_key = ctx.session_key or ""
         clarify_id = uuid.uuid4().hex[:10]
         choices = list(choices) if choices else None
+        metadata = ctx._status_thread_metadata
+        if series is not None:
+            metadata = {**(metadata or {}), "_clarify_series": {"index": series[0], "count": series[1]}}
         send_kwargs = dict(
             chat_id=ctx._status_chat_id, question=question, choices=choices, clarify_id=clarify_id,
-            session_key=session_key, metadata=ctx._status_thread_metadata,
+            session_key=session_key, metadata=metadata,
         )
 
         def _text_fallback():
