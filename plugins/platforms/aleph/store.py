@@ -433,9 +433,22 @@ class AlephStore:
                 raise
         return _chat(row), event
 
-    def set_chat_title(self, chat_id: str, title: str) -> None:
+    def set_chat_title(self, chat_id: str, title: str, *, by_person: bool = False) -> None:
+        """A chat's new title; ``by_person`` (``chat.rename``) also marks it as the person's, which
+        Hermes's own titles then leave alone (``renamed_by_person``)."""
         with self._lock:
-            self._db.execute("UPDATE chats SET title = ? WHERE id = ?", (title, chat_id))
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._db.execute("UPDATE chats SET title = ? WHERE id = ?", (title, chat_id))
+                if by_person:
+                    self._set_meta_locked(f"renamed:{chat_id}", "1")
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+
+    def renamed_by_person(self, chat_id: str) -> bool:
+        return self.meta(f"renamed:{chat_id}") is not None
 
     def idle_chats(self, before: float) -> list[str]:
         """Side chats nobody has written in since ``before`` (a time)."""
@@ -462,7 +475,7 @@ class AlephStore:
                 self._set_meta_locked("seq_floor", str(self._latest_locked()))
                 for table in ("events", "messages", "activity"):
                     self._db.execute(f"DELETE FROM {table} WHERE chat = ?", (chat_id,))
-                for key in (f"last_user_message:{chat_id}", f"last_receipt:{chat_id}"):
+                for key in (f"last_user_message:{chat_id}", f"last_receipt:{chat_id}", f"renamed:{chat_id}"):
                     self._db.execute("DELETE FROM meta WHERE key = ?", (key,))
                 event = self._append_locked("chat.delete", {"chat": chat_id})
                 self._db.execute("UPDATE chats SET deleted_seq = ? WHERE id = ?", (event.seq, chat_id))

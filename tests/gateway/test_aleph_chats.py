@@ -240,6 +240,63 @@ async def test_session_titles_name_side_chats(adapter):
     assert adapter._source(SIDE).chat_name == "Paris weather today"
 
 
+class _Sessions:
+    """The gateway's session store as an adapter sees it: one session per chat, on a real SessionDB."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def get_or_create_session(self, source, touch_activity=True):
+        return SimpleNamespace(session_id=f"s-{source.chat_id}")
+
+
+@pytest.mark.asyncio
+async def test_the_person_renames_a_side_chat_and_hermes_titles_leave_it(adapter, tmp_path):
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "state.db")
+    adapter.set_session_store(_Sessions(db))
+    try:
+        await adapter.handle_call("chat.create", {"id": SIDE, "title": None})
+        await adapter.handle_call("chat.create", {"id": "other", "title": None})
+        db.create_session(session_id="s-other", source="aleph")
+        db.set_session_title("s-other", "Kyoto trip")
+        latest = adapter.store.latest()
+
+        answer = await adapter.handle_call("chat.rename", {"id": SIDE, "title": "  Kyoto\n  trip  "})
+        (event,) = adapter.store.events_after(latest)
+        assert answer == {"seq": event.seq} and event.payload == {"chat": SIDE, "title": "Kyoto trip"}
+        assert adapter.store.chat(SIDE).title == "Kyoto trip" and adapter._source(SIDE).chat_name == "Kyoto trip"
+        # The person's authority in Hermes too; the name was taken, so the session gets the next one.
+        assert db.get_session_title(f"s-{SIDE}") == "Kyoto trip #2"
+        assert db.get_session_title_source(f"s-{SIDE}") == "user"
+
+        assert await adapter.handle_call("chat.rename", {"id": SIDE, "title": "Kyoto trip"}) == {"seq": None}
+        await asyncio.to_thread(adapter.on_session_title, _source(SIDE), "Trains in Japan", "llm")
+        await _settle()
+        assert adapter.store.events_after(event.seq) == [] and adapter.store.chat(SIDE).title == "Kyoto trip"
+
+        # 100 code points, the same in Hermes; a cut never leaves a trailing space.
+        await adapter.handle_call("chat.rename", {"id": SIDE, "title": "é" * 99 + " tail"})
+        assert adapter.store.chat(SIDE).title == "é" * 99 and db.get_session_title(f"s-{SIDE}") == "é" * 99
+        await adapter.handle_call("chat.rename", {"id": SIDE, "title": "y" * 300})
+        assert adapter.store.chat(SIDE).title == "y" * 100 == "y" * SessionDB.MAX_TITLE_LENGTH
+        assert db.get_session_title(f"s-{SIDE}") == "y" * 100
+        # A taken title of full length: the #N still fits.
+        await adapter.handle_call("chat.create", {"id": "third", "title": None})
+        await adapter.handle_call("chat.rename", {"id": "third", "title": "y" * 100})
+        assert adapter.store.chat("third").title == "y" * 100
+        assert db.get_session_title("s-third") == "y" * 97 + " #2"
+
+        await adapter.handle_call("chat.delete", {"id": "other"})
+        for bad in ({"id": "main", "title": "x"}, {"id": "nope", "title": "x"}, {"id": "other", "title": "x"},
+                    {"id": SIDE, "title": " \n "}, {"id": SIDE, "title": None}, {"id": SIDE}):
+            with pytest.raises(Exception) as failure:
+                await adapter.handle_call("chat.rename", bad)
+            assert getattr(failure.value, "code", None) == -32602, bad
+    finally:
+        db.close()
+
+
 # ── deleting ──────────────────────────────────────────────────────────────────────────────────
 
 
