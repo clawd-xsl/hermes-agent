@@ -16,8 +16,8 @@ What the channel gives the phone:
 - the agent's activity out of the thread: one line saying what it is doing, and a history of its steps;
 - gateway notices as system notes;
 - approval cards for dangerous commands and question cards for the `clarify` tool (single or multiple
-  choice, the recommended one marked, a series one card at a time; a typed message in the chat always
-  answers the open question). Every card ends settled: one left waiting when the gateway stops is settled
+  choice, the recommended one marked, a series one card at a time; a picked answer shows as the person's
+  message, and a typed message in the chat always answers the open question). Every card ends settled: one left waiting when the gateway stops is settled
   on its next start, an approval as `cancelled`, a question as `timeout`. History pages carry the cards in
   their place;
 - attachments both ways, and shared locations (they reach the agent as a location pin with a map link);

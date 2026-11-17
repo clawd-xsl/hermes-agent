@@ -1164,6 +1164,10 @@ class AlephAdapter(BasePlatformAdapter):
         self._turn_message[chat] = None if internal else self._last_user_message.get(chat)
         if internal or not self._exists(chat) or self._store is None:
             return
+        await self._read_up_to_latest(chat)
+
+    async def _read_up_to_latest(self, chat: str) -> None:
+        """A receipt up to the person's latest message in ``chat``, unless one already covers it."""
         target = self._last_user_message.get(chat)
         if not target or target == self._last_receipt.get(chat):
             return
@@ -1681,19 +1685,35 @@ class AlephAdapter(BasePlatformAdapter):
         else:
             outcome = {**_clarify_answer(card, response), "by": "user"}
         await self._log("clarify.resolved", {"chat": card["chat"], "clarify_id": clarify_id, **outcome})
+        if outcome["by"] == "user":
+            await self._read_up_to_latest(card["chat"])  # the typed answer reached the agent
 
     async def _respond_clarify(self, params: dict[str, Any]) -> None:
-        """``clarify.respond {clarify_id, choices: [index]}`` or ``{clarify_id, skip: true}``; a typed
-        answer is an ordinary ``message.send``."""
+        """``clarify.respond {clarify_id, choices: [index], message_id}`` or ``{clarify_id, skip: true}``.
+        A pick is the person's message: logged under the phone's ``message_id`` (so a resend is the
+        same message) with the picked labels as its text, then ``clarify.resolved``. It reaches the
+        agent as the question's answer, not as a turn of its own. A typed answer is an ordinary
+        ``message.send``."""
         clarify_id = params.get("clarify_id")
         if not isinstance(clarify_id, str):
             raise RpcError(INVALID_PARAMS, "clarify_id is required")
+        picks, message_id = params.get("choices"), params.get("message_id")
+        skip = params.get("skip") is True and picks is None
+        if not skip:
+            if not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 128:
+                raise RpcError(INVALID_PARAMS, "message_id is required with choices")
+            async with self._intake_lock:
+                existing = await asyncio.to_thread(self.store.message, message_id)
+            if existing is not None:
+                if existing.sender != "user":
+                    raise RpcError(INVALID_PARAMS, "message_id belongs to another message")
+                return  # a resend after a lost answer: the pick was taken the first time
         card = self._clarifies.get(clarify_id)
         if card is None:
             raise RpcError(INVALID_PARAMS, "no pending question with that clarify_id")
         from tools.clarify_gateway import SKIPPED, resolve_gateway_clarify
-        picks = params.get("choices")
-        if params.get("skip") is True and picks is None:
+        chat = card["chat"]
+        if skip:
             response, outcome = SKIPPED, {"answer": None, "choices": None}
         else:
             count = len(card["labels"])
@@ -1711,8 +1731,25 @@ class AlephAdapter(BasePlatformAdapter):
         self._clarifies.pop(clarify_id, None)
         if not resolved:
             outcome = {"answer": None, "choices": None}
-        await self._log("clarify.resolved", {"chat": card["chat"], "clarify_id": clarify_id,
+        elif not skip:
+            await self._log_answer(chat, message_id, outcome["answer"])
+        await self._log("clarify.resolved", {"chat": chat, "clarify_id": clarify_id,
                                              **outcome, "by": "user" if resolved else "timeout"})
+        if resolved and not skip:
+            await self._read_up_to_latest(chat)
+
+    async def _log_answer(self, chat: str, message_id: str, text: str) -> None:
+        """The person's picked answer as their message in the thread. It is already the clarify's answer,
+        so it is not handed to the gateway as a turn."""
+        async with self._intake_lock:
+            self._dedup.is_duplicate(message_id)
+            await self._log("message.new", {"chat": chat, "id": message_id, "sender": "user", "text": text,
+                                            "attachments": [], "created_at": now_iso()},
+                            message={"id": message_id, "sender": "user", "kind": "text", "text": text,
+                                     "attachments": []})
+            await asyncio.to_thread(self.store.mark_dispatched, message_id)
+            self._last_user_message[chat] = message_id
+            await asyncio.to_thread(self.store.set_meta, f"last_user_message:{chat}", message_id)
 
     async def _settle_stale_cards(self) -> None:
         """Every request in the log ends in its ``resolved``: one this process is not waiting on (it
