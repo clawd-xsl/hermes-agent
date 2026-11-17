@@ -22,6 +22,7 @@ BRIDGE_LOOKUPS = frozenset({"tool_search", "tool_describe"})
 # Aleph's own tools, in the same wording as Hermes's curated verbs.
 OWN_VERBS = {
     "aleph_react": "Reacting to a message",
+    "aleph_options": "Offering reply choices",
     "aleph_set_profile": "Changing name or avatar",
     "aleph_get_profile": "Checking its profile",
 }

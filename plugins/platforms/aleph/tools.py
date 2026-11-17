@@ -130,7 +130,40 @@ REACT = {
     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 }
 
-TOOLS = (GET_PROFILE, SET_PROFILE, REACT)
+MAX_OPTION_CHARS = 40
+
+OPTIONS = {
+    "name": "aleph_options",
+    "title": "Offer reply choices in Aleph",
+    "description": (
+        "Offer the person 2 to 4 replies they can send with one tap, under the message you are about to "
+        "write in Aleph. Use it when their next message is likely one of a few short answers you can name: "
+        "yes / not now, a choice between places or times. Write each as the person would say it, in their "
+        "language. Don't use it for open questions or to pad a reply with follow-ups, and don't list the "
+        "options again in your text. They ride on your next message this turn; calling it again replaces "
+        "them. It is not a question you wait on: the person can always type something else."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "options": {"type": "array", "minItems": 2, "maxItems": 4,
+                        "items": {"type": "string", "minLength": 1, "maxLength": MAX_OPTION_CHARS},
+                        "description": "2 to 4 short replies, each one line of at most 40 characters, all different."},
+        },
+        "required": ["options"],
+        "additionalProperties": False,
+    },
+    "outputSchema": {
+        "type": "object",
+        "properties": {
+            "options": {"type": "array", "items": {"type": "string"}, "description": "The options as they will be shown."},
+        },
+        "required": ["options"],
+        "additionalProperties": False,
+    },
+    "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+}
+
+TOOLS = (GET_PROFILE, SET_PROFILE, REACT, OPTIONS)
 
 
 def hermes_schema(tool: dict[str, Any]) -> dict[str, Any]:
@@ -284,8 +317,49 @@ async def react(args: dict[str, Any], **_: Any) -> str:
     return ok(text, result)
 
 
+def clean_options(raw: Any) -> list[str]:
+    """2 to 4 options, each one trimmed line of 1 to 40 characters, no two the same; ValueError says
+    what is wrong."""
+    if not isinstance(raw, list) or not 2 <= len(raw) <= 4:
+        raise ValueError("give 2 to 4 options")
+    options = []
+    for item in raw:
+        if not isinstance(item, str) or not (option := item.strip()):
+            raise ValueError("an option is empty")
+        if "\n" in option or "\r" in option:
+            raise ValueError(f"{option!r} is more than one line")
+        if len(option) > MAX_OPTION_CHARS:
+            raise ValueError(f"{option!r} is longer than {MAX_OPTION_CHARS} characters")
+        if option in options:
+            raise ValueError(f"{option!r} is there twice")
+        options.append(option)
+    return options
+
+
+async def offer_options(args: dict[str, Any], **_: Any) -> str:
+    try:
+        options = clean_options(args.get("options"))
+    except ValueError as exc:
+        return error(f"Nothing was attached: {exc}. Give 2 to 4 different one-line options of at most "
+                     f"{MAX_OPTION_CHARS} characters.")
+    runner, adapter = _live()
+    if adapter is None:
+        return _not_running()
+    chat = _session_chat()
+
+    async def apply():
+        adapter.set_options(chat, options)
+    try:
+        await _on_gateway(runner, apply)
+    except Exception as exc:
+        logger.warning("Aleph: attaching options failed", exc_info=True)
+        return error(f"Could not attach the options ({exc.__class__.__name__}: {exc}).")
+    return ok("They will show under your next message; don't repeat them in its text.", {"options": options})
+
+
 def register_tools(ctx) -> None:
-    handlers = {"aleph_get_profile": get_profile, "aleph_set_profile": set_profile, "aleph_react": react}
+    handlers = {"aleph_get_profile": get_profile, "aleph_set_profile": set_profile, "aleph_react": react,
+                "aleph_options": offer_options}
     for tool in TOOLS:
         ctx.register_tool(name=tool["name"], toolset=TOOLSET, schema=hermes_schema(tool),
                           handler=handlers[tool["name"]], check_fn=aleph_connected, is_async=True,

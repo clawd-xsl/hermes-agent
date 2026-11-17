@@ -52,18 +52,14 @@ def push_body_for(event_type: str, payload: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def build_payload(*, body: str, seq: int, chat: str) -> dict[str, Any]:
+def build_payload(*, body: str, seq: int, chat: str, sound: bool = True) -> dict[str, Any]:
     """No title: the agent goes by the name the person gave it on the phone, which the server does
-    not know; the notification service extension sets it. Notifications group by chat."""
-    return {
-        "aps": {
-            "alert": {"body": body},
-            "sound": "default",
-            "mutable-content": 1,
-            "thread-id": chat,
-        },
-        "aleph": {"seq": seq, "chat": chat},
-    }
+    not know; the notification service extension sets it. Notifications group by chat. Without
+    ``sound`` the notification arrives silently (a bubble right after another)."""
+    aps: dict[str, Any] = {"alert": {"body": body}, "mutable-content": 1, "thread-id": chat}
+    if sound:
+        aps["sound"] = "default"
+    return {"aps": aps, "aleph": {"seq": seq, "chat": chat}}
 
 
 def build_headers(*, topic: str, now: Optional[float] = None) -> dict[str, str]:

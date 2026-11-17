@@ -52,7 +52,7 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import MessageDeduplicator
 
 from plugins.platforms.aleph import noise
-from plugins.platforms.aleph import activity, reactions, replies
+from plugins.platforms.aleph import activity, bubbles, reactions, replies
 from plugins.platforms.aleph.profile import DEFAULT_NAME, Avatar
 from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file, file_url
 from plugins.platforms.aleph.noise import b64url, from_b64url
@@ -75,6 +75,7 @@ SCHEDULE_CALLS = frozenset({"schedule.list", "schedule.pause", "schedule.resume"
 CHAT_ID = "main"  # the main chat: the home channel, always there
 CHAT_NAME = "Aleph"
 MAX_CHAT_ID = 128
+QUIET_PUSH_SECONDS = 10.0
 MAX_CHAT_TITLE = 100  # code points, as Hermes's session titles (SessionDB.MAX_TITLE_LENGTH)
 # A side chat nobody has written in for this long is deleted (``side_chat_idle_days``; 0 keeps them).
 DEFAULT_SIDE_CHAT_IDLE_DAYS = 30
@@ -267,6 +268,18 @@ class ReplaySnapshot:
 
 
 
+
+@dataclasses.dataclass
+class _BubbleRun:
+    """A reply streaming in bubbles: its parts logged so far. Part n streams as draft ``base`` (n = 0)
+    or ``base.n``."""
+    base: str
+    parts: list[tuple[str, str]] = dataclasses.field(default_factory=list)  # (message id, text)
+
+    @property
+    def wire_id(self) -> str:
+        return self.base if not self.parts else f"{self.base}.{len(self.parts)}"
+
 def _chat_title(text: str) -> str:
     """A chat title: one line, whitespace runs collapsed, at most ``MAX_CHAT_TITLE`` code points; ""
     when nothing is left."""
@@ -339,6 +352,9 @@ class AlephAdapter(BasePlatformAdapter):
         self._open_draft: dict[str, tuple[str, str]] = {}  # chat -> (wire draft id, latest text)
         # Wire ids of drafts a message took over or the turn dropped: a late frame never reopens one.
         self._ended_drafts: dict[str, None] = {}
+        self._bubbles: dict[str, _BubbleRun] = {}  # chat -> the streamed reply's parts already logged
+        self._options: dict[str, list[str]] = {}  # chat -> aleph_options for the turn's next reply
+        self._last_push_at: dict[str, float] = {}  # chat -> its last pushed message (monotonic)
         self._typing: dict[str, Optional[str]] = {}  # chat -> status while the agent works
         self._draft_prefix = secrets.token_hex(3)
         # Cards awaiting an answer.
@@ -558,11 +574,18 @@ class AlephAdapter(BasePlatformAdapter):
         body = body or push_body_for(event.type, event.payload)
         if body is None:
             return
-        task = asyncio.create_task(self._push_event(event, body))
+        # A reply in a few bubbles sounds once: a message pushed soon after the chat's last pushed one
+        # comes silently. An approval or a question always sounds.
+        sound = True
+        if event.type == "message.new":
+            chat, now = str(event.payload.get("chat") or CHAT_ID), time.monotonic()
+            sound = now - self._last_push_at.get(chat, -math.inf) >= QUIET_PUSH_SECONDS
+            self._last_push_at[chat] = now
+        task = asyncio.create_task(self._push_event(event, body, sound=sound))
         self._push_tasks.add(task)
         task.add_done_callback(self._push_tasks.discard)
 
-    async def _push_event(self, event: LoggedEvent, body: str) -> None:
+    async def _push_event(self, event: LoggedEvent, body: str, *, sound: bool = True) -> None:
         sender, store, server = self._push, self._store, self._server
         if sender is None or store is None:
             return
@@ -572,7 +595,8 @@ class AlephAdapter(BasePlatformAdapter):
             targets = [d for d in devices if d.push_token and d.id not in active]
             if not targets:
                 return
-            payload = build_payload(body=body, seq=event.seq, chat=str(event.payload.get("chat") or CHAT_ID))
+            payload = build_payload(body=body, seq=event.seq, chat=str(event.payload.get("chat") or CHAT_ID),
+                                    sound=sound)
             results = await asyncio.gather(
                 *(sender.send(d.push_token, d.push_environment or "production", payload) for d in targets),
                 return_exceptions=True)
@@ -1044,6 +1068,7 @@ class AlephAdapter(BasePlatformAdapter):
             self._turn_message.pop(chat_id, None)
             self._last_user_message.pop(chat_id, None)
             self._last_receipt.pop(chat_id, None)
+            self._options.pop(chat_id, None)
             if self._pending_reactions.pop(chat_id, None) is not None:
                 await self._save_pending_reactions()
             for cards in (self._approvals, self._clarifies):
@@ -1124,6 +1149,7 @@ class AlephAdapter(BasePlatformAdapter):
             return
         chat = str(getattr(source, "chat_id", "") or CHAT_ID)
         self._clear_draft(chat)
+        self._options.pop(chat, None)  # the turn sent no text after them
         await self._close_open_steps(chat)
         self._set_typing(chat, active=False)
 
@@ -1143,34 +1169,73 @@ class AlephAdapter(BasePlatformAdapter):
         if chat is None:
             # A deleted chat: the reply has nowhere to go (not an error the gateway should retry).
             return SendResult(success=True, message_id=None)
-        chat_id = chat
+        try:
+            if kind != "text":
+                return SendResult(success=True, message_id=await self._log_agent_message(chat, text, attachments,
+                                                                                         kind=kind))
+            return SendResult(success=True, message_id=await self._send_reply(chat, text, attachments, reply_to))
+        except Exception as exc:
+            logger.error("Aleph: logging an outbound message failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _send_reply(self, chat: str, text: str, attachments: list[dict[str, Any]],
+                          reply_to: Optional[str]) -> Optional[str]:
+        """A reply's text, as the bubbles its ``<message_break/>`` markers make. The parts its draft
+        already logged while it streamed stand (re-worded or dropped if the final text differs); the
+        rest are logged in order, the first completing the open draft and the last carrying the files
+        and the turn's options. Only a reply does this: a notice the gateway sends meanwhile (a busy
+        ack, "stopped") comes marked interim, as kind "system", and leaves the draft alone."""
+        run = self._bubbles.pop(chat, None)
+        logged = run.parts if run is not None else []
+        parts = bubbles.split(text)
+        for (message_id, was), now in zip(logged, parts):
+            if was != now:
+                await self._log("message.edit", {"chat": chat, "id": message_id, "text": now})
+        for message_id, _was in logged[len(parts):]:
+            await self._log("message.delete", {"chat": chat, "id": message_id})
+        fresh = parts[len(logged):] or ([""] if attachments else [])
+        open_draft = self._open_draft.pop(chat, None)
+        if open_draft is not None:
+            self._end_draft(open_draft[0])
+        if not fresh:
+            if open_draft is not None:
+                self._live("draft.clear", {"chat": chat, "draft_id": open_draft[0]})
+            return logged[-1][0] if logged else None
+        options = self._options.pop(chat, None)
+        last_id = None
+        for index, part in enumerate(fresh):
+            extra: dict[str, Any] = {}
+            if index == 0 and open_draft is not None:
+                extra["draft_id"] = open_draft[0]  # the part's real message replaces its draft
+            elif index == 0 and not logged and reply_to and str(reply_to) != self._last_user_message.get(chat):
+                # The gateway anchors every reply to the message that started the turn; answering the
+                # person's latest message needs no quote, and neither does a reply that takes over its
+                # draft (it stands where the draft streamed, under that message). Anything else it names
+                # (an earlier message, one the person sent after the turn began) is quoted.
+                quoted = await self._reply_snapshot(chat, str(reply_to))
+                if quoted is not None:
+                    extra["reply_to"] = quoted
+            last = index == len(fresh) - 1
+            if last and options:
+                extra["options"] = options
+            last_id = await self._log_agent_message(chat, part, attachments if last else [], extra=extra)
+        return last_id
+
+    async def _log_agent_message(self, chat: str, text: str, attachments: list[dict[str, Any]], *,
+                                 kind: str = "text", extra: Optional[dict[str, Any]] = None) -> str:
         message_id = str(uuid.uuid4())
         payload: dict[str, Any] = {"chat": chat, "id": message_id, "sender": "agent", "text": text,
                                    "attachments": self._with_links(attachments), "created_at": now_iso()}
         if kind != "text":
             payload["kind"] = kind
-        else:
-            # The reply's real message replaces its draft on the phone. Only a reply does: a notice the
-            # gateway sends meanwhile (a busy ack, "stopped") comes marked interim, as kind "system".
-            open_draft = self._open_draft.pop(chat_id, None)
-            if open_draft is not None:
-                payload["draft_id"] = open_draft[0]
-                self._end_draft(open_draft[0])
-            # The gateway anchors every reply to the message that started the turn; answering the
-            # person's latest message needs no quote, and neither does a reply that takes over its draft
-            # (it stands where the draft streamed, under that message). Anything else it names (an
-            # earlier message, one the person sent after the turn began) is quoted.
-            elif reply_to and str(reply_to) != self._last_user_message.get(chat):
-                quoted = await self._reply_snapshot(chat, str(reply_to))
-                if quoted is not None:
-                    payload["reply_to"] = quoted
-        try:
-            await self._log("message.new", payload, message={
-                "id": message_id, "sender": "agent", "kind": kind, "text": text, "attachments": attachments})
-        except Exception as exc:
-            logger.error("Aleph: logging an outbound message failed: %s", exc)
-            return SendResult(success=False, error=str(exc))
-        return SendResult(success=True, message_id=message_id)
+        payload.update(extra or {})
+        await self._log("message.new", payload, message={
+            "id": message_id, "sender": "agent", "kind": kind, "text": text, "attachments": attachments})
+        return message_id
+
+    def set_options(self, chat: str, options: list[str]) -> None:
+        """``aleph_options``: the choices ride on the turn's next reply in ``chat`` (its last part)."""
+        self._options[chat] = list(options)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
                            metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -1200,25 +1265,46 @@ class AlephAdapter(BasePlatformAdapter):
 
     async def send_draft(self, chat_id: str, draft_id: int, content: str,
                          metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        """The reply so far. Each part a ``<message_break/>`` closes is logged as its message at once,
+        completing the draft it streamed in; the part still being written streams under a draft of its
+        own."""
         chat = self._outbound_chat(chat_id)
         if chat is None:
             return SendResult(success=True)
-        # A segment after a tool call opens with blank lines the final message does not have.
-        content = (content or "").lstrip("\n")
-        wire_id = self._draft_wire_ids.get(draft_id)
-        if wire_id is None:
+        base = self._draft_wire_ids.get(draft_id)
+        if base is None:
             # Wire ids are unique across restarts (the consumer's counter starts over).
-            wire_id = self._draft_wire_ids[draft_id] = f"{self._draft_prefix}-{draft_id}"
+            base = self._draft_wire_ids[draft_id] = f"{self._draft_prefix}-{draft_id}"
             if len(self._draft_wire_ids) > 512:
                 for stale in list(self._draft_wire_ids)[:256]:
                     self._draft_wire_ids.pop(stale, None)
-        if wire_id in self._ended_drafts:
-            return SendResult(success=True)  # its message already landed, or its turn dropped it
+        run = self._bubbles.get(chat)
+        if run is None or run.base != base:
+            if base in self._ended_drafts:
+                return SendResult(success=True)  # its message already landed, or its turn dropped it
+            run = self._bubbles[chat] = _BubbleRun(base)
+        # A segment after a tool call opens with blank lines the final message does not have.
+        closed, writing = bubbles.split_streaming(content or "")
+        try:
+            for part in closed[len(run.parts):]:
+                wire_id = run.wire_id
+                open_draft = self._open_draft.get(chat)
+                extra = {"draft_id": wire_id} if open_draft is not None and open_draft[0] == wire_id else {}
+                if extra:
+                    self._open_draft.pop(chat)
+                    self._end_draft(wire_id)
+                run.parts.append((await self._log_agent_message(chat, part, [], extra=extra), part))
+        except Exception as exc:
+            logger.error("Aleph: logging a reply's part failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+        if not writing:
+            return SendResult(success=True)
+        wire_id = run.wire_id
         previous = self._open_draft.get(chat)
         if previous is not None and previous[0] != wire_id:
             self._live("draft.clear", {"chat": chat, "draft_id": previous[0]})
-        self._open_draft[chat] = (wire_id, content)
-        self._live("draft", {"chat": chat, "draft_id": wire_id, "text": content})
+        self._open_draft[chat] = (wire_id, writing)
+        self._live("draft", {"chat": chat, "draft_id": wire_id, "text": writing})
         return SendResult(success=True)
 
     async def abandon_open_draft(self, chat_id: str, content: str,
@@ -1228,6 +1314,7 @@ class AlephAdapter(BasePlatformAdapter):
         return SendResult(success=True)
 
     def _clear_draft(self, chat: str) -> None:
+        self._bubbles.pop(chat, None)  # the parts it logged stand
         open_draft = self._open_draft.pop(chat, None)
         if open_draft is not None:
             self._end_draft(open_draft[0])

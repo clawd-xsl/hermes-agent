@@ -169,6 +169,7 @@ def test_payload_and_headers_match_the_protocol():
                 "mutable-content": 1, "thread-id": "main"},
         "aleph": {"seq": 58, "chat": "main"},
     }
+    assert "sound" not in build_payload(body="New message", seq=59, chat="main", sound=False)["aps"]
     headers = build_headers(topic="sh.xsl.aleph", now=1_000_000.0)
     assert headers == {"apns-push-type": "alert", "apns-priority": "10", "apns-topic": "sh.xsl.aleph",
                        "apns-expiration": str(1_000_000 + 86400)}
@@ -212,6 +213,31 @@ async def test_only_notifying_events_push_and_only_to_inactive_devices(adapter):
     finally:
         await phone_away.close()
         await phone_looking.close()
+
+
+@pytest.mark.asyncio
+async def test_a_reply_in_bubbles_sounds_once(adapter):
+    """Each bubble is pushed; one within 10 s of the chat's last pushed message comes silently. An
+    approval always sounds; another chat keeps its own clock."""
+    _device, keys = _pair_direct(adapter)
+    phone = await _phone(adapter, keys)
+    try:
+        await phone.call("push.register", {"token": PUSH_TOKEN, "environment": "development"})
+        await phone.close()
+        await adapter.send("main", "One.<message_break/>Two.<message_break/>Three.")
+        await adapter._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="main", session_key="s", text="Run it?", actions=[("Once", "once", "primary")],
+            command="ls", description="", smart_denied=False, request_id=None))
+        await adapter.handle_call("chat.create", {"id": "side-1"})
+        await adapter.send("side-1", "Elsewhere.")
+        await _settle()
+        pushed = sorted((p for _, _, p in adapter._push.sent), key=lambda p: p["aleph"]["seq"])  # sent concurrently
+        sounds = [(p["aleph"]["chat"], p["aps"]["alert"]["body"], "sound" in p["aps"]) for p in pushed]
+        assert sounds == [("main", "New message", True), ("main", "New message", False),
+                          ("main", "New message", False), ("main", "Approval needed", True),
+                          ("side-1", "New message", True)]
+    finally:
+        await phone.close()
 
 
 @pytest.mark.asyncio

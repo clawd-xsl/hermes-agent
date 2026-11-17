@@ -285,6 +285,17 @@ itself is still sent.
   only when that is not the person's latest message in the chat, such as an answer to an earlier
   message after the person sent another.
 
+The agent can send one reply as a few bubbles by writing `<message_break/>` between the parts (the
+platform hint tells it how). Each part is a message of its own: while the reply streams, a part is
+logged as soon as the text passes its marker and the rest streams as a new draft; the final text is
+reconciled with the parts already logged, so none is logged twice. Inside a code block the marker is
+text. Files follow the last part. Each part is pushed, and one within 10 seconds of the chat's last
+pushed message arrives without a sound, so a reply in three bubbles sounds once.
+
+With `aleph_options` the agent offers 2 to 4 short replies the person can send with one tap. They ride
+on the last part of the agent's next reply in that chat this turn; a turn that sends no text afterwards
+drops them.
+
 ## The agent's name and avatar
 
 On Aleph the agent has a name (`Aleph` until it picks one) and an avatar (none until it sets one; the
