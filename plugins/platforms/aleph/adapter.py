@@ -76,6 +76,7 @@ CHAT_ID = "main"  # the main chat: the home channel, always there
 CHAT_NAME = "Aleph"
 MAX_CHAT_ID = 128
 QUIET_PUSH_SECONDS = 10.0
+FILE_ID = re.compile(r"f_[0-9a-f]{32}")  # the server's own form, f_<uuid4 hex>, which the phone also picks
 MAX_CHAT_TITLE = 100  # code points, as Hermes's session titles (SessionDB.MAX_TITLE_LENGTH)
 # A side chat nobody has written in for this long is deleted (``side_chat_idle_days``; 0 keeps them).
 DEFAULT_SIDE_CHAT_IDLE_DAYS = 30
@@ -862,7 +863,7 @@ class AlephAdapter(BasePlatformAdapter):
         uploads = params.get("attachments") or []
         if not isinstance(uploads, list) or len(uploads) > MAX_ATTACHMENTS or not all(
                 isinstance(item, dict) for item in uploads):
-            raise RpcError(INVALID_PARAMS, "attachments must be a list of {ticket, key, name, mime}")
+            raise RpcError(INVALID_PARAMS, "attachments must be a list of {id, ticket, key, name, mime}")
         reply_to = params.get("reply_to")
         if reply_to is not None and not isinstance(reply_to, str):
             raise RpcError(INVALID_PARAMS, "reply_to must be a message id or null")
@@ -1773,13 +1774,21 @@ class AlephAdapter(BasePlatformAdapter):
                 for description in attachments]
 
     async def _take_uploads(self, uploads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """``message.send`` attachments ``{ticket, key, name, mime}``: decrypt each upload, hand the
+        """``message.send`` attachments ``{id, ticket, key, name, mime}``: decrypt each upload, hand the
         plaintext to the gateway's media cache (what the agent reads) and keep the ciphertext (what
-        downloads serve). All are checked before any is spent."""
+        downloads serve), filed under the id the phone chose, so the phone finds its own copy by it
+        again after refilling from history. All are checked before any is spent. Runs under
+        ``_intake_lock``, so two sends cannot claim one id."""
         if self._tickets is None:
             raise RpcError(INVALID_PARAMS, "not connected")
-        opened = []
+        opened, ids = [], set()
         for upload in uploads:
+            file_id = upload.get("id")
+            if not isinstance(file_id, str) or not FILE_ID.fullmatch(file_id):
+                raise RpcError(INVALID_PARAMS, "an attachment's id must be f_ and 32 lowercase hex digits")
+            if file_id in ids or await asyncio.to_thread(self.store.file, file_id) is not None:
+                raise RpcError(INVALID_PARAMS, f"the file id {file_id} is already taken")
+            ids.add(file_id)
             ticket, key = upload.get("ticket"), upload.get("key")
             name, mime = upload.get("name"), upload.get("mime")
             path = self._tickets.uploaded(ticket) if isinstance(ticket, str) else None
@@ -1792,12 +1801,12 @@ class AlephAdapter(BasePlatformAdapter):
                 raise RpcError(INVALID_PARAMS, f"the upload does not decrypt with its key: {exc}") from exc
             name = Path(name).name.replace("\x00", "").strip()[:200] if isinstance(name, str) else ""
             mime = (mime.split(";", 1)[0].strip().lower() if isinstance(mime, str) else "") or "application/octet-stream"
-            opened.append((ticket, str(key), name or "file" + (mimetypes.guess_extension(mime) or ""), mime,
-                           path, plaintext, _upload_hints(upload)))
+            opened.append((file_id, ticket, str(key), name or "file" + (mimetypes.guess_extension(mime) or ""),
+                           mime, path, plaintext, _upload_hints(upload)))
         # Into the media cache first, all of them: a file the gateway refuses (too big, not what its
         # type claims) fails the send before any ticket is spent.
         cached_files = []
-        for ticket, key, name, mime, path, plaintext, hints in opened:
+        for _file_id, _ticket, _key, name, mime, _path, plaintext, _hints in opened:
             try:
                 cached = await cache_media_bytes_async(plaintext, filename=name, mime_type=mime)
             except ValueError as exc:
@@ -1806,8 +1815,7 @@ class AlephAdapter(BasePlatformAdapter):
                 raise RpcError(INVALID_PARAMS, f"{name} could not be read")
             cached_files.append(cached)
         attachments = []
-        for (ticket, key, name, mime, path, plaintext, hints), cached in zip(opened, cached_files):
-            file_id = f"f_{uuid.uuid4().hex}"
+        for (file_id, ticket, key, name, mime, path, plaintext, hints), cached in zip(opened, cached_files):
             dest = self.store.files_dir / f"{file_id}.bin"
             await asyncio.to_thread(os.replace, path, dest)
             self._tickets.spend_upload(ticket)

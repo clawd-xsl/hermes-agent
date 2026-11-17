@@ -259,6 +259,8 @@ the model natively when it has vision, voice notes are transcribed, a text file 
 (Markdown, code, CSV, JSON…) is put into the message, and other files are noted with their paths.
 The phone converts camera formats such as HEIC to JPEG first; videos and other files go as they are, with
 the width, height and duration the phone knows, so every device can lay them out before downloading.
+Each file the phone sends keeps the id the phone gave it (`f_` and 32 hex digits), so the phone finds its
+own copy again after refilling its history; the agent's files get ids from the server.
 
 An upload may be up to 200 MB, but never more than the gateway accepts for inbound media
 (`gateway.max_inbound_media_bytes` in `config.yaml`, 128 MB by default); raise that to allow longer videos.
