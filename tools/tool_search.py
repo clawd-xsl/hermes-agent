@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from tools.registry import tool_error
-from toolsets import CLIENT_SURFACE_TOOLSETS, TOOLSET_SESSION_PLATFORMS
+from toolsets import BUILTIN_TOOLSET_NAMES, CLIENT_SURFACE_TOOLSETS, TOOLSET_SESSION_PLATFORMS
 from tools.tool_search_catalog import (
     BRIDGE_TOOL_NAMES, CHARS_PER_TOKEN, TOOL_CALL_NAME, TOOL_DESCRIBE_NAME, TOOL_SEARCH_NAME,
     CatalogEntry, _fn, _listing_group_label, _registry_entry, _registry_toolset,
@@ -139,6 +139,19 @@ def _core_tool_names() -> frozenset[str]:
 # their schema; once enabled they stay direct unless the deferral list names them.
 _DIRECT_SURFACE_TOOLSETS = CLIENT_SURFACE_TOOLSETS | TOOLSET_SESSION_PLATFORMS.keys()
 
+
+def _is_plugin_platform_toolset(toolset: str) -> bool:
+    """A plugin platform's own toolset (tools registered under the platform's name) reaches only
+    that platform's sessions, through its implicit ``hermes-<platform>`` bundle, so like the
+    session-gated toolsets it is that session's surface and stays direct."""
+    if toolset in BUILTIN_TOOLSET_NAMES:
+        return False
+    try:
+        from gateway.platform_registry import platform_registry
+        return platform_registry.is_registered(toolset)
+    except Exception:
+        return False
+
 # Event-triggered tools deferred BY DEFAULT (a catalog stub suffices). Keep the curated
 # list in DEFAULT_CONFIG so config discovery and runtime behavior cannot drift. An explicit
 # ``defer`` list replaces this wholesale ([] = everything eager). ``clarify`` is deliberately
@@ -149,8 +162,8 @@ _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defe
 
 def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
-    user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
-    plugin tool). Bridge names never defer."""
+    user override), OR an MCP tool, OR neither core nor a session surface (a session-gated GUI
+    toolset or a plugin platform's own) — i.e. a plugin tool. Bridge names never defer."""
     if name in BRIDGE_TOOL_NAMES:
         return False
     if defer_tools is not None and name in defer_tools:
@@ -159,7 +172,8 @@ def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) 
         return False
     toolset = _registry_toolset(name)  # None (unregistered/malformed) never defers
     return toolset is not None and (
-        toolset.startswith("mcp-") or toolset not in _DIRECT_SURFACE_TOOLSETS)
+        toolset.startswith("mcp-")
+        or (toolset not in _DIRECT_SURFACE_TOOLSETS and not _is_plugin_platform_toolset(toolset)))
 
 
 def _tool_def_names(tool_defs: Iterable[dict[str, Any]]) -> Iterable[str]:
