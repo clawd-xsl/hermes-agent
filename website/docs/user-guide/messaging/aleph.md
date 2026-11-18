@@ -26,7 +26,8 @@ What the channel gives the phone:
 - push notifications through APNs that carry no content: the app's notification extension fetches the
   real text over the channel itself.
 - emoji reactions both ways, like a tapback;
-- the agent's own name and avatar, which only the agent changes, with the `aleph` tools.
+- the agent's own name and avatar, which only the agent changes, with the `aleph` tools;
+- projects: Claude Code or Codex working in a folder on this machine, in the same log (see Projects).
 
 The wire protocol is specified in the Aleph repository (`docs/protocol.md`).
 
@@ -340,6 +341,54 @@ agent's `cronjob` tool, asked for in the conversation.
   finishes, whoever did it (the agent, `hermes cron`, the scheduler, another device): the adapter checks
   the job store and the executions ledger every two seconds and compares what it would show.
 
+## Projects
+
+A project is a coding agent, Claude Code or Codex, working in a folder on this machine. The phone shows
+projects beside the chats, in the same log (one `seq`, one catch-up, one reset, one push path). A project
+is one agent made of a top level, which the person talks to, and the threads the top level (or the
+person) opens for longer work, each a backend session of its own; all of them share the folder, the
+project's memory and its settings. Hermes's own agent is not involved: the plugin drives the backends'
+CLIs itself.
+
+- **Folders** lie under `ALEPH_PROJECTS_ROOT` (`/opt/data/projects` by default, links resolved), which is
+  all the phone's folder browser shows. A project takes an existing folder, one the browser made, or a
+  git clone (`https://`, `ssh://` or `user@host:path`, at most 10 minutes; a failed clone leaves nothing).
+- **What the server keeps**, in `$ALEPH_STATE_DIR/projects/<project>/`: each edit's diff, each command's
+  output (its last 8 MB), and the project's shared memory (`memory/MEMORY.md` and its entries), which every
+  session reads and writes. Deleting a project drops these and its events; its folder stays.
+- **Coordination**: the sessions reach each other through the plugin's own MCP tools (`open_thread`,
+  `message_thread`, `list_threads`, `report`) over a Unix socket in `$ALEPH_STATE_DIR/projects/` (mode
+  700). Each session's process has its own token, in its environment only, which decides its tools.
+
+Both backends run with `HOME` set to `ALEPH_PROJECTS_HOME` (`$HERMES_HOME` by default), so their sign-ins,
+config and transcripts live there. The machine needs:
+
+- **Claude Code**: `claude` on the gateway's `PATH`, signed in under that `HOME`
+  (`HOME=$HERMES_HOME claude auth status` says `loggedIn`). It offers `ask`, and `auto_review` when the
+  account accepts the CLI's auto mode; never `allow_all`, which it refuses as root.
+- **Codex**: `codex` on `PATH`, signed in with `CODEX_HOME=$HERMES_HOME/.codex`
+  (`HOME=$HERMES_HOME CODEX_HOME=$HERMES_HOME/.codex codex login`). One `codex app-server` serves every
+  thread.
+- **git credentials** for private clones and pushes, under that `HOME`: a token in a credential helper
+  (such as `$HERMES_HOME/.git-credentials`) or an SSH key. Clones never prompt; a failed push is the
+  agent's own command and shows in its output.
+
+`backends.list` asks each backend at most every 5 minutes (and again after one failed to start) and says
+why one cannot run: `not_installed`, `signed_out` or `error`.
+
+Limits:
+
+- An approval or question nobody answers is declined after `ALEPH_REQUEST_TIMEOUT` seconds (an hour).
+  "For This Session" grants last until the project's approval mode changes or the gateway restarts.
+- A restart completes every open turn and item `failed` ("The agent restarted"); queued messages wait,
+  and each session resumes on its next turn.
+- A thread's process (never the top level's) is closed after an hour idle with nothing running in the
+  background; the next message resumes it. The top level keeps at most 50 threads of its own open.
+- Nothing watches the folders: the changes summary is refreshed after a tool that can change files, at
+  each turn's end, and every 2 seconds while a turn runs and a phone is connected.
+- A diff over 2 MB or 20,000 lines shows as too large. Claude Code reports a command's output only once it
+  finishes.
+
 ## Home channel
 
 The plugin registers `aleph:main` as its home channel. `session: main` needs exactly one connected platform
@@ -362,12 +411,16 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_APNS_TEAM_ID` | | Apple developer team id |
 | `ALEPH_APNS_TOPIC` | | The app's bundle id |
 | `ALEPH_HOME_CHANNEL` | `main` | Home channel; `off` leaves the home to another platform |
-| `ALEPH_HISTORY_LIMIT` | `20000` | Logged events kept for catching up; a phone further behind gets `reset: true` and pages its history in again. Messages themselves are kept as history either way; cards live in the log, so history pages lose the oldest ones with it |
+| `ALEPH_HISTORY_LIMIT` | `200000` | Logged events kept for catching up; a phone further behind gets `reset: true` and pages its history in again. Messages, turns and items themselves are kept as history either way; cards live in the log, so history pages lose the oldest ones with it |
 | `ALEPH_SIDE_CHAT_IDLE_DAYS` | `30` | Days after which a side chat nobody has written in is deleted; `0` keeps them |
+| `ALEPH_PROJECTS_ROOT` | `/opt/data/projects` | The folder projects live in, and all the folder browser shows |
+| `ALEPH_PROJECTS_HOME` | `$HERMES_HOME` | `HOME` for Claude Code and Codex: their sign-ins, config and transcripts |
+| `ALEPH_REQUEST_TIMEOUT` | `3600` | Seconds a project's approval or question waits before it is declined |
 | `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`), and encrypted files |
 
 The same keys can be set under `platforms.aleph.extra` in `config.yaml` (`host`, `port`, `public_url`, `access_id`, `access_secret`,
-`apns_key_file`, `apns_key_id`, `apns_team_id`, `apns_topic`, `history_limit`, `side_chat_idle_days`, `state_dir`); environment
+`apns_key_file`, `apns_key_id`, `apns_team_id`, `apns_topic`, `history_limit`, `side_chat_idle_days`, `projects_root`,
+`projects_home`, `request_timeout`, `state_dir`); environment
 variables win.
 
 ## Endpoints

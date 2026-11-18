@@ -10,7 +10,8 @@ description: >
   side chats, each a session of its own, in one durable, replayable event log, with streaming
   drafts, typing and status text,
   read receipts, approval and question cards, attachments, content-free APNs push, and
-  home-channel delivery for `session: main` cron jobs and webhooks.
+  home-channel delivery for `session: main` cron jobs and webhooks. Projects: Claude Code or Codex
+  working in a folder on this machine, with threads, approvals and changes, in the same log.
 author: clawd-xsl
 provides_tools:
   - aleph_get_profile
@@ -64,8 +65,20 @@ optional_env:
     prompt: "Home channel"
     password: false
   - name: ALEPH_HISTORY_LIMIT
-    description: "How many logged events the server keeps for phones to catch up from (default 20000); messages stay as history"
+    description: "How many logged events the server keeps for phones to catch up from (default 200000); messages stay as history"
     prompt: "History limit"
+    password: false
+  - name: ALEPH_PROJECTS_ROOT
+    description: "The folder projects live in and the folder browser shows (default /opt/data/projects)"
+    prompt: "Projects root"
+    password: false
+  - name: ALEPH_PROJECTS_HOME
+    description: "HOME for the coding agents projects run (Claude Code, Codex): their sign-ins, config and transcripts (default $HERMES_HOME)"
+    prompt: "Projects home"
+    password: false
+  - name: ALEPH_REQUEST_TIMEOUT
+    description: "Seconds a project's approval or question waits for an answer before it is declined (default 3600)"
+    prompt: "Request timeout"
     password: false
   - name: ALEPH_STATE_DIR
     description: "Where the event log, devices and files live (default $HERMES_HOME/aleph)"

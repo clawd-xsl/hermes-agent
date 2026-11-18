@@ -25,14 +25,18 @@ class FakeSender:
 
     def __init__(self):
         self.sent = []
+        self.background = []  # (device token, payload) of each background push, apart from the alerts
         self.answers = {}  # device token -> PushResult
         self.gate = None  # an asyncio.Event a push waits on, to prove pushes never block
 
-    async def send(self, device_token, environment, payload):
+    async def send(self, device_token, environment, payload, *, background=False):
         from plugins.platforms.aleph.push import PushResult
         if self.gate is not None:
             await self.gate.wait()
-        self.sent.append((device_token, environment, payload))
+        if background:
+            self.background.append((device_token, payload))
+        else:
+            self.sent.append((device_token, environment, payload))
         return self.answers.get(device_token, PushResult(200))
 
     async def close(self):
@@ -173,6 +177,8 @@ def test_payload_and_headers_match_the_protocol():
     headers = build_headers(topic="sh.xsl.aleph", now=1_000_000.0)
     assert headers == {"apns-push-type": "alert", "apns-priority": "10", "apns-topic": "sh.xsl.aleph",
                        "apns-expiration": str(1_000_000 + 86400)}
+    background = build_headers(topic="sh.xsl.aleph", now=1_000_000.0, background=True)
+    assert (background["apns-push-type"], background["apns-priority"]) == ("background", "5")
 
 
 @pytest.mark.asyncio

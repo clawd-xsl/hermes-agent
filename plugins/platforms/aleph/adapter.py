@@ -17,7 +17,9 @@ Map onto the base adapter:
 - ``send_image_file`` / ``send_document`` / ``send_voice`` / ``send_video`` -> attachments;
 - ``on_processing_start`` -> ``receipt`` (the turn that takes the person's messages has started);
 - ``chat.create`` / ``chat.delete`` -> a side chat opened, or ended (``/new``) and dropped;
-- ``on_session_title`` -> ``chat.update`` (a side chat's session titles).
+- ``on_session_title`` -> ``chat.update`` (a side chat's session titles);
+- projects (coding agents in folders, their threads, the folder browser) -> ``projects.service.Projects``,
+  in the same log.
 
 Everything to and from the phone is end-to-end encrypted with Noise (``noise.py``): a device pairs
 once by scanning a QR code (``hermes aleph pair``, then the ``/aleph/v1/pair`` handshake) and is known
@@ -56,8 +58,14 @@ from plugins.platforms.aleph import activity, bubbles, reactions, replies
 from plugins.platforms.aleph.profile import DEFAULT_NAME, Avatar
 from plugins.platforms.aleph.files import TicketBook, decrypt_file, encrypt_file, file_url
 from plugins.platforms.aleph.noise import b64url, from_b64url
+from plugins.platforms.aleph.projects.backend import Backend
+from plugins.platforms.aleph.projects.claude import ClaudeBackend
+from plugins.platforms.aleph.projects.codex import CodexBackend
+from plugins.platforms.aleph.projects.requests import DEFAULT_TIMEOUT
+from plugins.platforms.aleph.projects.service import DEFAULT_PROJECTS_ROOT, Projects
 from plugins.platforms.aleph.push import (
-    BODY_MESSAGE, ENVIRONMENTS, ApnsConfig, ApnsSender, build_payload, push_body_for)
+    BODY_MESSAGE, ENVIRONMENTS, ApnsConfig, ApnsSender, build_background_payload, build_payload, card_id,
+    push_body_for)
 from plugins.platforms.aleph.schedule import Schedule, ScheduleError
 from plugins.platforms.aleph.server import (
     BUSY, INVALID_PARAMS, METHOD_NOT_FOUND, AlephServer, Connection, RpcError, event_frame)
@@ -88,7 +96,7 @@ AGENT_NAME = DEFAULT_NAME
 OWNER_NAME = "Owner"
 DEFAULT_PORT = 8650
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_HISTORY_LIMIT = 20000
+DEFAULT_HISTORY_LIMIT = 200000
 # Generous: Aleph renders long Markdown itself, and drafts stream the whole reply anyway.
 MAX_MESSAGE_LENGTH = 32000
 MAX_TEXT_CHARS = 64000
@@ -264,8 +272,10 @@ class ReplaySnapshot:
     latest: int
     reset: bool
     events: list[LoggedEvent]
-    # On a reset: every side chat that exists, as its ``chat.new`` payload.
+    # On a reset: every side chat that exists, as its ``chat.new`` payload, and every project with
+    # its threads.
     chats: Optional[list[dict[str, Any]]] = None
+    projects: Optional[list[dict[str, Any]]] = None
 
 
 
@@ -309,6 +319,16 @@ def _clarify_answer(card: dict[str, Any], response: str) -> dict[str, Any]:
         return {"answer": ", ".join(labels[i] for i in picks), "choices": picks}
     return {"answer": response, "choices": None}
 
+
+def _check_picks(picks: Any, labels: list[str], multi: bool) -> None:
+    """``clarify.respond``'s ``choices``: distinct indices of the listed labels, one unless ``multi``."""
+    if (not isinstance(picks, list) or not picks or len(set(map(repr, picks))) != len(picks)
+            or any(isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < len(labels) for i in picks)):
+        raise RpcError(INVALID_PARAMS, "choices must be distinct indices of the listed choices, or skip: true")
+    if len(picks) > 1 and not multi:
+        raise RpcError(INVALID_PARAMS, "this question takes one choice")
+
+
 def _chat_title(text: str) -> str:
     """A chat title: one line, whitespace runs collapsed, at most ``MAX_CHAT_TITLE`` code points; ""
     when nothing is left."""
@@ -337,13 +357,27 @@ class AlephAdapter(BasePlatformAdapter):
         self.side_chat_idle_days = self._int_setting(extra, "side_chat_idle_days", "ALEPH_SIDE_CHAT_IDLE_DAYS",
                                                      DEFAULT_SIDE_CHAT_IDLE_DAYS)
         self.state_dir = resolve_state_dir(extra)
+        self.projects_root = Path(setting(extra, "projects_root", "ALEPH_PROJECTS_ROOT")
+                                  or DEFAULT_PROJECTS_ROOT).expanduser()
+        # The coding agents' HOME: their sign-ins, config and transcripts live there.
+        from hermes_constants import get_hermes_home
+        projects_home = setting(extra, "projects_home", "ALEPH_PROJECTS_HOME")
+        projects_home = Path(projects_home).expanduser() if projects_home else get_hermes_home()
+        # Seconds a project's request waits for the person before it is declined.
+        self.request_timeout = self._int_setting(extra, "request_timeout", "ALEPH_REQUEST_TIMEOUT", DEFAULT_TIMEOUT)
         self.apns_config = apns_config(extra)
         self._push: Optional[ApnsSender] = None
         self._push_tasks: set[asyncio.Task] = set()
         self._push_problems_reported: set[tuple[str, str]] = set()
+        # Cards pushed and not settled yet, by card_id: their settling takes them off the Lock Screen.
+        self._pushed_cards: set[tuple[str, str]] = set()
         self._device_watch: Optional[asyncio.Task] = None
         self._idle_sweep: Optional[asyncio.Task] = None
         self._schedule: Optional[Schedule] = None
+        self._projects: Optional[Projects] = None
+        # The coding agents projects run on, by id; kept across reconnects.
+        self.project_backends: dict[str, Backend] = {
+            "claude": ClaudeBackend(projects_home), "codex": CodexBackend(projects_home)}
         self._history_loads = 0
         # The side chats that exist (``main`` always does), and those deleted while running: what the
         # gateway still sends them (the /new that ended the session, a late reply) goes nowhere.
@@ -438,6 +472,8 @@ class AlephAdapter(BasePlatformAdapter):
         except ValueError:
             self._pending_reactions = {}
         await self._settle_stale_cards()
+        self._projects = Projects(self, root=self.projects_root, backends=self.project_backends)
+        await self._projects.start()
         self._server = AlephServer(self, host=self.host, port=self.port, static=self.static)
         try:
             await self._server.start()
@@ -465,9 +501,12 @@ class AlephAdapter(BasePlatformAdapter):
         server, store, push, watch = self._server, self._store, self._push, self._device_watch
         sweep, self._idle_sweep = self._idle_sweep, None
         schedule, self._schedule = self._schedule, None
+        projects = self._projects
         if schedule is not None:
             await schedule.stop()
-        self._server = self._store = self._push = self._device_watch = None
+        if projects is not None:
+            await projects.stop()
+        self._server = self._store = self._push = self._device_watch = self._projects = None
         for task in (watch, sweep):
             if task is not None:
                 task.cancel()
@@ -486,6 +525,12 @@ class AlephAdapter(BasePlatformAdapter):
         if self._store is None:
             raise RuntimeError("Aleph adapter is not connected")
         return self._store
+
+    @property
+    def projects(self) -> Projects:
+        if self._projects is None:
+            raise RuntimeError("Aleph adapter is not connected")
+        return self._projects
 
     # ── fan-out ────────────────────────────────────────────────────────────────────────────────
 
@@ -601,9 +646,19 @@ class AlephAdapter(BasePlatformAdapter):
         """Fire and forget: a slow or failing APNs never delays the log or the WebSocket."""
         if self._push is None:
             return
+        card = card_id(event.type, event.payload)
+        if event.type.endswith(".resolved"):
+            # A pushed card that settles leaves the Lock Screen: a background push wakes the app to
+            # catch up and remove it.
+            if card in self._pushed_cards:
+                self._pushed_cards.discard(card)
+                self._spawn_push(event, build_background_payload(event.seq), background=True)
+            return
         body = body or push_body_for(event.type, event.payload)
         if body is None:
             return
+        if card is not None:
+            self._pushed_cards.add(card)
         # A reply in a few bubbles sounds once: a message pushed soon after the chat's last pushed one
         # comes silently. An approval or a question always sounds.
         sound = True
@@ -611,11 +666,20 @@ class AlephAdapter(BasePlatformAdapter):
             chat, now = str(event.payload.get("chat") or CHAT_ID), time.monotonic()
             sound = now - self._last_push_at.get(chat, -math.inf) >= QUIET_PUSH_SECONDS
             self._last_push_at[chat] = now
-        task = asyncio.create_task(self._push_event(event, body, sound=sound))
+        payload = event.payload
+        if payload.get("project") is not None:
+            scope = {"project": payload["project"], "thread": payload.get("thread") or payload["project"]}
+        else:
+            scope = {"chat": str(payload.get("chat") or CHAT_ID)}
+        self._spawn_push(event, build_payload(body=body, seq=event.seq, sound=sound,
+                                              time_sensitive=event.type == "approval.request", **scope))
+
+    def _spawn_push(self, event: LoggedEvent, payload: dict[str, Any], *, background: bool = False) -> None:
+        task = asyncio.create_task(self._push_event(event, payload, background=background))
         self._push_tasks.add(task)
         task.add_done_callback(self._push_tasks.discard)
 
-    async def _push_event(self, event: LoggedEvent, body: str, *, sound: bool = True) -> None:
+    async def _push_event(self, event: LoggedEvent, payload: dict[str, Any], *, background: bool = False) -> None:
         sender, store, server = self._push, self._store, self._server
         if sender is None or store is None:
             return
@@ -625,10 +689,9 @@ class AlephAdapter(BasePlatformAdapter):
             targets = [d for d in devices if d.push_token and d.id not in active]
             if not targets:
                 return
-            payload = build_payload(body=body, seq=event.seq, chat=str(event.payload.get("chat") or CHAT_ID),
-                                    sound=sound, time_sensitive=event.type == "approval.request")
             results = await asyncio.gather(
-                *(sender.send(d.push_token, d.push_environment or "production", payload) for d in targets),
+                *(sender.send(d.push_token, d.push_environment or "production", payload, background=background)
+                  for d in targets),
                 return_exceptions=True)
         except asyncio.CancelledError:
             raise
@@ -658,6 +721,11 @@ class AlephAdapter(BasePlatformAdapter):
                 self._server.broadcast(event_frame(event_type, payload))
         self._on_loop(emit)
 
+    def connection_closed(self, conn: Connection) -> None:
+        """A phone's connection is gone: what it followed live ends."""
+        if self._projects is not None:
+            self._projects.connection_closed(conn)
+
     def live_state(self) -> tuple[list[dict[str, Any]], list[str]]:
         """The present, for a phone catching up, and the frames that show it. One entry for each chat
         where the agent is working now (typing, an open draft or a step still running), saying all of
@@ -680,29 +748,32 @@ class AlephAdapter(BasePlatformAdapter):
             if self._exists(chat) and open_steps:
                 frames += [event_frame("activity", dict(step)) for _raw, step in open_steps]
                 entry(chat)
+        if self._projects is not None:
+            frames += self._projects.live_frames()
         return list(working.values()), frames
 
     async def replay_snapshot(self, after: int) -> ReplaySnapshot:
         """Under ``append_lock``: the events a phone that stored ``after`` is missing, or a reset.
 
-        A reset replays nothing: the phone starts from the present (``latest``, the side chats) and
-        pages older messages in with ``history.load``. It is the answer to a phone with nothing yet
-        (``after`` 0), to one ahead of this log (a wiped or replaced server), and to one whose missing
-        events were pruned for age."""
+        A reset replays nothing: the phone starts from the present (``latest``, the side chats, the
+        projects) and pages older messages in with ``history.load``. It is the answer to a phone with
+        nothing yet (``after`` 0), to one ahead of this log (a wiped or replaced server), and to one whose
+        missing events were pruned for age."""
         latest = await asyncio.to_thread(self.store.latest)
         pruned = await asyncio.to_thread(self.store.pruned_through)
         if latest > 0 and (after == 0 or after > latest or after < pruned):
             chats = [{"chat": chat.id, "title": chat.title, "created_at": chat.created_at}
                      for chat in await asyncio.to_thread(self.store.chats)]
-            return ReplaySnapshot(latest, True, [], chats)
+            return ReplaySnapshot(latest, True, [], chats, await self.projects.snapshot())
         events = await asyncio.to_thread(self.store.events_after, after, until=latest) if latest > after else []
         return ReplaySnapshot(latest, False, events)
 
     async def load_history(self, params: dict[str, Any], conn: Optional[Connection]) -> dict[str, Any]:
-        """``history.load {chat, before, limit}``: write one ``history.page`` into the connection's
-        stream. Read and queued under ``append_lock``, so the page reflects every logged event queued
-        on the connection before it and none after."""
-        chat = self._chat_param(params)
+        """``history.load {chat, before, limit}`` or ``{thread, …}`` for a project thread: write one
+        ``history.page`` into the connection's stream. Read and queued under ``append_lock``, so the
+        page reflects every logged event queued on the connection before it and none after."""
+        thread = params.get("thread")
+        chat = self._chat_param(params) if thread is None else None
         before, limit = params.get("before"), params.get("limit", HISTORY_PAGE_DEFAULT)
         if isinstance(before, bool) or not isinstance(before, int) or before < 1:
             raise RpcError(INVALID_PARAMS, "before must be a seq (a positive integer)")
@@ -715,9 +786,12 @@ class AlephAdapter(BasePlatformAdapter):
         self._history_loads += 1
         try:
             async with self.append_lock:
-                messages, older = await asyncio.to_thread(self.store.history, chat, before, limit)
-                conn.enqueue(event_frame("history.page", {"chat": chat, "before": before, "messages": messages,
-                                                          "next": older}))
+                if chat is None:
+                    page = await self.projects.history(thread, before, limit)
+                else:
+                    messages, older = await asyncio.to_thread(self.store.history, chat, before, limit)
+                    page = {"chat": chat, "before": before, "messages": messages, "next": older}
+                conn.enqueue(event_frame("history.page", page))
         finally:
             self._history_loads -= 1
         return {}
@@ -817,6 +891,8 @@ class AlephAdapter(BasePlatformAdapter):
             await self._register_push(conn, params)
             return {}
         if method == "message.send":
+            if "thread" in params:
+                return {"seq": await self.projects.send(params)}
             return {"seq": await self._accept_user_message(params)}
         if method == "chat.stop":
             await self._stop(self._chat_param(params))
@@ -848,6 +924,10 @@ class AlephAdapter(BasePlatformAdapter):
                 return await self._schedule.call(method, params)
             except ScheduleError as exc:
                 raise RpcError(INVALID_PARAMS, str(exc)) from exc
+        if method in self.projects.calls:
+            return await self.projects.calls[method](params)
+        if method in self.projects.connection_calls:
+            return await self.projects.connection_calls[method](params, conn)
         if method == "ping":
             return {}
         raise RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
@@ -1618,7 +1698,8 @@ class AlephAdapter(BasePlatformAdapter):
             raise RpcError(INVALID_PARAMS, "request_id and choice are required")
         card = self._approvals.get(request_id)
         if card is None:
-            raise RpcError(INVALID_PARAMS, "no pending approval with that request_id")
+            await self.projects.respond_approval(request_id, choice)
+            return
         if choice not in card["choices"]:
             raise RpcError(INVALID_PARAMS, "choice is not one the request offered",
                            {"choices": list(card["choices"])})
@@ -1705,18 +1786,19 @@ class AlephAdapter(BasePlatformAdapter):
                 return  # a resend after a lost answer: the pick was taken the first time
         card = self._clarifies.get(clarify_id)
         if card is None:
-            raise RpcError(INVALID_PARAMS, "no pending question with that clarify_id")
+            question = self.projects.question(clarify_id)
+            if question is None:
+                raise RpcError(INVALID_PARAMS, "no pending question with that clarify_id")
+            if not skip:
+                _check_picks(picks, *question)
+            await self.projects.answer_question(clarify_id, None if skip else list(picks), message_id)
+            return
         from tools.clarify_gateway import SKIPPED, resolve_gateway_clarify
         chat = card["chat"]
         if skip:
             response, outcome = SKIPPED, {"answer": None, "choices": None}
         else:
-            count = len(card["labels"])
-            if (not isinstance(picks, list) or not picks or len(set(map(repr, picks))) != len(picks)
-                    or any(isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < count for i in picks)):
-                raise RpcError(INVALID_PARAMS, "choices must be distinct indices of the listed choices, or skip: true")
-            if len(picks) > 1 and not card["multi"]:
-                raise RpcError(INVALID_PARAMS, "this question takes one choice")
+            _check_picks(picks, card["labels"], card["multi"])
             # What Hermes's own typed-pick path hands the agent: the label, or for several a JSON list.
             response = (json.dumps([card["raw"][i].strip() for i in picks], ensure_ascii=False) if card["multi"]
                         else card["raw"][picks[0]])
@@ -1727,36 +1809,42 @@ class AlephAdapter(BasePlatformAdapter):
         if not resolved:
             outcome = {"answer": None, "choices": None}
         elif not skip:
-            await self._log_answer(chat, message_id, outcome["answer"])
+            await self._log_answer({"chat": chat}, message_id, outcome["answer"])
         await self._log("clarify.resolved", {"chat": chat, "clarify_id": clarify_id,
                                              **outcome, "by": "user" if resolved else "timeout"})
         if resolved and not skip:
             await self._read_up_to_latest(chat)
 
-    async def _log_answer(self, chat: str, message_id: str, text: str) -> None:
-        """The person's picked answer as their message in the thread. It is already the clarify's answer,
-        so it is not handed to the gateway as a turn."""
+    async def _log_answer(self, scope: dict[str, Any], message_id: str, text: str) -> LoggedEvent:
+        """The person's picked answer as their message where it was asked (``scope``: its chat, or its
+        project and thread). It is already the question's answer, so it starts no turn."""
         async with self._intake_lock:
             self._dedup.is_duplicate(message_id)
-            await self._log("message.new", {"chat": chat, "id": message_id, "sender": "user", "text": text,
-                                            "attachments": [], "created_at": now_iso()},
-                            message={"id": message_id, "sender": "user", "kind": "text", "text": text,
-                                     "attachments": []})
-            await asyncio.to_thread(self.store.mark_dispatched, message_id)
-            self._last_user_message[chat] = message_id
-            await asyncio.to_thread(self.store.set_meta, f"last_user_message:{chat}", message_id)
+            event = await self._log("message.new", {**scope, "id": message_id, "sender": "user", "text": text,
+                                                    "attachments": [], "created_at": now_iso()},
+                                    message={"id": message_id, "sender": "user", "kind": "text", "text": text,
+                                             "attachments": []})
+            chat = scope.get("chat")
+            if chat is not None:
+                await asyncio.to_thread(self.store.mark_dispatched, message_id)
+                self._last_user_message[chat] = message_id
+                await asyncio.to_thread(self.store.set_meta, f"last_user_message:{chat}", message_id)
+        return event
 
     async def _settle_stale_cards(self) -> None:
         """Every request in the log ends in its ``resolved``: one this process is not waiting on (it
         restarted, the session ended) is settled now, an approval as ``cancelled``, a question as
-        ``timeout``."""
+        ``timeout``. A project's request is settled where it was asked, in its project and thread."""
         for kind, request in await asyncio.to_thread(self.store.unsettled_cards):
-            chat = request.get("chat") or CHAT_ID
+            if request.get("project") is not None:
+                scope = {"project": request["project"], "thread": request.get("thread") or request["project"]}
+            else:
+                scope = {"chat": request.get("chat") or CHAT_ID}
             if kind == "approval.request" and request.get("request_id") not in self._approvals:
-                await self._log("approval.resolved", {"chat": chat, "request_id": request.get("request_id"),
+                await self._log("approval.resolved", {**scope, "request_id": request.get("request_id"),
                                                       "choice": None, "by": "cancelled"})
             elif kind == "clarify.request" and request.get("clarify_id") not in self._clarifies:
-                await self._log("clarify.resolved", {"chat": chat, "clarify_id": request.get("clarify_id"),
+                await self._log("clarify.resolved", {**scope, "clarify_id": request.get("clarify_id"),
                                                      "answer": None, "choices": None, "by": "timeout"})
 
     # ── files ──────────────────────────────────────────────────────────────────────────────────

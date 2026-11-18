@@ -64,6 +64,7 @@ PARSE_ERROR = -32700
 INTERNAL_ERROR = -32603
 NOT_READY = 4001
 BUSY = 4002
+FAILED = 4003  # failed on the agent's machine; ``data`` is ``{reason, message}``
 
 # WebSocket close codes (4000-4999 is application use).
 CLOSE_UNAUTHORIZED = 4401  # unknown or revoked device key, a broken handshake, revoked later
@@ -448,6 +449,7 @@ class AlephServer:
                     break
         finally:
             self.connections.discard(conn)
+            self.adapter.connection_closed(conn)
             await conn.close()
             logger.info("Aleph: %s disconnected", device.name)
         return ws
@@ -590,6 +592,8 @@ class AlephServer:
                       "agent": self.adapter.agent_info(), "latest": snapshot.latest, "reset": snapshot.reset}
             if snapshot.chats is not None:
                 result["chats"] = snapshot.chats
+            if snapshot.projects is not None:
+                result["projects"] = snapshot.projects
             conn.enqueue(_frame({"jsonrpc": "2.0", "id": call_id, "result": result}))
             for event in snapshot.events:
                 conn.enqueue(event_frame(event.type, event.payload, event.seq))

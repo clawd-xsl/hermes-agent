@@ -32,14 +32,27 @@ EXPIRATION_SECONDS = 24 * 60 * 60
 BODY_MESSAGE = "New message"
 BODY_APPROVAL = "Approval needed"
 BODY_QUESTION = "Question"
+BODY_FINISHED = "Finished"
+BODY_FAILED = "Failed"
+# Card requests and their outcomes, by the field naming the card.
+_CARD_IDS = {"approval.request": "request_id", "approval.resolved": "request_id",
+             "clarify.request": "clarify_id", "clarify.resolved": "clarify_id"}
+
+
+def card_id(event_type: str, payload: dict[str, Any]) -> Optional[tuple[str, str]]:
+    """``(kind, id)`` of the card an approval or question event is about, else ``None``."""
+    key = _CARD_IDS.get(event_type)
+    return (event_type.split(".")[0], str(payload.get(key))) if key else None
 
 
 def push_body_for(event_type: str, payload: dict[str, Any]) -> Optional[str]:
     """The generic body for a logged event that notifies, or ``None`` for one that does not.
 
     Notifies: the agent's text messages (attachment-only ones included), approval requests and
-    questions. Not: tool rows, system notices, the person's own messages (their echo), receipts,
-    edits, deletions and outcomes. Drafts and typing are never logged, so never reach here.
+    questions, and a project's top level ending a turn it spoke in or that failed (a thread's turns
+    do not: the top level hears of them and speaks). Not: tool rows, system notices, the person's own
+    messages (their echo), receipts, edits, deletions and outcomes. Drafts and typing are never
+    logged, so never reach here.
     """
     if event_type == "message.new":
         if payload.get("sender") != "agent" or (payload.get("kind") or "text") != "text":
@@ -49,27 +62,40 @@ def push_body_for(event_type: str, payload: dict[str, Any]) -> Optional[str]:
         return BODY_APPROVAL
     if event_type == "clarify.request":
         return BODY_QUESTION
+    if event_type == "turn.completed" and payload.get("thread") == payload.get("project"):
+        if payload.get("status") == "failed":
+            return BODY_FAILED
+        if payload.get("status") == "completed" and not payload.get("silent"):
+            return BODY_FINISHED
     return None
 
 
-def build_payload(*, body: str, seq: int, chat: str, sound: bool = True,
-                  time_sensitive: bool = False) -> dict[str, Any]:
+def build_payload(*, body: str, seq: int, chat: Optional[str] = None, project: Optional[str] = None,
+                  thread: Optional[str] = None, sound: bool = True, time_sensitive: bool = False) -> dict[str, Any]:
     """No title: the agent goes by the name the person gave it on the phone, which the server does
-    not know; the notification service extension sets it. Notifications group by chat. Without
-    ``sound`` the notification arrives silently (a bubble right after another); ``time_sensitive``
-    (an approval the agent waits on) breaks through a Focus that allows it."""
-    aps: dict[str, Any] = {"alert": {"body": body}, "mutable-content": 1, "thread-id": chat}
+    not know; the notification service extension sets it. Notifications group by chat, or by
+    project (``aleph.project`` tells the extension it is no chat). Without ``sound`` the
+    notification arrives silently (a bubble right after another); ``time_sensitive`` (an approval
+    the agent waits on) breaks through a Focus that allows it."""
+    aps: dict[str, Any] = {"alert": {"body": body}, "mutable-content": 1, "thread-id": project or chat}
     if sound:
         aps["sound"] = "default"
     if time_sensitive:
         aps["interruption-level"] = "time-sensitive"
-    return {"aps": aps, "aleph": {"seq": seq, "chat": chat}}
+    where = {"project": project, "thread": thread} if project is not None else {"chat": chat}
+    return {"aps": aps, "aleph": {"seq": seq, **where}}
 
 
-def build_headers(*, topic: str, now: Optional[float] = None) -> dict[str, str]:
+def build_background_payload(seq: int) -> dict[str, Any]:
+    """A silent wake for the app to catch up to ``seq`` (a settled card) and remove its notification."""
+    return {"aps": {"content-available": 1}, "aleph": {"seq": seq}}
+
+
+def build_headers(*, topic: str, now: Optional[float] = None, background: bool = False) -> dict[str, str]:
+    # Apple drops a background push sent at priority 10, and throttles them: they go at 5.
     return {
-        "apns-push-type": "alert",
-        "apns-priority": "10",
+        "apns-push-type": "background" if background else "alert",
+        "apns-priority": "5" if background else "10",
         "apns-topic": topic,
         "apns-expiration": str(int((now if now is not None else time.time()) + EXPIRATION_SECONDS)),
     }
@@ -182,19 +208,20 @@ class ApnsSender:
             self._jwt_at = now
         return self._jwt
 
-    async def send(self, device_token: str, environment: str, payload: dict[str, Any]) -> PushResult:
+    async def send(self, device_token: str, environment: str, payload: dict[str, Any], *,
+                   background: bool = False) -> PushResult:
         host = SANDBOX_HOST if environment == "development" else PRODUCTION_HOST
         url = f"{host}/3/device/{device_token}"
         body = json.dumps(payload, separators=(",", ":")).encode()
         if self._client is None:
             self._client = self._client_factory()
-        result = await self._post(url, body, self._token())
+        result = await self._post(url, body, self._token(), background)
         if result.status == 403 and result.reason == "ExpiredProviderToken":
-            result = await self._post(url, body, self._token(refresh=True))
+            result = await self._post(url, body, self._token(refresh=True), background)
         return result
 
-    async def _post(self, url: str, body: bytes, token: str) -> PushResult:
-        headers = build_headers(topic=self.config.topic, now=self._clock())
+    async def _post(self, url: str, body: bytes, token: str, background: bool) -> PushResult:
+        headers = build_headers(topic=self.config.topic, now=self._clock(), background=background)
         headers["authorization"] = f"bearer {token}"
         headers["content-type"] = "application/json"
         response = await self._client.post(url, content=body, headers=headers)
