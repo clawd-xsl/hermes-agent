@@ -153,8 +153,6 @@ def test_the_tool_is_a_complete_mcp_definition():
     jsonschema.Draft202012Validator.check_schema(tool["outputSchema"])
     assert tool["annotations"] == {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True,
                                    "openWorldHint": False}
-    for hint in ("occasionally", "Never narrate", "messages_back", "empty string"):
-        assert hint in tool["description"]
 
 
 @pytest.mark.asyncio

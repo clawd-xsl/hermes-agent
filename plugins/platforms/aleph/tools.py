@@ -58,8 +58,8 @@ SET_PROFILE = {
     "title": "Change your Aleph name or avatar",
     "description": (
         "Change your own name, avatar, or both in the Aleph app. Only you can change them: the app has "
-        "no editor, so when the person asks for a new name or picture, use this tool. Every device "
-        "shows the change at once, with a note in the conversation.\n"
+        "no editor, so when the person asks for a new name or picture, use this tool, not Hermes's "
+        "config. Every device shows the change at once, with a note in the conversation.\n"
         f"- name: 1 to {MAX_NAME_CHARS} characters, one line.\n"
         "- avatar: an absolute file path on this machine or an https URL, to a PNG, JPEG, HEIC, WebP or "
         "GIF image (first frame) of at most 20 MB. A picture made with an image tool works: pass the "
@@ -97,14 +97,9 @@ REACT = {
     "title": "React to a message in Aleph",
     "description": (
         "React to one of the person's messages in Aleph with a single emoji, the way they would tap back "
-        "in Messages. Reach for it when a reaction is what a person would do: something funny gets a 😂, "
-        "warmth gets a ❤️, a plan you're on board with gets a 👍. Then carry on with whatever the message "
-        "needs; if the reaction says it all, it can be the whole reply. Use it like a person: occasionally, "
-        "when felt, not on every message and never as a status signal. Never narrate it ('I reacted "
-        "with…'): the emoji on the bubble is the point. It goes on the person's latest message unless you "
-        "say otherwise; messages_back reaches an earlier one (1 = the one before the latest), for when "
-        "something lands late. One reaction per message: another emoji replaces yours, an empty string "
-        "takes it back."),
+        "in Messages. It goes on the person's latest message unless you say otherwise; messages_back "
+        "reaches an earlier one (1 = the one before the latest), message_id a specific one. One reaction "
+        "per message: another emoji replaces yours, an empty string takes it back."),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -137,11 +132,9 @@ OPTIONS = {
     "title": "Offer reply choices in Aleph",
     "description": (
         "Offer the person 2 to 4 replies they can send with one tap, under the message you are about to "
-        "write in Aleph. Use it when their next message is likely one of a few short answers you can name: "
-        "yes / not now, a choice between places or times. Write each as the person would say it, in their "
-        "language. Don't use it for open questions or to pad a reply with follow-ups, and don't list the "
-        "options again in your text. They ride on your next message this turn; calling it again replaces "
-        "them. It is not a question you wait on: the person can always type something else."),
+        f"write in Aleph: each one line of at most {MAX_OPTION_CHARS} characters, and a tap sends its text as "
+        "the person's message. They ride on your next message this turn; calling it again replaces them. "
+        "It is not a question you wait on: the person can always type something else."),
     "inputSchema": {
         "type": "object",
         "properties": {
