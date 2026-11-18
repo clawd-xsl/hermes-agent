@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""A stand-in for the ``claude`` CLI in the projects tests: it replays frames recorded from the real
+CLI and speaks its control protocol.
+
+``$FAKE_CLAUDE_DIR/scenario.json`` says what it does:
+
+- ``auth``: what ``claude auth status --json`` prints.
+- ``models`` and ``auto``: the probe's initialize answer, and whether ``set_permission_mode auto`` is
+  taken (also by a session).
+- ``scripts``: one per process started, in order, each a list of steps: ``{"out": frame}`` writes a
+  frame (``$FOLDER`` becomes the working directory), ``{"await": "user"}``,
+  ``{"await": "control_response"}`` and ``{"await": "interrupt"}`` wait for what the backend sends,
+  ``{"echo": true}`` replays the last user message as ``--replay-user-messages`` does, ``{"stop": payload}``
+  runs the Stop hook of ``--settings`` with ``payload``, and ``{"exit": code, "stderr": line}`` ends it.
+
+After its script it waits for stdin to close, as the CLI does. Everything it gets (its argv, part of
+its environment, each frame) is appended to ``$FAKE_CLAUDE_DIR/log.jsonl``.
+"""
+
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+
+DIR = os.environ["FAKE_CLAUDE_DIR"]
+with open(os.path.join(DIR, "scenario.json"), encoding="utf-8") as handle:
+    SCENARIO = json.load(handle)
+LOCK = threading.Lock()
+
+
+def log(entry):
+    with LOCK, open(os.path.join(DIR, "log.jsonl"), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+
+def write(frame):
+    with LOCK:
+        sys.stdout.write(json.dumps(frame) + "\n")
+        sys.stdout.flush()
+
+
+def control(request_id, response=None, error=None):
+    body = {"subtype": "error", "request_id": request_id, "error": error} if error else {
+        "subtype": "success", "request_id": request_id, "response": response or {}}
+    write({"type": "control_response", "response": body})
+
+
+def answer(frame):
+    """A control request of the backend's, answered at once: what the CLI answers without a turn."""
+    request = frame["request"]
+    subtype = request.get("subtype")
+    if subtype == "initialize":
+        control(frame["request_id"], {"models": SCENARIO.get("models", []), "current_permission_mode": "default"})
+    elif subtype == "set_permission_mode":
+        if request.get("mode") == "auto" and not SCENARIO.get("auto", True):
+            control(frame["request_id"], error="Auto mode is unavailable for this account")
+        else:
+            control(frame["request_id"], {"mode": request.get("mode")})
+    elif subtype == "set_model":
+        control(frame["request_id"], {"model": SCENARIO.get("resolved", {}).get(str(request.get("model")),
+                                                                                  request.get("model"))})
+    elif subtype == "interrupt":
+        control(frame["request_id"], {"still_queued": []})
+        return "interrupt"
+    return None
+
+
+def place(value, folder):
+    if isinstance(value, str):
+        return value.replace("$FOLDER", folder)
+    if isinstance(value, list):
+        return [place(one, folder) for one in value]
+    if isinstance(value, dict):
+        return {key: place(one, folder) for key, one in value.items()}
+    return value
+
+
+def counted():
+    """This process's number among those started for the scenario."""
+    path = os.path.join(DIR, "spawns")
+    with LOCK:
+        number = int(open(path).read()) if os.path.exists(path) else 0
+        with open(path, "w") as handle:
+            handle.write(str(number + 1))
+    return number
+
+
+def stop_hook(payload):
+    settings = json.loads(sys.argv[sys.argv.index("--settings") + 1])
+    for group in settings["hooks"]["Stop"]:
+        for hook in group["hooks"]:
+            subprocess.run(hook["command"], shell=True, input=json.dumps(payload), text=True, check=False)
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv[:2] == ["auth", "status"]:
+        print(json.dumps(SCENARIO.get("auth", {"loggedIn": True})))
+        return 0
+    log({"argv": argv, "env": {key: os.environ.get(key) for key in (
+        "HOME", "ALEPH_BUS_TOKEN", "ALEPH_STOP_REPORT", "CLAUDE_CONFIG_DIR")}})
+    inbox = {"user": queue.Queue(), "control_response": queue.Queue(), "interrupt": queue.Queue()}
+    closed = threading.Event()
+
+    def read():
+        for line in sys.stdin:
+            frame = json.loads(line)
+            log({"in": frame})
+            if frame.get("type") == "user":
+                inbox["user"].put(frame)
+            elif frame.get("type") == "control_response":
+                inbox["control_response"].put(frame)
+            elif frame.get("type") == "control_request" and answer(frame) == "interrupt":
+                inbox["interrupt"].put(frame)
+        closed.set()
+    threading.Thread(target=read, daemon=True).start()
+    if "--no-session-persistence" in argv:  # the probe: it only answers control requests
+        closed.wait()
+        return 0
+    scripts = SCENARIO.get("scripts", [])
+    number = counted()
+    folder = os.getcwd()
+    last = None
+    for step in scripts[number] if number < len(scripts) else []:
+        if "out" in step:
+            write(place(step["out"], folder))
+        elif "await" in step:
+            got = inbox[step["await"]].get()
+            if step["await"] == "user":
+                last = got
+        elif "echo" in step:
+            write({"type": "user", "message": last["message"], "parent_tool_use_id": None,
+                   "session_id": "fake", "isReplay": True})
+        elif "stop" in step:
+            stop_hook(step["stop"])
+        elif "exit" in step:
+            if step.get("stderr"):
+                print(step["stderr"], file=sys.stderr, flush=True)
+            return step["exit"]
+    closed.wait()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

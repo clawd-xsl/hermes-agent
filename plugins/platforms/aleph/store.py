@@ -1,9 +1,10 @@
-"""Aleph's durable state: the append-only event log, message index, chats, file registry, paired
-devices (by their static X25519 public key), the pending pairing secret, and the server's static key.
+"""Aleph's durable state: the append-only event log, message index, chats, projects (``ProjectTables``),
+file registry, paired devices (by their static X25519 public key), the pending pairing secret, and the
+server's static key.
 
 One SQLite file under ``$HERMES_HOME/aleph/``. The log is what a phone replays after ``hello``, one log
-for all chats; ``seq`` is assigned here and increases by exactly one per logged event. Deleting a side
-chat takes its events out of the log, so a replay may skip the seqs it had. Methods are synchronous and thread-safe (one connection behind a lock); the adapter
+for all chats and projects; ``seq`` is assigned here and increases by exactly one per logged event.
+Deleting a side chat or a project takes its events out of the log, so a replay may skip the seqs it had. Methods are synchronous and thread-safe (one connection behind a lock); the adapter
 calls them through ``asyncio.to_thread`` under its own append lock, which also fixes the order in
 which events are broadcast.
 
@@ -26,22 +27,28 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from plugins.platforms.aleph.projects.store import SCHEMA as _PROJECT_SCHEMA
+from plugins.platforms.aleph.projects.store import TABLES as _PROJECT_TABLES
+from plugins.platforms.aleph.projects.store import ProjectTables
+
 # The conversation's layout. A store written under another one is not converted: its conversation
 # (events, messages, chats, steps and their files) is dropped, keeping pairings and the agent's profile.
 # Until Aleph's first release the number stays 1 (the current layout is always v1), and a deploy that
 # changes the layout drops or converts the store by hand. From the first release on, every layout
 # change bumps it.
 SCHEMA_VERSION = "1"
-_CONVERSATION_TABLES = ("events", "messages", "chats", "activity")
+_CONVERSATION_TABLES = ("events", "messages", "chats", "activity", *_PROJECT_TABLES)
 _META = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     seq INTEGER PRIMARY KEY,
     type TEXT NOT NULL,
     chat TEXT,
+    project TEXT,
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_chat ON events (chat);
+CREATE INDEX IF NOT EXISTS events_project ON events (project);
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     seq INTEGER NOT NULL,
@@ -203,7 +210,7 @@ class AlephStore:
     """The chats' log. ``history_limit`` bounds how many events are kept; older ones are pruned and
     a ``hello`` asking for them gets ``reset: true``."""
 
-    def __init__(self, root: Path, *, history_limit: int = 20000) -> None:
+    def __init__(self, root: Path, *, history_limit: int = 200000) -> None:
         self.root = Path(root)
         self.files_dir = self.root / "files"
         self.files_dir.mkdir(parents=True, exist_ok=True)
@@ -218,8 +225,9 @@ class AlephStore:
             self._db.executescript(_META)
             if self._meta_locked("schema") != SCHEMA_VERSION:
                 self._drop_conversation_locked()
-            self._db.executescript(_SCHEMA)
+            self._db.executescript(_SCHEMA + _PROJECT_SCHEMA)
             self._set_meta_locked("schema", SCHEMA_VERSION)
+        self.projects = ProjectTables(self._db, self._lock)
 
     def _drop_conversation_locked(self) -> None:
         """Start the conversation over (a store from another layout): phones that knew it get
@@ -264,7 +272,8 @@ class AlephStore:
     def append(self, event_type: str, payload: dict[str, Any], *,
                message: Optional[dict[str, Any]] = None) -> LoggedEvent:
         """Log one event (and index the message it records) atomically; returns it with its seq. The
-        event's chat is its payload's ``chat``."""
+        event's chat is its payload's ``chat``, or for a project's event its thread
+        (``ProjectTables.scope``)."""
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -277,13 +286,13 @@ class AlephStore:
 
     def _append_locked(self, event_type: str, payload: dict[str, Any],
                        message: Optional[dict[str, Any]] = None) -> LoggedEvent:
-        chat = payload.get("chat")
+        chat, project = self.projects.scope(event_type, payload)
         if message is not None:
             self._keep_time_order_locked(chat, payload)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         seq = self._latest_locked() + 1
-        self._db.execute("INSERT INTO events (seq, type, chat, payload) VALUES (?, ?, ?, ?)",
-                         (seq, event_type, chat, body))
+        self._db.execute("INSERT INTO events (seq, type, chat, project, payload) VALUES (?, ?, ?, ?, ?)",
+                         (seq, event_type, chat, project, body))
         if message is not None:
             current = {key: value for key, value in payload.items() if key != "draft_id"}
             self._db.execute(
@@ -295,6 +304,8 @@ class AlephStore:
             self._db.execute("UPDATE chats SET last_active_at = ? WHERE id = ?", (time.time(), chat))
         else:
             self._fold_locked(event_type, chat, payload)
+        if project is not None:
+            self.projects.fold_locked(seq, event_type, chat, payload)
         self._prune_locked(seq)
         return LoggedEvent(seq, event_type, payload)
 
@@ -398,6 +409,29 @@ class AlephStore:
             cards = self._cards_locked(chat, older if older is not None else 0, before)
         return sorted(page + cards, key=lambda item: item["seq"]), older
 
+    def thread_history(self, thread: str, before: int, limit: int) -> tuple[list[dict[str, Any]], Optional[int]]:
+        """A project thread's history page, as ``history`` is a chat's: its newest ``limit`` entries
+        logged before ``before``, oldest first, each with its ``seq``: ``{seq, message}`` (the person's
+        prompt as its ``message.new`` stands, with ``read``), ``{seq, turn}`` and ``{seq, item}``
+        (``ProjectTables.entries_locked``), with the cards in their place; and the next ``before``."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT seq, sender, payload, read FROM messages WHERE chat = ? AND seq < ? ORDER BY seq DESC "
+                "LIMIT ?", (thread, int(before), int(limit) + 1)).fetchall()
+            entries = []
+            for seq, sender, body, read in rows:
+                message = json.loads(body)
+                if sender == "user":
+                    message["read"] = bool(read)
+                entries.append({"seq": int(seq), "message": message})
+            entries += self.projects.entries_locked(thread, before, limit + 1)
+            entries.sort(key=lambda entry: entry["seq"], reverse=True)
+            more = len(entries) > limit
+            page = entries[:limit][::-1]
+            older = page[0]["seq"] if more and page else None
+            cards = self._cards_locked(thread, older if older is not None else 0, before)
+        return sorted(page + cards, key=lambda entry: entry["seq"]), older
+
     def _cards_locked(self, chat: str, since: int, before: int) -> list[dict[str, Any]]:
         """The approval and question cards of ``chat`` logged in ``[since, before)``, each with its
         ``resolved`` payload (logged at any time since) or None while it waits."""
@@ -423,9 +457,12 @@ class AlephStore:
     def unsettled_cards(self) -> list[tuple[str, dict[str, Any]]]:
         """``(type, payload)`` of every logged approval or question request without its ``resolved``."""
         with self._lock:
-            rows = self._db.execute(
-                "SELECT type, payload FROM events WHERE type IN ('approval.request', 'clarify.request', "
-                "'approval.resolved', 'clarify.resolved') ORDER BY seq").fetchall()
+            return self._unsettled_cards_locked()
+
+    def _unsettled_cards_locked(self) -> list[tuple[str, dict[str, Any]]]:
+        rows = self._db.execute(
+            "SELECT type, payload FROM events WHERE type IN ('approval.request', 'clarify.request', "
+            "'approval.resolved', 'clarify.resolved') ORDER BY seq").fetchall()
         waiting: dict[tuple[str, Any], tuple[str, dict[str, Any]]] = {}
         for kind, body in rows:
             payload = json.loads(body)
@@ -510,20 +547,7 @@ class AlephStore:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                file_ids = []
-                for (attachments,) in self._db.execute("SELECT attachments FROM messages WHERE chat = ?", (chat_id,)):
-                    file_ids += [str(item.get("id")) for item in json.loads(attachments) if isinstance(item, dict)]
-                paths = []
-                for file_id in file_ids:
-                    row = self._db.execute("SELECT path FROM files WHERE id = ?", (file_id,)).fetchone()
-                    if row is not None:
-                        paths.append(row[0])
-                        self._db.execute("DELETE FROM files WHERE id = ?", (file_id,))
-                self._set_meta_locked("seq_floor", str(self._latest_locked()))
-                for table in ("events", "messages", "activity"):
-                    self._db.execute(f"DELETE FROM {table} WHERE chat = ?", (chat_id,))
-                for key in (f"last_user_message:{chat_id}", f"last_receipt:{chat_id}", f"renamed:{chat_id}"):
-                    self._db.execute("DELETE FROM meta WHERE key = ?", (key,))
+                paths = self._drop_scopes_locked("chat = ?", chat_id, [chat_id])
                 event = self._append_locked("chat.delete", {"chat": chat_id})
                 self._db.execute("UPDATE chats SET deleted_seq = ? WHERE id = ?", (event.seq, chat_id))
                 self._db.execute("COMMIT")
@@ -533,6 +557,56 @@ class AlephStore:
         for path in paths:
             Path(path).unlink(missing_ok=True)
         return event
+
+    def delete_project(self, project_id: str) -> LoggedEvent:
+        """Drop a project's events (its threads', closed ones included), messages, files, turns, items
+        and queued messages, and log ``project.delete``, atomically. The project and its threads are
+        remembered as deleted (their ids are not reused)."""
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                paths = self._drop_scopes_locked("project = ?", project_id,
+                                                 self.projects.thread_ids_locked(project_id))
+                self.projects.delete_project_locked(project_id)
+                event = self._append_locked("project.delete", {"project": project_id})
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        for path in paths:
+            Path(path).unlink(missing_ok=True)
+        return event
+
+    def _drop_scopes_locked(self, events_where: str, key: str, scopes: list[str]) -> list[str]:
+        """Drop the events matching ``events_where`` (on ``key``) and the messages, steps, file
+        records and marks of ``scopes``, the chats or threads they belong to. Returns the stored
+        files' paths, to remove once committed."""
+        # A replay after this skips the dropped seqs; the next event must still follow the newest.
+        self._set_meta_locked("seq_floor", str(self._latest_locked()))
+        self._db.execute(f"DELETE FROM events WHERE {events_where}", (key,))
+        paths = []
+        for scope in scopes:
+            file_ids = []
+            for (attachments,) in self._db.execute("SELECT attachments FROM messages WHERE chat = ?", (scope,)):
+                file_ids += [str(item.get("id")) for item in json.loads(attachments) if isinstance(item, dict)]
+            for file_id in file_ids:
+                row = self._db.execute("SELECT path FROM files WHERE id = ?", (file_id,)).fetchone()
+                if row is not None:
+                    paths.append(row[0])
+                    self._db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            for table in ("messages", "activity"):
+                self._db.execute(f"DELETE FROM {table} WHERE chat = ?", (scope,))
+            for mark in (f"last_user_message:{scope}", f"last_receipt:{scope}", f"renamed:{scope}"):
+                self._db.execute("DELETE FROM meta WHERE key = ?", (mark,))
+        return paths
+
+    def projects_snapshot(self) -> list[dict[str, Any]]:
+        """``hello``'s ``projects`` on a reset (``ProjectTables.snapshot_locked``), a thread with an open
+        request ``waiting``."""
+        with self._lock:
+            waiting = {request.get("thread") or request.get("project")
+                       for _kind, request in self._unsettled_cards_locked() if request.get("project")}
+            return self.projects.snapshot_locked(waiting)
 
     # ── files ──────────────────────────────────────────────────────────────────────────────────
 
