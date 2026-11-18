@@ -37,6 +37,11 @@ async def project_adapter(tmp_path):
         await adapter.disconnect()
 
 
+async def open_thread(adapter, project: str, thread: str, name: str = "work") -> None:
+    """A thread of ``project``, as the top level opens one (the person never does)."""
+    await adapter.projects.open_agent_thread(project, thread, name, None, None)
+
+
 async def until(condition: Callable[[], Any], timeout: float = 3.0) -> Any:
     """Wait for what the sessions do on their own tasks: ``condition``'s first truthy value."""
     deadline = time.monotonic() + timeout
@@ -46,7 +51,8 @@ async def until(condition: Callable[[], Any], timeout: float = 3.0) -> Any:
     return value
 
 
-MODELS = (Model("opus", "Opus", ("low", "medium", "high"), "high"), Model("sonnet", "Sonnet", (), None))
+MODELS = (Model("opus", "Opus", ("low", "medium", "high"), "high", ("standard", "fast"), "standard"),
+          Model("sonnet", "Sonnet", (), None))
 
 
 def available(backend_id: str = "claude", name: str = "Claude Code", **fields: Any) -> BackendInfo:

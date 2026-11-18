@@ -14,7 +14,7 @@ import pytest
 from plugins.platforms.aleph.projects.backend import (
     Accepted, Answers, Approve, Ask, Call, Delta, Deny, Exit, Item, McpServer, Question, SessionSpec, TurnEnd)
 from plugins.platforms.aleph.projects.claude import ClaudeBackend, ClaudeSession
-from tests.gateway.aleph_backend import until
+from tests.gateway.aleph_backend import open_thread, until
 
 FIXTURES = Path(__file__).parent / "fixtures" / "claude"
 TURN_SESSION = "496417e2-84f6-4659-9d33-75e4bc3f8c86"
@@ -70,7 +70,7 @@ def folder(tmp_path):
 
 def spec(folder: Path, **fields: Any) -> SessionSpec:
     return SessionSpec(**{"thread": "t1", "project": "p1", "folder": str(folder), "top_level": False, "model": None,
-                          "effort": None, "approval": "ask", "plan": False, **fields})
+                          "effort": None, "tier": None, "approval": "ask", "plan": False, **fields})
 
 
 class Sink(list):
@@ -182,15 +182,15 @@ async def test_approvals_round_trip_with_session_rules(tmp_path, fake, folder):
     tools = {item.fields["title"]: item.key for item in started(events)}
     assert (write.kind, write.item, write.files) == ("edit", tools["hello.txt"],
                                                      ({"path": "hello.txt", "added": 1, "removed": 0},))
-    assert edit.files == ({"path": "notes.md", "added": 1, "removed": 1},) and edit.grant is None
-    assert (rm.kind, rm.item, rm.command, rm.cwd, rm.grant, rm.text) == (
-        "command", tools["rm notes.md"], "rm notes.md", str(folder), "rm", "Delete notes.md")
+    assert edit.files == ({"path": "notes.md", "added": 1, "removed": 1},) and edit.rule is None
+    assert (rm.kind, rm.item, rm.command, rm.cwd, rm.rule, rm.text) == (
+        "command", tools["rm notes.md"], "rm notes.md", str(folder), "prefix:rm", "Delete notes.md")
 
     responses = fake.responses()
     assert responses[write.key] == {"behavior": "allow", "updatedInput": {"file_path": f"{folder}/hello.txt",
                                                                            "content": "hi\n"}}
-    # For this session: an edit takes the CLI's own suggestion, a command its first word's prefix rule,
-    # each for the session only (never the project's settings file).
+    # Always Allow gives the session its rule: an edit the CLI's own suggestion, a command its prefix
+    # rule, each for the session only (never the folder's settings file).
     assert responses[edit.key]["updatedPermissions"] == [{"type": "setMode", "mode": "acceptEdits",
                                                           "destination": "session"}]
     assert responses[rm.key]["updatedPermissions"] == [{
@@ -200,7 +200,7 @@ async def test_approvals_round_trip_with_session_rules(tmp_path, fake, folder):
 
 
 @pytest.mark.asyncio
-async def test_a_refusal_carries_what_the_person_typed_and_a_command_whose_word_runs_anything_grants_nothing(
+async def test_a_refusal_carries_what_the_person_typed_and_a_command_no_prefix_covers_is_allowed_exactly(
         tmp_path, fake, folder):
     def asked(request_id: str, command: str) -> list[dict[str, Any]]:
         return [{"out": {"type": "control_request", "request_id": request_id, "request": {
@@ -212,11 +212,13 @@ async def test_a_refusal_carries_what_the_person_typed_and_a_command_whose_word_
     session, events = await opened(tmp_path, folder)
     await turn(session, events, "clean",
                lambda ask: Deny("Use make clean instead") if "rm" in ask.command else Approve(session=True))
-    # "cd:*" would cover the rm too, and "python3:*" any program at all: neither is granted.
-    assert [ask.grant for ask in events.of(Ask)] == [None, None]
+    # "cd:*" would cover the rm too, and "python3:*" any program at all: each is ruled exactly.
+    assert [ask.rule for ask in events.of(Ask)] == ["exact:cd src && rm -rf build", "exact:python3 build.py"]
     responses = fake.responses()
     assert responses["req-1"] == {"behavior": "deny", "message": "Use make clean instead"}
-    assert responses["req-2"] == {"behavior": "allow", "updatedInput": {"command": "python3 build.py"}}
+    assert responses["req-2"] == {"behavior": "allow", "updatedInput": {"command": "python3 build.py"},
+                                  "updatedPermissions": [{"type": "addRules", "behavior": "allow", "destination": "session",
+                                                          "rules": [{"toolName": "Bash", "ruleContent": "python3 build.py"}]}]}
     await session.close()
 
 
@@ -324,7 +326,7 @@ async def test_a_stop_as_the_turn_ends_leaves_the_next_turn_alone(tmp_path, fake
 
 @pytest.mark.asyncio
 async def test_settings_apply_at_turn_start_and_effort_resumes_in_a_new_process(tmp_path, fake, folder):
-    fake.scenario(script("hello"), script("hello"), resolved={"sonnet": "claude-sonnet-5-5"})
+    fake.scenario(script("hello"), script("hello"), script("hello"), resolved={"sonnet": "claude-sonnet-5-5"})
     session, events = await opened(tmp_path, folder)
     await turn(session, events, "Reply with just: hi")
     await session.apply(spec(folder, model="sonnet", plan=True))
@@ -332,11 +334,18 @@ async def test_settings_apply_at_turn_start_and_effort_resumes_in_a_new_process(
                                {"subtype": "set_permission_mode", "mode": "plan"}]
     await session.apply(spec(folder, model="sonnet", plan=True, effort="high"))
     await turn(session, events, "Reply with just: hi", key="k2")
-    first, second = fake.spawns()
+    # Fast mode, too, is set only at launch.
+    await session.apply(spec(folder, model="sonnet", plan=True, effort="high", tier="fast"))
+    await turn(session, events, "Reply with just: hi", key="k3")
+    first, second, third = fake.spawns()
     assert second["argv"][second["argv"].index("--resume") + 1] == HELLO_SESSION
     assert [second["argv"][second["argv"].index(flag) + 1] for flag in ("--effort", "--model", "--permission-mode")] \
         == ["high", "sonnet", "plan"]
     assert "--effort" not in first["argv"] and not events.of(Exit)  # the old process went quietly
+
+    def fast(spawn):
+        return json.loads(spawn["argv"][spawn["argv"].index("--settings") + 1])["fastMode"]
+    assert [fast(spawn) for spawn in (first, second, third)] == [False, False, True]
     await session.close()
 
 
@@ -411,6 +420,8 @@ async def test_the_probe_says_what_runs_here(tmp_path, fake):
     opus, *_, old = info.models
     assert (opus.name, opus.efforts) == ("Opus 5.5", ("low", "medium", "high", "xhigh", "max"))
     assert old.efforts == ()
+    # A model that takes fast mode offers it as its speeds, standard by default.
+    assert (opus.tiers, opus.default_tier, old.tiers, old.default_tier) == (("standard", "fast"), "standard", (), None)
     # The handshake starts no model turn: it sends nothing but control requests.
     assert all(entry["in"]["type"] == "control_request" for entry in fake.log() if "in" in entry)
 
@@ -434,9 +445,9 @@ async def test_a_thread_runs_on_claude_code_through_the_runtime(tmp_path, fake):
                     if entry["id"] == "claude"]
         assert listed["available"] and listed["default_model"] == "opus"
         await adapter.handle_call("project.create", {
-            "id": project, "name": "web", "folder": str(adapter.root / "web"), "clone": None, "backend": "claude",
+            "id": project, "name": "web", "folder": str(adapter.root / "web"), "backend": "claude",
             "model": None, "effort": None, "approval": "ask"})
-        await adapter.handle_call("thread.open", {"id": thread, "project": project})
+        await open_thread(adapter, project, thread)
         mark = adapter.store.latest()
         await adapter.handle_call("message.send", {"id": "m-1", "thread": thread, "text": "Reply with just: hi"})
         [done] = await until(lambda: [e.payload for e in adapter.store.events_after(mark)

@@ -281,7 +281,7 @@ class Bus:
                         raise ToolError("request_id already belongs to a different open_thread request")
                     return known[1]
             threads = await asyncio.to_thread(self._tables.threads, caller.project)
-            if sum(row.payload.get("opened_by") == "agent" and not row.payload.get("closed") for row in threads) >= OPEN_LIMIT:
+            if sum(not row.payload.get("closed") for row in threads) >= OPEN_LIMIT:
                 raise ToolError(f"Thread limit reached ({OPEN_LIMIT} open threads opened from the top level)")
             top = self.projects.hub.sessions.get(caller.thread)
             parked = await top.claim(brief) if top is not None else None
@@ -321,7 +321,6 @@ class Bus:
             status = ("waiting" if desk is not None and desk.waits(row.id)
                       else "running" if session is not None and session.turn is not None else "idle")
             threads.append({"thread": row.id, "name": row.payload.get("name"), "status": status,
-                            "opened_by": "you" if row.payload.get("opened_by") == "agent" else "user",
                             "last_active_at": row.last_active_at})
         threads.sort(key=lambda entry: entry["last_active_at"], reverse=True)
         return {"threads": threads}

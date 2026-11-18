@@ -69,7 +69,7 @@ optional_env:
     prompt: "History limit"
     password: false
   - name: ALEPH_PROJECTS_ROOT
-    description: "The folder projects live in and the folder browser shows (default /opt/data/projects)"
+    description: "Where projects with no folder get their working folders, and agents clone or create new ones (default /opt/data/projects)"
     prompt: "Projects root"
     password: false
   - name: ALEPH_PROJECTS_HOME

@@ -17,7 +17,7 @@ import pytest_asyncio
 from plugins.platforms.aleph.projects.backend import (
     Accepted, Approve, Ask, Call, Delta, Deny, Exit, Item, McpServer, Patch, SessionSpec, TurnEnd)
 from plugins.platforms.aleph.projects.codex import CodexBackend
-from tests.gateway.aleph_backend import project_adapter, until
+from tests.gateway.aleph_backend import open_thread, project_adapter, until
 
 FIXTURES = Path(__file__).parent / "fixtures" / "codex"
 PROJECT = "C41A0000-0000-4000-8000-000000000001"
@@ -69,7 +69,7 @@ async def backend(tmp_path, codex):
 def _spec(folder: Path, **fields) -> SessionSpec:
     state = folder.parent / "state"
     return SessionSpec(**{"thread": THREAD, "project": PROJECT, "folder": str(folder), "top_level": False,
-                          "model": None, "effort": None, "approval": "ask", "plan": False,
+                          "model": None, "effort": None, "tier": None, "approval": "ask", "plan": False,
                           "instructions": "Work in small steps.",
                           "mcp": McpServer("aleph", sys.executable, ("-I", "child.py", "pipe", "bus.sock"),
                                            {"ALEPH_BUS_TOKEN": "token-1"}, ("report",)),
@@ -153,13 +153,16 @@ async def test_a_recorded_turn_reaches_the_runtime_as_neutral_items(tmp_path, co
 
 @pytest.mark.asyncio
 async def test_settings_apply_from_the_next_turn(tmp_path, codex, backend):
+    await backend.probe()  # what the speeds are called comes from the model list
     session, events = await _open(backend, tmp_path)
-    await session.apply(_spec(tmp_path / "web", model="gpt-5.6-terra", effort="high", approval="allow_all", plan=True))
+    await session.apply(_spec(tmp_path / "web", model="gpt-5.6-terra", effort="high", tier="fast",
+                              approval="allow_all", plan=True))
     await session.send("k1", "Plan it")
     await _turn_end(events)
     turn = codex.sent("turn/start")[0]
-    assert (turn["model"], turn["effort"], turn["approvalPolicy"], turn["sandboxPolicy"]) == (
-        "gpt-5.6-terra", "high", "never", {"type": "dangerFullAccess"})
+    # Fast is the model's own faster service tier.
+    assert (turn["model"], turn["effort"], turn["serviceTier"], turn["approvalPolicy"], turn["sandboxPolicy"]) == (
+        "gpt-5.6-terra", "high", "priority", "never", {"type": "dangerFullAccess"})
     assert turn["collaborationMode"] == {"mode": "plan", "settings": {
         "model": "gpt-5.6-terra", "reasoning_effort": "high", "developer_instructions": None}}
 
@@ -173,9 +176,9 @@ async def adapter(tmp_path, codex):
         instance.project_backends["codex"] = instance.codex = CodexBackend(tmp_path / "home")
         try:
             await instance.handle_call("project.create", {
-                "id": PROJECT, "name": "web", "folder": str(instance.root / "web"), "clone": None,
+                "id": PROJECT, "name": "web", "folder": str(instance.root / "web"),
                 "backend": "codex", "model": None, "effort": None, "approval": "ask"})
-            await instance.handle_call("thread.open", {"id": THREAD, "project": PROJECT})
+            await open_thread(instance, PROJECT, THREAD)
             yield instance
         finally:
             await instance.codex.stop()
@@ -202,7 +205,7 @@ async def _send(adapter, message_id, text):
 
 @pytest.mark.asyncio
 async def test_a_command_approval_round_trip_and_a_steer_into_the_turn(adapter, codex):
-    # As Codex asks for a command it lets the person allow for the session.
+    # As Codex asks for a command it lets the person allow always: Codex grants it for the session.
     codex.play(turns=[_offering(_recorded("approval.json"), ["accept", "acceptForSession", "decline"])])
     await _send(adapter, "m-1", "Fetch example.com")
     request = await _logged(adapter, "approval.request")
@@ -210,7 +213,8 @@ async def test_a_command_approval_round_trip_and_a_steer_into_the_turn(adapter, 
     assert (request["kind"], request["command"], request["item"], request["text"]) == (
         "command", "curl -sI https://example.com", item["id"],
         "May I run the requested network command with escalated permissions?")
-    await adapter.handle_call("approval.respond", {"request_id": request["request_id"], "choice": "session"})
+    assert request["always_scope"] == "Won't ask again for curl -sI https://example.com in web"
+    await adapter.handle_call("approval.respond", {"request_id": request["request_id"], "choice": "always"})
     assert await until(lambda: codex.answers()) == [{"decision": "acceptForSession"}]
 
     # The turn takes the person's steer: its receipt, and the turn goes on to its end.
@@ -271,7 +275,7 @@ async def test_a_session_grant_codex_does_not_offer_allows_once(tmp_path, codex,
     session, events = await _open(backend, tmp_path)
     await session.send("k1", "Fetch example.com")
     ask = await until(lambda: next((e for e in events if isinstance(e, Ask)), None))
-    assert (ask.command, ask.grant) == ("curl -sI https://example.com", None)
+    assert (ask.command, ask.rule) == ("curl -sI https://example.com", None)
     await session.answer(ask.key, Approve(session=True))
     assert await until(lambda: codex.answers()) == [{"decision": "accept"}]
 
@@ -289,7 +293,7 @@ async def test_an_mcp_tool_approval_and_other_elicitations(tmp_path, codex, back
     ask = await until(lambda: next((e for e in events if isinstance(e, Ask)), None))
     # A real elicitation is declined without asking; Codex's approval of a tool call is an ask.
     assert codex.answers() == [{"action": "decline", "content": None, "_meta": None}]
-    assert (ask.kind, ask.item, ask.text, ask.grant) == (
+    assert (ask.kind, ask.item, ask.text, ask.rule) == (
         "tool", "exec-0f37ddb6-9f8a-4114-8acb-df0b9a4c9698", "danger", "aleph/danger")
     await session.answer(ask.key, Approve(session=True))
     await _turn_end(events)
@@ -330,7 +334,7 @@ async def test_a_subagent_shows_as_its_call_and_its_approvals_are_its_parents(tm
     session, events = await _open(backend, tmp_path)
     await session.send("k1", "Test it")
     first = await until(lambda: next((e for e in events if isinstance(e, Ask)), None))
-    assert (first.kind, first.item, first.command, first.grant) == ("command", None, "npm test", "/bin/zsh -lc 'npm test'")
+    assert (first.kind, first.item, first.command, first.rule) == ("command", None, "npm test", "prefix:npm test")
     await session.answer(first.key, Deny())
     second = await until(lambda: next((e for e in events if isinstance(e, Ask) and e is not first), None))
     await session.answer(second.key, Deny())
@@ -375,6 +379,7 @@ async def test_what_the_probe_says(tmp_path, codex, monkeypatch):
         assert info.model(None).id == "gpt-5.6-terra"
         assert info.models[0].efforts == ("low", "medium", "high", "xhigh", "max", "ultra")
         assert info.models[0].default_effort == "low"
+        assert (info.models[0].tiers, info.models[0].default_tier) == (("standard", "fast"), "standard")
         await backend.stop()
 
         codex.play(requirements={"allowedApprovalsReviewers": ["user"], "allowedApprovalPolicies": ["on-request"]})

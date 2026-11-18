@@ -1,8 +1,8 @@
 """A project's requests (protocol "Projects: Requests"): what its backends wait on the person for, as
 the chat's approval and question cards naming ``project`` and ``thread``.
 
-One ``RequestDesk`` per project holds its open requests, the session grants the person gave, and a
-timer per request: unanswered, it is declined (fail closed). It speaks only the neutral decisions of
+One ``RequestDesk`` per project holds its open requests, its Always Allow rules (kept in the store:
+they last as long as the project), and a timer per request: unanswered, it is declined (fail closed). It speaks only the neutral decisions of
 ``backend.py``; each backend says them in its own wire format. A Codex-style backend, which ends a
 plan-mode turn with its plan and asks nothing, gets the server's own plan request here, answered by
 starting the next turn.
@@ -17,7 +17,8 @@ import secrets
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
-from plugins.platforms.aleph.projects.backend import SECRET, Answers, Approve, Ask, BackendSession, Decision, Deny
+from plugins.platforms.aleph.projects.backend import (
+    SECRET, Answers, Approve, Ask, BackendSession, Decision, Deny, rule_covers, rule_words)
 from plugins.platforms.aleph.projects.service import now_iso
 from plugins.platforms.aleph.server import INVALID_PARAMS, RpcError
 
@@ -29,11 +30,12 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 3600  # seconds a request waits before it is declined
 IMPLEMENT = "Implement the plan."
-_APPROVAL_CHOICES = ({"label": "Allow Once", "choice": "once", "style": "primary"},
-                     {"label": "For This Session", "choice": "session", "style": "default"},
-                     {"label": "Don't Allow", "choice": "deny", "style": "destructive"})
+_ALLOW = {"label": "Allow", "choice": "once", "style": "primary"}
+_ALWAYS = {"label": "Always Allow", "choice": "always", "style": "default"}
+_DENY = {"label": "Don't Allow", "choice": "deny", "style": "destructive"}
 _PLAN_CHOICES = ({"label": "Start Coding", "choice": "once", "style": "primary"},
                  {"label": "Keep Planning", "choice": "deny", "style": "default"})
+_EDITS = "*"  # the edit rule: any file in the project's folder
 
 
 def typed_answer(labels: list[str], multi: bool, text: str) -> tuple[tuple[str, ...], dict[str, Any]]:
@@ -70,17 +72,21 @@ class _Request:
         return self.ask.kind == "question"
 
 
+def _rule(ask: Ask) -> Optional[str]:
+    """What Always Allow of ``ask`` would keep; None when it offers no Always Allow."""
+    if ask.kind == "edit":
+        return _EDITS
+    return ask.rule if ask.kind in ("command", "tool") else None
+
+
 class RequestDesk:
-    """One project's open requests and session grants (in memory: they end with the server, as the
-    backends' own grants do)."""
+    """One project's open requests and Always Allow rules."""
 
     def __init__(self, projects: Projects, project: str) -> None:
         self._projects = projects
         self.project = project
         self._open: dict[str, _Request] = {}
-        self._grants: set[tuple[str, str]] = set()  # (kind, grant): commands and tools, project-wide
-        self._edits = False  # any file in the folder
-        self._permissions: dict[str, set[str]] = {}  # thread -> grants: these stay with their thread
+        self._rules: Optional[set[tuple[str, str]]] = None  # (kind, rule), read from the store at first need
         self._tasks: set[asyncio.Task] = set()
 
     def _scoped(self, request: _Request, **payload: Any) -> dict[str, Any]:
@@ -103,10 +109,10 @@ class RequestDesk:
     # ── asking ─────────────────────────────────────────────────────────────────────────────────
 
     async def ask(self, session: Session, ask: Ask, *, server: bool = False) -> None:
-        """Under the session's gate: a card for ``ask``, unless a session grant covers it. Never waits
-        for the person; ``server``: the server's own plan request, answered by the server."""
+        """Under the session's gate: a card for ``ask``, unless an Always Allow rule covers it. Never
+        waits for the person; ``server``: the server's own plan request, answered by the server."""
         backend = None if server else session.backend
-        if backend is not None and await self._covered(session.thread, ask):
+        if backend is not None and await self._covered(ask):
             await self._answer(backend, ask, Approve(session=True))
             return
         request = _Request(_card_id("q" if ask.kind == "question" else "r"), session, ask, backend)
@@ -122,8 +128,10 @@ class RequestDesk:
             payload.update(command=ask.command, cwd=ask.cwd)
         if ask.kind == "edit":
             payload["files"] = list(ask.files)
-        payload.update(choices=list(_PLAN_CHOICES if ask.kind == "plan" else _APPROVAL_CHOICES),
-                       created_at=now_iso())
+        payload["choices"] = list(_choices(ask))
+        if _rule(ask) is not None:
+            payload["always_scope"] = await self._scope_line(ask)
+        payload["created_at"] = now_iso()
         await self._log("approval.request", payload)
 
     async def _show_question(self, request: _Request) -> None:
@@ -140,42 +148,44 @@ class RequestDesk:
         payload["created_at"] = now_iso()
         await self._log("clarify.request", payload)
 
-    async def _covered(self, thread: str, ask: Ask) -> bool:
-        """Whether a session grant the person gave covers ``ask``: what the backend itself was granted
-        (``Ask.grant``), any thread's but a permission's; an edit of files all in the folder."""
+    async def _scope_line(self, ask: Ask) -> str:
+        """``always_scope``: what Always Allow would cover, in a line under the choices."""
+        project = await asyncio.to_thread(self._projects.tables.project, self.project)
+        where = project.payload.get("name") or "this project"
+        what = "edits" if ask.kind == "edit" else rule_words(ask.rule) if ask.kind == "command" else ask.text or ask.rule
+        return f"Won't ask again for {what} in {where}"
+
+    async def _known_rules(self) -> set[tuple[str, str]]:
+        if self._rules is None:
+            self._rules = await asyncio.to_thread(self._projects.tables.rules, self.project)
+        return self._rules
+
+    async def _covered(self, ask: Ask) -> bool:
+        """Whether an Always Allow rule of the project covers ``ask``: a command its rule matches, the
+        same tool, an edit of files all in the folder."""
+        rules = await self._known_rules()
         if ask.kind == "edit":
-            return self._edits and bool(ask.files) and await self._in_folder(ask.files)
-        if ask.grant is None:
-            return False
-        if ask.kind == "permission":
-            return ask.grant in self._permissions.get(thread, ())
-        return ask.kind in ("command", "tool") and (ask.kind, ask.grant) in self._grants
+            return ("edit", _EDITS) in rules and bool(ask.files) and await self._in_folder(ask.files)
+        if ask.kind == "command" and ask.command is not None:
+            return any(kind == "command" and rule_covers(rule, ask.command) for kind, rule in rules)
+        return ask.kind == "tool" and ask.rule is not None and ("tool", ask.rule) in rules
 
     async def _in_folder(self, files: tuple[dict[str, Any], ...]) -> bool:
         project = await asyncio.to_thread(self._projects.tables.project, self.project)
-        folder = os.path.realpath(project.payload["folder"])
+        folder = os.path.realpath(self._projects.folder(project))
 
         def inside(path: Any) -> bool:
             real = os.path.realpath(os.path.join(folder, str(path)))
             return real.startswith(folder.rstrip(os.sep) + os.sep)
         return all(inside(one.get("path")) and (not one.get("old_path") or inside(one["old_path"])) for one in files)
 
-    def _grant(self, request: _Request) -> None:
-        ask = request.ask
-        if ask.kind == "edit":
-            self._edits = True
-        elif ask.grant is None:
+    async def _keep_rule(self, ask: Ask) -> None:
+        rule = _rule(ask)
+        if rule is None:
             return
-        elif ask.kind == "permission":
-            self._permissions.setdefault(request.thread, set()).add(ask.grant)
-        elif ask.kind in ("command", "tool"):
-            self._grants.add((ask.kind, ask.grant))
-
-    def clear_grants(self) -> None:
-        """The project's approval mode changed: what the person allowed under the old one ends."""
-        self._grants.clear()
-        self._edits = False
-        self._permissions.clear()
+        await self._known_rules()
+        self._rules.add((ask.kind, rule))
+        await asyncio.to_thread(self._projects.tables.add_rule, self.project, ask.kind, rule)
 
     # ── answering ──────────────────────────────────────────────────────────────────────────────
 
@@ -183,7 +193,7 @@ class RequestDesk:
         request = self._open.get(request_id)
         if request is None or request.question:
             return None
-        return [choice["choice"] for choice in (_PLAN_CHOICES if request.ask.kind == "plan" else _APPROVAL_CHOICES)]
+        return [choice["choice"] for choice in _choices(request.ask)]
 
     async def respond(self, request_id: str, choice: str) -> None:
         """``approval.respond`` for one of this project's approvals."""
@@ -202,10 +212,10 @@ class RequestDesk:
         await self._log("approval.resolved", self._scoped(request, request_id=request.id, choice=choice, by="user"))
         if ask.kind == "plan":
             await self._projects.leave_plan(request.thread)
-        if choice == "session":
-            self._grant(request)
+        if choice == "always":
+            await self._keep_rule(ask)
         if request.backend is not None:
-            await self._answer(request.backend, ask, Approve(session=choice == "session"))
+            await self._answer(request.backend, ask, Approve(session=choice == "always"))
         elif ask.kind == "plan":
             try:
                 await session.submit(IMPLEMENT, cause="user")
@@ -336,6 +346,12 @@ class RequestDesk:
         task = asyncio.create_task(coroutine)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+
+def _choices(ask: Ask) -> tuple[dict[str, str], ...]:
+    if ask.kind == "plan":
+        return _PLAN_CHOICES
+    return (_ALLOW, _ALWAYS, _DENY) if _rule(ask) is not None else (_ALLOW, _DENY)
 
 
 def _card_id(prefix: str) -> str:

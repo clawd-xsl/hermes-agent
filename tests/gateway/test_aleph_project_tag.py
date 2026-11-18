@@ -15,7 +15,7 @@ import pytest_asyncio
 
 from plugins.platforms.aleph.projects.backend import Ask, Call, Item, TurnEnd
 from plugins.platforms.aleph.projects.tag import SERVER
-from tests.gateway.aleph_backend import project_adapter, until
+from tests.gateway.aleph_backend import open_thread, project_adapter, until
 
 PROJECT = "C41A0000-0000-4000-8000-000000000001"
 THREAD = "8D0F0000-0000-4000-8000-000000000002"
@@ -25,9 +25,9 @@ THREAD = "8D0F0000-0000-4000-8000-000000000002"
 async def adapter(tmp_path):
     async with project_adapter(tmp_path) as instance:
         await instance.handle_call("project.create", {
-            "id": PROJECT, "name": "web", "folder": str(instance.root / "web"), "clone": None, "backend": "claude",
+            "id": PROJECT, "name": "web", "folder": str(instance.root / "web"), "backend": "claude",
             "model": None, "effort": None, "approval": "ask"})
-        await instance.handle_call("thread.open", {"id": THREAD, "project": PROJECT, "name": "fix-login"})
+        await open_thread(instance, PROJECT, THREAD, "fix-login")
         instance.backend = instance.projects.backends["claude"]
         yield instance
 
@@ -113,9 +113,10 @@ async def test_open_thread_opens_one_thread_per_request_id_and_starts_it_with_th
         error, opened = await mcp.call("open_thread", **arguments)
         assert not error and opened == {"thread": item["opened"], "name": "Fix the login form"}
         [new] = _events(adapter, mark, "thread.new")
-        assert {key: new[key] for key in ("id", "project", "name", "opened_by", "item", "brief", "closed")} == {
-            "id": item["opened"], "project": PROJECT, "name": "Fix the login form", "opened_by": "agent",
-            "item": item["id"], "brief": brief, "closed": False}
+        # It starts with the top level's settings as they are then.
+        assert {key: new[key] for key in ("id", "project", "name", "item", "brief", "closed", "approval")} == {
+            "id": item["opened"], "project": PROJECT, "name": "Fix the login form", "item": item["id"],
+            "brief": brief, "closed": False, "approval": "ask"}
 
         # The thread's first turn is the brief, the agent's own; its session knows its role.
         child = await until(lambda: next((s for s in adapter.backend.sessions if s.spec.thread == item["opened"]
@@ -123,7 +124,7 @@ async def test_open_thread_opens_one_thread_per_request_id_and_starts_it_with_th
         assert child.sent == [brief]
         [started] = await _logged(adapter, mark, "turn.started", item["opened"])
         assert started["cause"] == "agent"
-        assert "one thread of that project: Fix the login form" in child.spec.instructions
+        assert "one of its threads: Fix the login form" in child.spec.instructions
         assert str(adapter.state_dir / "projects" / PROJECT / "memory") in child.spec.instructions
         assert child.spec.mcp.tools == ("report",)
         top.emit(_open_call("toolu_1", "completed", **arguments))
@@ -189,20 +190,20 @@ async def test_message_thread_steers_the_thread_or_is_held_while_it_waits_on_the
         error, receipt = await mcp.call("message_thread", **call.arguments)
         assert not error and receipt["status"] == "delivered"
         top.emit(Item("toolu_1", "tool", "completed", {"tool": "other"}))
-        assert thread.sent[-1] == "Message from you at the top level:\nUse the v2 endpoint"
+        assert thread.sent[-1] == "Message from you in the main transcript:\nUse the v2 endpoint"
         assert not _events(adapter, mark, "turn.started") and not _events(adapter, mark, "item.started")
 
         thread.emit(Ask("ask_1", "command", command="npm test", text="Runs the suite"))
         [request] = await _logged(adapter, mark, "approval.request")
         error, receipt = await mcp.call("message_thread", thread=THREAD, text="Skip the e2e suite")
         assert not error and receipt["status"] == "held"
-        assert thread.sent[-1] != "Message from you at the top level:\nSkip the e2e suite"
+        assert thread.sent[-1] != "Message from you in the main transcript:\nSkip the e2e suite"
         error, listed = await mcp.call("list_threads")
-        assert listed["threads"] == [{"thread": THREAD, "name": "fix-login", "status": "waiting", "opened_by": "user",
+        assert listed["threads"] == [{"thread": THREAD, "name": "fix-login", "status": "waiting",
                                       "last_active_at": listed["threads"][0]["last_active_at"]}]
 
         await adapter.handle_call("approval.respond", {"request_id": request["request_id"], "choice": "once"})
-        await until(lambda: thread.sent[-1] == "Message from you at the top level:\nSkip the e2e suite")
+        await until(lambda: thread.sent[-1] == "Message from you in the main transcript:\nSkip the e2e suite")
         assert not _events(adapter, mark, "turn.started")  # still steering the same turn
     finally:
         await mcp.close()

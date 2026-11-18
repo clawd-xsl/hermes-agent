@@ -345,14 +345,19 @@ agent's `cronjob` tool, asked for in the conversation.
 
 A project is a coding agent, Claude Code or Codex, working in a folder on this machine. The phone shows
 projects beside the chats, in the same log (one `seq`, one catch-up, one reset, one push path). A project
-is one agent made of a top level, which the person talks to, and the threads the top level (or the
-person) opens for longer work, each a backend session of its own; all of them share the folder, the
-project's memory and its settings. Hermes's own agent is not involved: the plugin drives the backends'
-CLIs itself.
+is one agent made of a top level, which the person talks to, and the threads the top level opens for
+longer work, each a backend session of its own; all of them share the folder and the project's memory.
+Each thread, the top level included, has its own model, effort, speed and approval mode, which the
+person changes at any time from its next turn. Hermes's own agent is not involved: the plugin drives the
+backends' CLIs itself.
 
-- **Folders** lie under `ALEPH_PROJECTS_ROOT` (`/opt/data/projects` by default, links resolved), which is
-  all the phone's folder browser shows. A project takes an existing folder, one the browser made, or a
-  git clone (`https://`, `ssh://` or `user@host:path`, at most 10 minutes; a failed clone leaves nothing).
+- **Folders**: a project takes any folder the gateway can read and write, and several projects may
+  share one (they see the same working tree; each keeps its own Always Allow rules); the phone's folder
+  browser shows the whole machine, starting in the gateway's home folder. A project is named from the
+  person's first message until renamed. A project with
+  no folder (No Project on the phone) works for good in a folder the server gives it under
+  `ALEPH_PROJECTS_ROOT` (`/opt/data/projects` by default), in `.aleph/<project>`; deleting it deletes that
+  folder too. Cloning or creating a repository is asked of the agent in words.
 - **What the server keeps**, in `$ALEPH_STATE_DIR/projects/<project>/`: each edit's diff, each command's
   output (its last 8 MB), and the project's shared memory (`memory/MEMORY.md` and its entries), which every
   session reads and writes. Deleting a project drops these and its events; its folder stays.
@@ -370,8 +375,8 @@ config and transcripts live there. The machine needs:
   (`HOME=$HERMES_HOME CODEX_HOME=$HERMES_HOME/.codex codex login`). One `codex app-server` serves every
   thread.
 - **git credentials** for private clones and pushes, under that `HOME`: a token in a credential helper
-  (such as `$HERMES_HOME/.git-credentials`) or an SSH key. Clones never prompt; a failed push is the
-  agent's own command and shows in its output.
+  (such as `$HERMES_HOME/.git-credentials`) or an SSH key. A failed clone or push is the agent's own
+  command and shows in its output.
 
 `backends.list` asks each backend at most every 5 minutes (and again after one failed to start) and says
 why one cannot run: `not_installed`, `signed_out` or `error`.
@@ -379,7 +384,9 @@ why one cannot run: `not_installed`, `signed_out` or `error`.
 Limits:
 
 - An approval or question nobody answers is declined after `ALEPH_REQUEST_TIMEOUT` seconds (an hour).
-  "For This Session" grants last until the project's approval mode changes or the gateway restarts.
+  "Always Allow" keeps a rule for the project (a command's prefix, edits in its folder, or a tool) in the
+  store, for as long as the project lasts; the running session only gets a session grant, so nothing is
+  written into the folder's own settings.
 - A restart completes every open turn and item `failed` ("The agent restarted"); queued messages wait,
   and each session resumes on its next turn.
 - A thread's process (never the top level's) is closed after an hour idle with nothing running in the
@@ -413,7 +420,7 @@ With `off`, a `deliver=aleph` job needs the explicit target `aleph:main`.
 | `ALEPH_HOME_CHANNEL` | `main` | Home channel; `off` leaves the home to another platform |
 | `ALEPH_HISTORY_LIMIT` | `200000` | Logged events kept for catching up; a phone further behind gets `reset: true` and pages its history in again. Messages, turns and items themselves are kept as history either way; cards live in the log, so history pages lose the oldest ones with it |
 | `ALEPH_SIDE_CHAT_IDLE_DAYS` | `30` | Days after which a side chat nobody has written in is deleted; `0` keeps them |
-| `ALEPH_PROJECTS_ROOT` | `/opt/data/projects` | The folder projects live in, and all the folder browser shows |
+| `ALEPH_PROJECTS_ROOT` | `/opt/data/projects` | Where projects with no folder get their working folders, and where the agent clones or creates new ones |
 | `ALEPH_PROJECTS_HOME` | `$HERMES_HOME` | `HOME` for Claude Code and Codex: their sign-ins, config and transcripts |
 | `ALEPH_REQUEST_TIMEOUT` | `3600` | Seconds a project's approval or question waits before it is declined |
 | `ALEPH_STATE_DIR` | `$HERMES_HOME/aleph` | The server key (`server.key`), the event log and paired devices (`aleph.db`), and encrypted files |
