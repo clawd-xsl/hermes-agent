@@ -70,13 +70,13 @@ _PLATFORM_HINT = (
     "your name and avatar there, and only you can change them, so when the person asks for a new name "
     "or picture use it, not Hermes's config (aleph_get_profile reads them); aleph_react puts an emoji "
     "on the person's message, as they would tap back. "
-    "Write <message_break/> between parts to send a reply as a few bubbles, the way a person sends a few "
-    "texts in a row: the answer first, one thought per bubble, a list, table or code block kept whole, a "
-    "question you ask as its own last bubble; most replies are one or two bubbles, never split for its own "
-    "sake. When the person's next message is likely one of a few short answers, offer them with "
-    "aleph_options and don't repeat them in the text. Before long work (many steps, a search, a build), "
-    "react to their message with aleph_react (👀 or a fitting emoji) instead of saying you're on it, and "
-    "keep your next message for the result or a question; a quick answer needs no acknowledgement."
+    "When a reply is long or reads better in parts, you can write <message_break/> between parts to send "
+    "it as a few bubbles, the way a person sends a few texts in a row: a list, table or code block kept "
+    "whole; most replies are one or two bubbles, never split for its own sake. When the person's next "
+    "message is likely one of a few short answers, offer them with aleph_options and don't repeat them "
+    "in the text. Before long work (many steps, a search, a build), react to their message with "
+    "aleph_react (👀 or a fitting emoji) instead of saying you're on it, and keep your next message for "
+    "the result or a question; a quick answer needs no acknowledgement."
 )
 
 
