@@ -69,24 +69,45 @@ async def test_a_question_card_and_its_answers(adapter, clarify):
                                     "choices": ["staging", "prod"], "multi_select": False, "recommended": 0,
                                     "index": 0, "count": 2}
         assert entry.awaiting_text  # a typed message in the chat answers it
+        agent_message = (await adapter.send("main", "An agent message.")).message_id
         for bad in ({"choices": [2]}, {"choices": []}, {"choices": [0, 1]}, {"choices": ["0"]},
                     {"choice": 1}, {"text": "prod"}, {"skip": False}):
-            answer = await phone.call("clarify.respond", {"clarify_id": "q1", **bad})
+            answer = await phone.call("clarify.respond", {"clarify_id": "q1", "message_id": "a-bad", **bad})
             assert answer["error"]["code"] == -32602, bad
-        assert (await phone.call("clarify.respond", {"clarify_id": "q1", "choices": [1]}))["result"] == {}
+        for message_id in (None, "", agent_message):  # required with choices; never another's id
+            answer = await phone.call("clarify.respond", {"clarify_id": "q1", "choices": [1], "message_id": message_id})
+            assert answer["error"]["code"] == -32602, message_id
+        pick = {"clarify_id": "q1", "choices": [1], "message_id": "a-1"}
+        assert (await phone.call("clarify.respond", pick))["result"] == {}
         assert entry.response == "prod"
-        assert await _resolved(phone) == {"clarify_id": "q1", "answer": "prod", "choices": [1], "by": "user"}
+        # The pick is the person's message, logged before the card settles, and read at once.
+        logged = []
+        while not logged or logged[-1]["type"] != "clarify.resolved":
+            logged.append((await phone.logged())["params"])
+        said = [p["payload"] for p in logged if p["type"] == "message.new" and p["payload"]["sender"] == "user"]
+        assert [(m["id"], m["text"]) for m in said] == [("a-1", "prod")]
+        types = [p["type"] for p in logged]
+        assert types.index("message.new") < types.index("clarify.resolved")
+        resolved = dict(logged[-1]["payload"])
+        resolved.pop("chat")
+        assert resolved == {"clarify_id": "q1", "answer": "prod", "choices": [1], "by": "user"}
+        assert adapter.store.history("main", 10**6, 5)[0][-1]["read"] is True
+        latest = adapter.store.latest()
+        assert (await phone.call("clarify.respond", pick))["result"] == {}  # a resend is the same message
+        assert adapter.store.latest() == latest
 
         entry, card = await _ask(adapter, phone, clarify, "q2", "Where?", ["a", "b", "c"], multi=True)
         assert card["multi_select"] is True and "recommended" not in card and "index" not in card
-        await phone.call("clarify.respond", {"clarify_id": "q2", "choices": [0, 2]})
-        assert entry.response == '["a", "c"]'
+        await phone.call("clarify.respond", {"clarify_id": "q2", "choices": [0, 2], "message_id": "a-2"})
+        assert entry.response == '["a", "c"]' and adapter.store.message("a-2").text == "a, c"
         assert await _resolved(phone) == {"clarify_id": "q2", "answer": "a, c", "choices": [0, 2], "by": "user"}
 
         entry, _ = await _ask(adapter, phone, clarify, "q3", "Next one?", ["x", "y"])
+        latest = adapter.store.latest()
         await phone.call("clarify.respond", {"clarify_id": "q3", "skip": True})
         assert entry.response == clarify.SKIPPED
         assert await _resolved(phone) == {"clarify_id": "q3", "answer": None, "choices": None, "by": "user"}
+        assert [e.type for e in adapter.store.events_after(latest)] == ["clarify.resolved"]  # a skip says nothing
     finally:
         await phone.close()
 
@@ -123,13 +144,14 @@ async def test_cards_are_in_history_pages_in_their_place(adapter, clarify):
         await phone.hello()
         await adapter.send("main", "Before.")
         await _ask(adapter, phone, clarify, "h1", "Which env?", ["staging", "prod"])
-        await phone.call("clarify.respond", {"clarify_id": "h1", "choices": [0]})
+        await phone.call("clarify.respond", {"clarify_id": "h1", "choices": [0], "message_id": "h-answer"})
         await adapter.send("main", "Between.")
         await _ask(adapter, phone, clarify, "h2", "And now?", None)
         page, older = adapter.store.history("main", adapter.store.latest() + 1, 10)
         assert older is None
-        assert [item.get("card") or item["text"] for item in page] == ["Before.", "question", "Between.", "question"]
-        answered, waiting = page[1], page[3]
+        assert [item.get("card") or item["text"] for item in page] == [
+            "Before.", "question", "staging", "Between.", "question"]  # the pick is the person's message
+        answered, waiting = page[1], page[4]
         assert answered["request"]["clarify_id"] == "h1" and answered["resolved"]["choices"] == [0]
         assert waiting["request"]["question"] == "And now?" and waiting["resolved"] is None
         assert [item["seq"] for item in page] == sorted(item["seq"] for item in page)
@@ -158,7 +180,7 @@ async def test_every_card_settles_even_across_a_restart(tmp_path, clarify):
         await first.send_clarify("main", "Open?", ["y", "n"], "c-open", "sk")
         clarify.register("c-done", "sk", "Done?", ["y", "n"])
         await first.send_clarify("main", "Done?", ["y", "n"], "c-done", "sk")
-        await first._respond_clarify({"clarify_id": "c-done", "choices": [0]})
+        await first._respond_clarify({"clarify_id": "c-done", "choices": [0], "message_id": "c-answer"})
     finally:
         approval.observe_gateway_settle = original
     await first.disconnect()  # the process went away with two cards waiting
