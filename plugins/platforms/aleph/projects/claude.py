@@ -27,11 +27,11 @@ import time
 from collections import deque
 from typing import Any, Optional
 
-from plugins.platforms.aleph.projects import child, git
+from plugins.platforms.aleph.projects import actions, child, git
 from plugins.platforms.aleph.projects.backend import (
     TIERS,
     Accepted, Answers, Approve, Ask, BackendInfo, Call, Decision, Delta, Deny, Exit, Item, Model, Question,
-    SessionSpec, Sink, TurnEnd, clip, command_rule, plain_options, title)
+    SessionSpec, Sink, TurnEnd, clip, command_rule, label, mcp_title, plain_options, title)
 from plugins.platforms.aleph.projects import process
 from plugins.platforms.aleph.projects.process import STREAM_LIMIT, end, kill, signal_group
 from plugins.platforms.aleph.projects.service import one_line
@@ -585,13 +585,14 @@ class ClaudeSession:
         kind = _KINDS.get(name, "other")
         text = str(data.get("command") or "") if kind == "execute" else json.dumps(data, ensure_ascii=False)
         self._tools[key] = kind
-        self.sink(Item(key, "tool", fields={"tool": kind, "title": title(self._title(name, data, call)),
-                                            "input": clip(text)},
+        fields = {"tool": kind, "title": mcp_title(call.server, call.tool) if call else title(self._title(name, data)),
+                  "input": clip(text)}
+        if kind == "execute":
+            fields.update(label=label(data.get("description")), actions=actions.classify(text, self._relative))
+        self.sink(Item(key, "tool", fields={field: value for field, value in fields.items() if value is not None},
                        call=call, arguments=data if name in _DIFFED else None))
 
-    def _title(self, name: str, data: dict[str, Any], call: Optional[Call]) -> str:
-        if call is not None:
-            return call.tool
+    def _title(self, name: str, data: dict[str, Any]) -> str:
         for field in ("command", "file_path", "notebook_path", "pattern", "url", "query", "description"):
             value = data.get(field)
             if isinstance(value, str) and value:

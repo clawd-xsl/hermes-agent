@@ -124,10 +124,13 @@ async def test_a_recorded_turn_becomes_protocol_items(tmp_path, fake, folder, mo
     # Tools start at their complete call, in protocol shape; ToolSearch is no item.
     tools = started(events)
     assert [(item.fields["tool"], item.fields["title"]) for item in tools] == [
-        ("execute", "ls -la"), ("execute", "ls missing-dir"), ("other", "list_threads"), ("edit", "hello.txt"),
+        ("execute", "ls -la"), ("execute", "ls missing-dir"), ("other", "aleph: list_threads"), ("edit", "hello.txt"),
         ("edit", "notes.md"), ("execute", "rm notes.md")]
     ls, missing, threads, write, edit, rm = tools
     assert ls.fields["input"] == "ls -la" and json.loads(threads.fields["input"]) == {}
+    # A command keeps its text as the title; the model's description of it is the label.
+    assert ls.fields["label"] == "List files in current directory" and ls.fields["actions"] == [{"kind": "list"}]
+    assert rm.fields["label"] == "Delete notes.md" and "actions" not in rm.fields
     assert threads.call == Call("aleph", "list_threads", {})
     assert write.arguments == {"file_path": f"{folder}/hello.txt", "content": "hi\n"}
     assert edit.arguments == {"file_path": f"{folder}/notes.md", "old_string": "a", "new_string": "b",

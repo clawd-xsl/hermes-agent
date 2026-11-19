@@ -113,7 +113,8 @@ async def test_a_recorded_turn_reaches_the_runtime_as_neutral_items(tmp_path, co
                                      {"text": "Create hello.txt", "status": "pending"}]}
     # The command as the model wrote it, its output (here only on its end) before it completes.
     command = "exec-385be039-72e0-4346-a342-e122623e49c6"
-    assert items[command, "in_progress"].fields == {"tool": "execute", "title": "ls", "input": "ls"}
+    assert items[command, "in_progress"].fields == {"tool": "execute", "title": "ls", "input": "ls",
+                                                    "actions": [{"kind": "list"}]}
     output = events.index(Delta(command, output="notes.txt\n"))
     assert events.index(items[command, "completed"]) == output + 1
     assert items[command, "completed"].fields["exit_code"] == 0
@@ -122,6 +123,7 @@ async def test_a_recorded_turn_reaches_the_runtime_as_neutral_items(tmp_path, co
     assert edit.patches == (Patch("hello.txt", "@@ -0,0 +1,1 @@\n+hi", "added"),)
     tool = items["exec-fd0756d1-f190-48ac-8cff-5b9b937c3018", "in_progress"]
     assert tool.call == Call("aleph", "list_threads", {}) and tool.fields["tool"] == "other"
+    assert tool.fields["title"] == "aleph: list_threads"
     # Reasoning with no summary, and the person's own input, are not items.
     assert {e.kind for e in events if isinstance(e, Item)} == {"message", "plan", "tool"}
     assert events[-1] == TurnEnd("completed", None, {"used": 20025, "window": 258400})

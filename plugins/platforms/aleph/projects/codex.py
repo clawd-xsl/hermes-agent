@@ -25,8 +25,8 @@ from typing import Any, Callable, Optional
 
 from plugins.platforms.aleph.projects.backend import (
     Accepted, Answers, Approve, Ask, BackendInfo, Call, Decision, Delta, Deny, Exit, Item, Model, Patch,
-    TIERS, Question, SessionSpec, Sink, TurnEnd, clip, command_rule, plain_options, title)
-from plugins.platforms.aleph.projects import process
+    TIERS, Question, SessionSpec, Sink, TurnEnd, clip, command_rule, mcp_title, plain_options, title)
+from plugins.platforms.aleph.projects import actions, process
 from plugins.platforms.aleph.projects.process import STREAM_LIMIT, end, signal_group
 from plugins.platforms.aleph.projects.service import one_line
 
@@ -596,6 +596,9 @@ class CodexSession:
                     self._sink(Delta(key, output=raw["aggregatedOutput"]))
                 self._streamed.discard(key)
             fields = {"tool": "execute", "title": title(command), "input": clip(command)}
+            shown = actions.from_codex(raw.get("commandActions"), self._relative)
+            if shown:
+                fields["actions"] = shown
             item = Item(key, "tool", status, {**fields, "exit_code": raw.get("exitCode")} if done else fields)
         elif kind == "fileChange":
             item = self._edit(key, raw, status, done)
@@ -605,10 +608,12 @@ class CodexSession:
                 self._tools.pop(key, None)
             else:
                 self._tools[key] = (raw["server"], raw["tool"])
-            item = Item(key, "tool", status, _other(raw["tool"], arguments),
+            item = Item(key, "tool", status, _other(mcp_title(raw["server"], raw["tool"]), arguments),
                         call=Call(raw["server"], raw["tool"], arguments))
         elif kind == "dynamicToolCall":
-            item = Item(key, "tool", status, _other(raw["tool"], raw.get("arguments")))
+            namespace = raw.get("namespace")
+            item = Item(key, "tool", status, _other(mcp_title(namespace, raw["tool"]) if namespace else title(raw["tool"]),
+                                                    raw.get("arguments")))
         elif kind == "webSearch":
             action = raw.get("action") or {}
             query = raw.get("query") or action.get("query") or action.get("url") or ""
@@ -694,9 +699,9 @@ class CodexSession:
         self._sink(ask)
 
 
-def _other(tool: str, arguments: Any) -> dict[str, Any]:
+def _other(shown_title: str, arguments: Any) -> dict[str, Any]:
     shown = json.dumps(arguments, ensure_ascii=False) if arguments not in (None, {}) else ""
-    return {"tool": "other", "title": title(tool), "input": clip(shown)}
+    return {"tool": "other", "title": shown_title, "input": clip(shown)}
 
 
 def _question(entry: dict[str, Any]) -> Question:

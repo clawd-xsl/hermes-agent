@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Optional, Protocol
 APPROVALS = ("ask", "auto_review", "allow_all")
 TIERS = ("standard", "fast")
 MAX_TITLE = 200  # an item's title, one line
+MAX_LABEL = 120  # what a tool call does, in the agent's words for the person
 MAX_INPUT = 4000  # an item's input
 _RECOMMENDED = re.compile(r"\s*\(recommended\)\s*$", re.IGNORECASE)
 # A shell control operator: a command with one is several, and a prefix of it covers nothing of the rest.
@@ -35,6 +36,16 @@ def clip(text: str, limit: int = MAX_INPUT) -> str:
 def title(text: Any) -> str:
     """An item's title: one line, at most ``MAX_TITLE``."""
     return clip(" ".join(str(text or "").split()), MAX_TITLE)
+
+
+def label(text: Any) -> Optional[str]:
+    """A tool item's ``label``: one line, at most ``MAX_LABEL``; None when there is none."""
+    return clip(" ".join(str(text or "").split()), MAX_LABEL) or None
+
+
+def mcp_title(server: str, tool: str) -> str:
+    """An MCP tool's title when it gives none: never its wire name (``mcp__chrome__navigate``)."""
+    return title(f"{server}: {tool}")
 
 
 def _words(command: str) -> Optional[list[str]]:
