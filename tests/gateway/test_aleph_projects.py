@@ -247,16 +247,18 @@ async def test_deleting_a_project_drops_its_events_and_leaves_its_folder(adapter
 
 
 @pytest.mark.asyncio
-async def test_the_folder_browser_covers_the_whole_machine(adapter, tmp_path, monkeypatch):
+async def test_the_folder_browser_opens_at_the_projects_root_and_covers_the_whole_machine(adapter, tmp_path):
+    opened = await _call(adapter, "fs.list", {})
+    assert opened["path"] == str(adapter.root) and opened["parent"] == str(adapter.root.parent)
+    assert opened["folders"] == [{"name": "web", "path": str(adapter.root / "web")}]
     home = tmp_path / "home"
     (home / "Api").mkdir(parents=True)
     (home / "web" / "src").mkdir(parents=True)
     (home / ".cache").mkdir()
     (home / "notes.txt").write_text("x")
     os.symlink(home / "web", home / "site")
-    monkeypatch.setenv("HOME", str(home))
 
-    listing = await _call(adapter, "fs.list", {})
+    listing = await _call(adapter, "fs.list", {"path": str(home)})
     assert listing["path"] == str(home) and listing["parent"] == str(tmp_path) and "root" not in listing
     assert [folder["name"] for folder in listing["folders"]] == ["Api", "site", "web"] and listing["more"] is False
     nested = await _call(adapter, "fs.list", {"host": "local", "path": str(home / "web")})
@@ -272,7 +274,32 @@ async def test_the_folder_browser_covers_the_whole_machine(adapter, tmp_path, mo
         assert error.code == 4003 and error.data["reason"] == "access"
     finally:
         locked.chmod(0o700)
-    assert (await _error(adapter, "fs.mkdir", {"path": str(home / "new")})).code == -32601
+
+
+@pytest.mark.asyncio
+async def test_a_new_folder_goes_in_the_folder_shown(adapter, tmp_path):
+    here = str(adapter.root)
+    made = await _call(adapter, "fs.mkdir", {"host": "local", "path": here, "name": "  recipes "})
+    assert made == {"path": str(adapter.root / "recipes")} and (adapter.root / "recipes").is_dir()
+    nested = await _call(adapter, "fs.mkdir", {"path": str(adapter.root / "web"), "name": "été 2026"})
+    assert nested["path"] == str(adapter.root / "web" / "été 2026")
+    taken = await _error(adapter, "fs.mkdir", {"path": here, "name": "recipes"})
+    assert taken.code == -32602 and taken.message == 'A folder named "recipes" already exists.'
+    (adapter.root / "notes.txt").write_text("x")
+    assert (await _error(adapter, "fs.mkdir", {"path": here, "name": "notes.txt"})).code == -32602
+    for name in ("", "  ", ".", "..", ".hidden", "a/b", "../escape", "x" * 256, None, 7):
+        assert (await _error(adapter, "fs.mkdir", {"path": here, "name": name})).code == -32602, name
+    for params in ({"name": "x"}, {"path": "projects", "name": "x"}, {"host": "devbox", "path": here, "name": "x"}):
+        assert (await _error(adapter, "fs.mkdir", params)).code == -32602, params
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o500)
+    try:
+        for path in (str(tmp_path / "missing"), str(adapter.root / "notes.txt"), str(locked)):
+            error = await _error(adapter, "fs.mkdir", {"path": path, "name": "x"})
+            assert error.code == 4003 and error.data["reason"] == "access", path
+    finally:
+        locked.chmod(0o700)
+    assert sorted(path.name for path in adapter.root.iterdir()) == ["notes.txt", "recipes", "web"]
 
 
 # ── backends ──────────────────────────────────────────────────────────────────────────────────
