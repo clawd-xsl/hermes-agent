@@ -1,6 +1,9 @@
 """Projects on Aleph (protocol "Projects"): the calls on projects and their threads, the folder
 browser, the backends on offer, and what a reconnecting phone needs of them.
 
+A project with no folder of its own runs in a working folder the server gives it under the projects
+root (``folder``), for its whole life.
+
 ``Projects`` is all the adapter sees of them. Entity changes are logged through the adapter's
 ``_log``, like any event, and their rows follow from the log (``ProjectTables``). They are checked and
 logged under one lock, so an id is taken once however calls race.
@@ -12,7 +15,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 import time
 from datetime import datetime
@@ -20,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from plugins.platforms.aleph.projects import git
-from plugins.platforms.aleph.projects.backend import APPROVALS, Ask, Backend, BackendInfo, Item
+from plugins.platforms.aleph.projects.backend import APPROVALS, TIERS, Ask, Backend, BackendInfo, Item
 from plugins.platforms.aleph.projects.output import Outputs
 from plugins.platforms.aleph.projects.store import ThreadRow
 from plugins.platforms.aleph.server import FAILED, INVALID_PARAMS, RpcError, event_frame
@@ -38,7 +40,8 @@ PROBE_SECONDS = 300.0
 MAX_ID = 128
 MAX_NAME = 100  # code points, as a chat's title
 MAX_FOLDERS = 1000
-MAX_NAME_BYTES = 255
+HOSTS = ("local",)
+WORKING = ".aleph"  # under the projects root: the working folders of projects with no folder (hidden from fs.list)
 MAX_TEXT_CHARS = 64000
 MAX_COMMENTS = 200
 MAX_LINE_CHARS = 300
@@ -51,8 +54,6 @@ SCOPES = ("uncommitted", "base")
 # Tools whose end may leave the working tree changed (a subagent's edits included).
 _CHANGING = frozenset({"execute", "edit", "delete", "move", "think"})
 _EDITS = frozenset({"edit", "delete", "move"})
-# A clone source: https://, ssh:// or scp-like user@host:path.
-_CLONE_URL = re.compile(r"^(?:https://[^\s/]+/\S+|ssh://\S+|[\w.-]+@[\w.-]+:\S+)$")
 # What an item's end brings, by kind (or a tool's ACP kind), for one settled without it.
 _END_FIELDS: dict[str, dict[str, Any]] = {
     "message": {"text": ""}, "reasoning": {"text": ""}, "plan": {"steps": []},
@@ -155,10 +156,9 @@ class Projects:
         self._poller: Optional[asyncio.Task] = None
         self._deleted: set[str] = set()  # this run: a look under way at one must not bring it back
         self.calls: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
-            "backends.list": self._backends_list, "fs.list": self._fs_list, "fs.mkdir": self._fs_mkdir,
+            "backends.list": self._backends_list, "fs.list": self._fs_list,
             "project.create": self._create_project, "project.update": self._update_project,
-            "project.delete": self._delete_project, "thread.open": self._open_thread,
-            "thread.update": self._update_thread, "thread.close": self._close_thread,
+            "project.delete": self._delete_project, "thread.update": self._update_thread, "thread.close": self._close_thread,
             "thread.stop": self._stop_thread, "message.cancel": self._cancel_message,
             "changes.get": self._changes_get, "diff.get": self._diff_get}
         # Calls that answer to one connection.
@@ -169,12 +169,13 @@ class Projects:
     def tables(self):
         return self.adapter.store.projects
 
+    def folder(self, project) -> str:
+        """Where a project's sessions run: its folder, or the working folder the server gave it."""
+        return project.payload.get("folder") or str(self.root / WORKING / project.id)
+
     async def start(self) -> None:
         """Before the server accepts connections: settle what the last run left open. Turns and items
         always end; the backend session itself resumes on the thread's next turn."""
-        swept = await asyncio.to_thread(git.sweep, self.state_dir / "clones")
-        if swept:
-            logger.info("Aleph: removed %d clone(s) the last run left half made", swept)
         items, turns = await asyncio.to_thread(self.tables.settle_open)
         at = now_iso()
         for item in items:
@@ -238,8 +239,8 @@ class Projects:
         while True:
             self._look_again.discard(project_id)
             row = await asyncio.to_thread(self.tables.project, project_id)
-            if row is None or row.deleted_seq is not None:
-                return
+            if row is None or row.deleted_seq is not None or row.payload.get("folder") is None:
+                return  # a project with no folder has no changes to show
             try:
                 payload = {"project": project_id, **await git.summary(row.payload["folder"])}
             except git.GitError as exc:
@@ -326,7 +327,7 @@ class Projects:
         if not event.patches and not event.arguments:
             return None
         project = await asyncio.to_thread(self.tables.project, session.project)
-        files = await asyncio.to_thread(git.edit_files, project.payload["folder"], event.arguments, event.patches)
+        files = await asyncio.to_thread(git.edit_files, self.folder(project), event.arguments, event.patches)
         await asyncio.to_thread(self._keep_diff, session.project, item, files)
         return [{key: entry[key] for key in ("path", "old_path", "added", "removed") if entry[key] is not None}
                 for entry in files]
@@ -388,91 +389,64 @@ class Projects:
         infos = await asyncio.gather(*(self.backend_info(backend_id) for backend_id in self.backends))
         return {"backends": [info.wire() for info in infos]}
 
-    async def _settings(self, backend_id: str, changes: dict[str, Any], model_id: Optional[str], *,
-                        follows: bool = False) -> None:
-        """Check the settings ``changes`` sets against what the backend offers: ``-32602`` for a choice
-        it does not have, ``4003 unavailable`` when it cannot run. ``model_id`` is the model the
-        settings will run with (an effort is that model's); ``follows``: a null approval follows the
-        project (a thread's)."""
+    async def _settings(self, backend_id: str, settings: dict[str, Any]) -> None:
+        """Check a thread's settings as they will be (``model``, ``effort``, ``tier``, ``approval``)
+        against what the backend offers: ``-32602`` for a choice it does not have, ``4003 unavailable``
+        when it cannot run. An effort or a tier is the model's, the default model's for a null one."""
         info = await self.backend_info(backend_id)
         if not info.available:
             raise failed("unavailable", info.message or f"{info.name} cannot run here ({info.reason})")
-        model = info.model(model_id)
-        if changes.get("model") is not None and model is None:
-            raise _invalid(f"{info.name} has no model {changes['model']}")
-        effort = changes.get("effort")
+        model = info.model(settings.get("model"))
+        if settings.get("model") is not None and model is None:
+            raise _invalid(f"{info.name} has no model {settings['model']}")
+        effort, tier = settings.get("effort"), settings.get("tier")
         if effort is not None and (model is None or effort not in model.efforts):
             raise _invalid(f"{effort} is no effort of {model.name if model else 'the default model'}")
-        if "approval" in changes:
-            approval = changes["approval"]
-            if approval is None and not follows:
-                raise _invalid("approval is required")
-            if approval is not None and (approval not in APPROVALS or approval not in info.approvals):
-                raise _invalid(f"{info.name} does not offer approval {approval} here")
+        if tier is not None and (tier not in TIERS or model is None or tier not in model.tiers):
+            raise _invalid(f"{tier} is no speed of {model.name if model else 'the default model'}")
+        approval = settings.get("approval")
+        if approval not in APPROVALS or approval not in info.approvals:
+            raise _invalid(f"{info.name} does not offer approval {approval} here")
 
     # ── the folder browser ─────────────────────────────────────────────────────────────────────
 
-    def _inside(self, path: Any) -> str:
-        """``path`` resolved, when it is absolute and lies in the projects root after resolving links."""
+    @staticmethod
+    def _host(params: dict[str, Any]) -> str:
+        host = params.get("host", "local")
+        if host not in HOSTS:
+            raise _invalid(f"unknown host {host!r}")
+        return host
+
+    @staticmethod
+    def _real_folder(path: Any) -> str:
+        """``path``, absolute, resolved, and a folder."""
         if not isinstance(path, str) or not os.path.isabs(path) or "\x00" in path:
             raise _invalid("path must be an absolute path")
         real = os.path.realpath(path)
-        root = str(self.root)
-        if real != root and not real.startswith(root.rstrip(os.sep) + os.sep):
-            raise _invalid("path is outside the projects root")
-        return real
-
-    def _folder(self, path: Any) -> str:
-        real = self._inside(path)
         if not os.path.isdir(real):
             raise _invalid("path is not a folder")
         return real
 
     def _list(self, path: Optional[str]) -> dict[str, Any]:
-        root = str(self.root)
-        if path is None:
-            try:
-                os.makedirs(root, exist_ok=True)
-            except OSError as exc:
-                raise failed("io", exc) from exc
-        real = self._folder(root if path is None else path)
+        real = self._real_folder(os.path.expanduser("~") if path is None else path)
         folders = []
         try:
             with os.scandir(real) as entries:
                 for entry in entries:
-                    if entry.name.startswith(".") or not entry.is_dir():
-                        continue
-                    if entry.is_symlink():
-                        target = os.path.realpath(entry.path)
-                        if not target.startswith(root.rstrip(os.sep) + os.sep):
-                            continue
-                    folders.append({"name": entry.name, "path": entry.path})
+                    if not entry.name.startswith(".") and entry.is_dir():
+                        folders.append({"name": entry.name, "path": entry.path})
+        except PermissionError as exc:
+            raise failed("access", f"{real} cannot be read") from exc
         except OSError as exc:
-            raise failed("io", exc) from exc
+            raise failed("access", exc) from exc
         folders.sort(key=lambda folder: (folder["name"].casefold(), folder["name"]))
-        return {"root": root, "path": real, "parent": None if real == root else os.path.dirname(real),
+        parent = os.path.dirname(real)
+        return {"path": real, "parent": None if parent == real else parent,
                 "folders": folders[:MAX_FOLDERS], "more": len(folders) > MAX_FOLDERS}
 
-    def _mkdir(self, path: Any) -> dict[str, Any]:
-        if not isinstance(path, str) or not os.path.isabs(path):
-            raise _invalid("path must be an absolute path")
-        name = os.path.basename(path)
-        if not name or name.startswith(".") or "\x00" in name or len(name.encode("utf-8", "surrogatepass")) > MAX_NAME_BYTES:
-            raise _invalid(f"the folder's name must be 1 to {MAX_NAME_BYTES} bytes, not starting with .")
-        target = os.path.join(self._folder(os.path.dirname(path)), name)
-        try:
-            os.mkdir(target)
-        except FileExistsError as exc:
-            raise failed("exists", f"{target} already exists") from exc
-        except OSError as exc:
-            raise failed("io", exc) from exc
-        return {"path": target}
-
     async def _fs_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._host(params)
         return await asyncio.to_thread(self._list, params.get("path"))
-
-    async def _fs_mkdir(self, params: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._mkdir, params.get("path"))
 
     # ── projects ───────────────────────────────────────────────────────────────────────────────
 
@@ -491,8 +465,8 @@ class Projects:
             raise _invalid("that id is already used")
 
     async def _create_project(self, params: dict[str, Any]) -> dict[str, Any]:
-        """``project.create``. The same id again answers as the first time, a clone still running
-        included: the second call awaits the first."""
+        """``project.create``. The same id again answers as the first time: a second call while the
+        first runs awaits it."""
         project_id = _id(params)
         pending = self._creating.get(project_id)
         if pending is None:
@@ -507,78 +481,53 @@ class Projects:
         return await asyncio.shield(pending)
 
     async def _create_once(self, project_id: str, params: dict[str, Any]) -> dict[str, Any]:
-        name, clone = _name(params.get("name")), params.get("clone")
-        backend_id = params.get("backend")
-        settings = {key: _optional_str(params, key) for key in ("model", "effort", "approval")}
         known = await asyncio.to_thread(self.tables.project, project_id)
         if known is not None:
             if known.deleted_seq is not None:
                 raise _invalid("that project was deleted")
             return {"seq": known.created_seq}
         await self._id_unused(project_id)
+        host, backend_id = self._host(params), params.get("backend")
         if backend_id not in self.backends:
             raise _invalid(f"unknown backend {backend_id!r}")
-        if clone is None:
-            folder = await asyncio.to_thread(self._folder, params.get("folder"))
-        else:
-            if not isinstance(clone, str) or not _CLONE_URL.match(clone):
-                raise _invalid("clone must be a git URL (https://, ssh:// or user@host:path)")
-            folder = await asyncio.to_thread(self._new_folder, params.get("folder"))
-        await self._settings(backend_id, settings, settings["model"])
-        if clone is not None:
-            await self._clone(clone, folder)
+        folder = params.get("folder")
+        if folder is not None:
+            folder = await asyncio.to_thread(self._real_folder, folder)
+            if not await asyncio.to_thread(os.access, folder, os.R_OK | os.W_OK | os.X_OK):
+                raise failed("access", f"{folder} cannot be read and written here")
+        name = _name(params.get("name"), nullable=True)  # else named from the person's first message
+        settings = {key: _optional_str(params, key) for key in ("model", "effort", "tier", "approval")}
+        await self._settings(backend_id, settings)
         async with self._lock:
             known = await asyncio.to_thread(self.tables.project, project_id)
             if known is not None:  # created meanwhile by a call that did not wait on this one
                 return {"seq": known.created_seq}
+            if folder is None:
+                await asyncio.to_thread(os.makedirs, self.root / WORKING / project_id, exist_ok=True)
+            created_at = now_iso()
             event = await self.adapter._log("project.new", {
-                "id": project_id, "name": name, "folder": folder, "host": "local", "backend": backend_id,
-                **settings, "created_at": now_iso()})
-        logger.info("Aleph: created project %s in %s (%s)", project_id, folder, backend_id)
+                "id": project_id, "name": name, "folder": folder, "host": host, "backend": backend_id,
+                "created_at": created_at})
+            await self.adapter._log("thread.new", {
+                "id": project_id, "project": project_id, "name": None, "created_at": created_at, "item": None,
+                "brief": None, **settings, "plan": False, "closed": False})
+        logger.info("Aleph: created project %s in %s (%s)", project_id, folder or "its working folder", backend_id)
         self.look(project_id)
         return {"seq": event.seq}
 
-    def _new_folder(self, path: Any) -> str:
-        """A folder a clone will make: inside the root, not there yet, its parent a folder."""
-        if not isinstance(path, str) or not os.path.isabs(path) or not os.path.basename(path):
-            raise _invalid("folder must be an absolute path")
-        target = os.path.join(self._folder(os.path.dirname(path)), os.path.basename(path))
-        if os.path.lexists(target):
-            raise _invalid("folder already exists")
-        return target
-
-    async def _clone(self, url: str, folder: str) -> None:
-        """Clone ``url`` into ``folder``; a failure leaves no folder."""
-        try:
-            await git.clone(url, folder, self.state_dir / "clones")
-        except git.CloneError as exc:
-            logger.warning("Aleph: cloning into %s failed (%s): %s", folder, exc.reason, one_line(exc))
-            raise failed(exc.reason, exc) from exc
-
     async def _update_project(self, params: dict[str, Any]) -> dict[str, Any]:
-        """``project.update``: ``{seq: null}`` when nothing changed."""
-        project_id = _id(params)
-        changes: dict[str, Any] = {}
-        if "name" in params:
-            changes["name"] = _name(params["name"])
-        for key in ("model", "effort", "approval"):
-            if key in params:
-                changes[key] = _optional_str(params, key)
+        """``project.update``: its name. ``{seq: null}`` when nothing changed."""
+        project_id, name = _id(params), _name(params.get("name"))
         async with self._lock:
             row = await self._live_project(project_id)
-            current = row.payload
-            changed = {key: value for key, value in changes.items() if current.get(key) != value}
-            if not changed:
+            if row.payload.get("name") == name:
                 return {"seq": None}
-            if changed.keys() - {"name"}:
-                await self._settings(current["backend"], changed, changed.get("model", current.get("model")))
-            event = await self.adapter._log("project.update", {**current, **changed})
-            if "approval" in changed and project_id in self.desks:
-                self.desks[project_id].clear_grants()
+            event = await self.adapter._log("project.update", {**row.payload, "name": name})
         return {"seq": event.seq}
 
     async def _delete_project(self, params: dict[str, Any]) -> dict[str, Any]:
-        """``project.delete``: its sessions end, its events and bodies go; the folder stays."""
+        """``project.delete``: its sessions end, its events and bodies go; the folder stays, but a working
+        folder the server gave goes too."""
         project_id = _id(params)
         async with self._lock:
             row = await asyncio.to_thread(self.tables.project, project_id)
@@ -597,6 +546,8 @@ class Projects:
                 event = await asyncio.to_thread(self.adapter.store.delete_project, project_id)
                 self.adapter._broadcast(event)
         await asyncio.to_thread(shutil.rmtree, self.state_dir / project_id, ignore_errors=True)
+        if row.payload.get("folder") is None:
+            await asyncio.to_thread(shutil.rmtree, self.root / WORKING / project_id, ignore_errors=True)
         logger.info("Aleph: deleted project %s", project_id)
         return {"seq": event.seq}
 
@@ -609,6 +560,8 @@ class Projects:
     async def _folder_of(self, params: dict[str, Any]) -> tuple[str, str]:
         """``(folder, scope)`` of a call on a project's changes."""
         project = await self._live_project(params.get("project"))
+        if project.payload.get("folder") is None:
+            raise _invalid("a project with no folder has no changes")
         scope = params.get("scope")
         if scope not in SCOPES:
             raise _invalid("scope must be uncommitted or base")
@@ -672,42 +625,27 @@ class Projects:
         await self._live_project(row.project)
         return row
 
-    async def _open_thread(self, params: dict[str, Any]) -> dict[str, Any]:
-        """``thread.open``: a thread the person starts; idempotent by id."""
-        thread_id, project_id = _id(params), _id(params, "project")
-        name = _name(params.get("name"), nullable=True)
-        async with self._lock:
-            await self._live_project(project_id)
-            known = await asyncio.to_thread(self.tables.thread, thread_id)
-            if known is not None and known.project == project_id and not known.top_level:
-                return {"seq": known.created_seq}
-            await self._id_unused(thread_id)
-            event = await self.adapter._log("thread.new", {
-                "id": thread_id, "project": project_id, "name": name, "created_at": now_iso(), "opened_by": "user",
-                "item": None, "brief": None, "model": None, "effort": None, "approval": None, "plan": False,
-                "closed": False})
-        return {"seq": event.seq}
-
     async def open_agent_thread(self, project_id: str, thread_id: str, name: str, item: Optional[str],
-                                brief: str) -> ThreadRow:
+                                brief: Optional[str]) -> ThreadRow:
         """A thread the top level opens (``open_thread``), named ``name``, its row in the main transcript
-        the ``thread`` item ``item``."""
+        the ``thread`` item ``item``. It starts with the top level's settings as they are now."""
         async with self._lock:
             await self._live_project(project_id)
+            top = await asyncio.to_thread(self.tables.thread, project_id)
+            settings = {key: top.payload.get(key) for key in ("model", "effort", "tier", "approval")}
             await self.adapter._log("thread.new", {
-                "id": thread_id, "project": project_id, "name": name, "created_at": now_iso(), "opened_by": "agent",
-                "item": item, "brief": brief, "model": None, "effort": None, "approval": None, "plan": False,
-                "closed": False})
+                "id": thread_id, "project": project_id, "name": name, "created_at": now_iso(), "item": item,
+                "brief": brief, **settings, "plan": False, "closed": False})
         return await asyncio.to_thread(self.tables.thread, thread_id)
 
     async def _update_thread(self, params: dict[str, Any]) -> dict[str, Any]:
-        """``thread.update``: null settings follow the project again; the top level takes only
-        ``plan``. ``{seq: null}`` when nothing changed."""
+        """``thread.update``, at any time, from the next turn on; the top level takes all but ``name``
+        (its name is the project's). ``{seq: null}`` when nothing changed."""
         thread_id = _id(params)
         changes: dict[str, Any] = {}
         if "name" in params:
             changes["name"] = _name(params["name"])
-        for key in ("model", "effort", "approval"):
+        for key in ("model", "effort", "tier", "approval"):
             if key in params:
                 changes[key] = _optional_str(params, key)
         if "plan" in params:
@@ -716,18 +654,15 @@ class Projects:
             changes["plan"] = params["plan"]
         async with self._lock:
             thread = await self._live_thread(thread_id)
-            if thread.top_level and changes.keys() - {"plan"}:
-                raise _invalid("the top level's name and settings are the project's")
+            if thread.top_level and "name" in changes:
+                raise _invalid("the top level's name is the project's")
             current = thread.payload
             changed = {key: value for key, value in changes.items() if current.get(key) != value}
             if not changed:
                 return {"seq": None}
-            settings = {key: value for key, value in changed.items() if key in ("model", "effort", "approval")}
-            if any(value is not None for value in settings.values()):
+            if changed.keys() & {"model", "effort", "tier", "approval"}:
                 project = await self._live_project(thread.project)
-                model_id = changed["model"] if "model" in changed else current.get("model")
-                await self._settings(project.payload["backend"], settings, model_id or project.payload.get("model"),
-                                     follows=True)
+                await self._settings(project.payload["backend"], {**current, **changed})
             event = await self.adapter._log("thread.update", {**current, **changed})
         return {"seq": event.seq}
 
@@ -785,6 +720,7 @@ class Projects:
                     thread = await self._live_thread(thread.id)
                     if thread.payload.get("closed"):
                         await adapter._log("thread.update", {**thread.payload, "closed": False})
+            await self._name_from(thread.project, text)
         payload: dict[str, Any] = {"project": thread.project, "thread": thread.id, "id": message_id,
                                    "sender": "user", "text": text, "attachments": adapter._with_links(attachments)}
         if comments:
@@ -792,6 +728,16 @@ class Projects:
         payload["created_at"] = now_iso()
         # Logged by the session, under its gate: whether it waits for the turn is decided there.
         return await self.hub.session(thread).accept(payload, attachments, delivery)
+
+    async def _name_from(self, project_id: str, text: str) -> None:
+        """A project still unnamed is named from the person's first message."""
+        name = _name(text, nullable=True)
+        if name is None:
+            return
+        async with self._lock:
+            row = await self._live_project(project_id)
+            if row.payload.get("name") is None:
+                await self.adapter._log("project.update", {**row.payload, "name": name})
 
     async def sent_seq(self, message_id: str, thread_id: str) -> Optional[int]:
         """The seq ``message.send`` first answered for ``message_id`` in this thread (its

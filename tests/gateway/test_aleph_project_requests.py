@@ -1,5 +1,5 @@
 """Projects on Aleph, requests: approvals and questions as the chat's cards in a thread, how each choice
-lands with the backend, session grants across the project, the timeout that declines, a typed message
+lands with the backend, Always Allow rules across the project, the timeout that declines, a typed message
 answering or declining, the server's own plan request, cards that always settle, and what is pushed."""
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import pytest_asyncio
 
 from plugins.platforms.aleph.projects.backend import (
     SECRET, Answers, Approve, Ask, Deny, Exit, Item, Question, TurnEnd)
-from tests.gateway.aleph_backend import project_adapter, until
+from tests.gateway.aleph_backend import open_thread, project_adapter, until
 from tests.gateway.test_aleph_push import PUSH_TOKEN, FakeSender
 
 PROJECT = "C41A0000-0000-4000-8000-000000000001"
@@ -23,10 +23,10 @@ OTHER = "8D0F0000-0000-4000-8000-000000000003"
 async def adapter(tmp_path):
     async with project_adapter(tmp_path) as instance:
         await instance.handle_call("project.create", {
-            "id": PROJECT, "name": "web", "folder": str(instance.root / "web"), "clone": None, "backend": "claude",
+            "id": PROJECT, "name": "web", "folder": str(instance.root / "web"), "backend": "claude",
             "model": None, "effort": None, "approval": "ask"})
         for thread in (THREAD, OTHER):
-            await instance.handle_call("thread.open", {"id": thread, "project": PROJECT})
+            await open_thread(instance, PROJECT, thread)
         instance.backend = instance.projects.backends["claude"]
         yield instance
 
@@ -69,15 +69,18 @@ async def test_an_approval_lands_with_the_backend_and_a_denied_item_completes_de
     session.emit(_execute("toolu_1", "npm test"))
     item = await _logged(adapter, "item.started")
     request = await _asked(adapter, session, Ask("ask_1", "command", item="toolu_1", text="Runs the suite",
-                                                 command="npm test", cwd=session.spec.folder, grant="npm"))
+                                                 command="npm test", cwd=session.spec.folder,
+                                                 rule="prefix:npm test"))
     assert {key: request[key] for key in ("project", "thread", "kind", "item", "command", "cwd", "text")} == {
         "project": PROJECT, "thread": THREAD, "kind": "command", "item": item["id"], "command": "npm test",
         "cwd": session.spec.folder, "text": "Runs the suite"}
     assert [(c["choice"], c["label"]) for c in request["choices"]] == [
-        ("once", "Allow Once"), ("session", "For This Session"), ("deny", "Don't Allow")]
-    assert (await adapter.projects.snapshot())[0]["threads"][0]["state"] == "waiting"
-    error = await _error(adapter, "approval.respond", {"request_id": request["request_id"], "choice": "always"})
-    assert error.code == -32602 and error.data == {"choices": ["once", "session", "deny"]}
+        ("once", "Allow"), ("always", "Always Allow"), ("deny", "Don't Allow")]
+    assert request["always_scope"] == "Won't ask again for npm test in web"
+    threads = {thread["id"]: thread for thread in (await adapter.projects.snapshot())[0]["threads"]}
+    assert (threads[THREAD]["state"], threads[PROJECT]["state"]) == ("waiting", "idle")
+    error = await _error(adapter, "approval.respond", {"request_id": request["request_id"], "choice": "session"})
+    assert error.code == -32602 and error.data == {"choices": ["once", "always", "deny"]}
     await adapter.handle_call("approval.respond", {"request_id": request["request_id"], "choice": "once"})
     assert session.answers == [("ask_1", Approve())]
     resolved = await _logged(adapter, "approval.resolved")
@@ -100,36 +103,34 @@ async def test_an_approval_lands_with_the_backend_and_a_denied_item_completes_de
 
 
 @pytest.mark.asyncio
-async def test_a_session_grant_covers_the_project_until_its_approval_mode_changes(adapter):
+async def test_always_allow_keeps_a_rule_for_the_whole_project_for_good(adapter):
     session = await _session(adapter)
-    request = await _asked(adapter, session, Ask("ask_1", "command", command="git status", grant="git"))
-    await adapter.handle_call("approval.respond", {"request_id": request["request_id"], "choice": "session"})
+    request = await _asked(adapter, session, Ask("ask_1", "command", command="git status", rule="prefix:git status"))
+    await adapter.handle_call("approval.respond", {"request_id": request["request_id"], "choice": "always"})
     assert session.answers == [("ask_1", Approve(session=True))]
     edit = await _asked(adapter, session, Ask("ask_2", "edit", files=({"path": "src/a.ts", "added": 1, "removed": 0},)))
-    await adapter.handle_call("approval.respond", {"request_id": edit["request_id"], "choice": "session"})
+    assert edit["always_scope"] == "Won't ask again for edits in web"
+    await adapter.handle_call("approval.respond", {"request_id": edit["request_id"], "choice": "always"})
 
-    # Another thread's matching asks are allowed with the backend's own session grant, with no card:
-    # a command of the same rule, an edit of any file in the folder.
+    # The rules outlast the server (kept in the store) and cover every thread of the project: a command
+    # its prefix matches and an edit of any file in the folder are allowed with no card.
+    adapter.projects.desks.clear()
     other = await _session(adapter, OTHER)
     cards = len([e for e in adapter.store.events_after(0) if e.type == "approval.request"])
-    other.emit(Ask("ask_3", "command", command="git log --oneline", grant="git"))
+    other.emit(Ask("ask_3", "command", command="git status --short", rule="prefix:git status"))
     other.emit(Ask("ask_4", "edit", files=({"path": "docs/readme.md", "added": 3, "removed": 0},)))
     await until(lambda: len(other.answers) == 2)
     assert other.answers == [("ask_3", Approve(session=True)), ("ask_4", Approve(session=True))]
-    # A file outside the folder, another rule or a permission of another thread still asks.
+    # A file outside the folder, another command or several in one still ask; a permission offers no
+    # Always Allow.
     for ask in (Ask("ask_5", "edit", files=({"path": "../elsewhere.txt", "added": 1, "removed": 0},)),
-                Ask("ask_6", "command", command="npm test", grant="npm")):
+                Ask("ask_6", "command", command="git push", rule="prefix:git push"),
+                Ask("ask_7", "command", command="git status && rm -rf /", rule="exact:git status && rm -rf /")):
         request = await _asked(adapter, other, ask)
         await adapter.handle_call("approval.respond", {"request_id": request["request_id"], "choice": "once"})
-    permission = await _asked(adapter, session, Ask("ask_7", "permission", text="Network access", grant="network"))
-    await adapter.handle_call("approval.respond", {"request_id": permission["request_id"], "choice": "session"})
-    await _asked(adapter, other, Ask("ask_8", "permission", text="Network access", grant="network"))
+    permission = await _asked(adapter, other, Ask("ask_8", "permission", text="Network access"))
+    assert [choice["choice"] for choice in permission["choices"]] == ["once", "deny"] and "always_scope" not in permission
     assert len([e for e in adapter.store.events_after(0) if e.type == "approval.request"]) == cards + 4
-
-    # A new approval mode ends what the person allowed under the old one.
-    await adapter.handle_call("project.update", {"id": PROJECT, "approval": "auto_review"})
-    request = await _asked(adapter, other, Ask("ask_9", "command", command="git push", grant="git"))
-    assert request["command"] == "git push"
 
 
 @pytest.mark.asyncio
@@ -166,7 +167,8 @@ async def test_a_typed_message_declines_an_approval_or_answers_a_question_of_its
     request = await _asked(adapter, session, Ask("ask_1", "command", item="toolu_1", command="npm publish"))
     elsewhere = await _asked(adapter, other, Ask("ask_2", "command", command="make"))
     mark = adapter.store.latest()
-    seq = (await adapter.handle_call("message.send", {"id": "t-1", "thread": THREAD,
+    # Sent to wait for the turn's end, it still answers the request first: it queues nothing.
+    seq = (await adapter.handle_call("message.send", {"id": "t-1", "thread": THREAD, "delivery": "after_turn",
                                                       "text": "Don't publish, bump the version"}))["seq"]
     assert session.answers == [("ask_1", Deny("Don't publish, bump the version"))]
     assert session.sent == ["Go"]  # no turn of its own: the agent reads it with the refusal
@@ -300,7 +302,7 @@ async def test_requests_no_one_can_answer_settle_when_their_thread_closes_or_its
 
 
 @pytest.mark.asyncio
-async def test_a_project_pushes_its_requests_and_top_level_turns_and_settled_cards_leave_the_lock_screen(adapter):
+async def test_a_project_pushes_its_requests_and_every_threads_turns_and_settled_cards_leave_the_lock_screen(adapter):
     adapter._push = FakeSender()
     adapter.store.set_push_token(adapter.device.id, PUSH_TOKEN, "development")
     sender = adapter._push
@@ -320,7 +322,7 @@ async def test_a_project_pushes_its_requests_and_top_level_turns_and_settled_car
     assert sender.background == [(PUSH_TOKEN, {"aps": {"content-available": 1},
                                                "aleph": {"seq": adapter.store.latest()}})]
 
-    # A thread's turns do not push; the top level's do when it spoke or failed, not when silent.
+    # Every thread's turns push, the top level's included, unless the top level stayed silent.
     session.emit(TurnEnd("completed"))
     top = await _session(adapter, PROJECT)
     await _asked(adapter, top, Ask("ask_2", "question", questions=(Question("Ship it?"),)), "clarify.request")
@@ -335,10 +337,10 @@ async def test_a_project_pushes_its_requests_and_top_level_turns_and_settled_car
             top.emit(end)
         await _logged(adapter, "turn.completed", mark)
     await asyncio.sleep(0.05)
-    assert len(sender.sent) == 4
-    bodies = [(p["aps"]["alert"]["body"], p["aleph"]["thread"]) for p in await pushed(4)]
-    assert bodies == [("Approval needed", THREAD), ("Question", PROJECT), ("Finished", PROJECT),
-                      ("Failed", PROJECT)]
+    assert len(sender.sent) == 5
+    bodies = [(p["aps"]["alert"]["body"], p["aleph"]["thread"]) for p in await pushed(5)]
+    assert bodies == [("Approval needed", THREAD), ("Finished", THREAD), ("Question", PROJECT),
+                      ("Finished", PROJECT), ("Failed", PROJECT)]
     # The question settled with its turn: it leaves the Lock Screen too.
     await until(lambda: len(sender.background) == 2)
 

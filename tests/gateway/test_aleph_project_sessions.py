@@ -12,7 +12,7 @@ import pytest_asyncio
 
 from plugins.platforms.aleph.projects.backend import Accepted, Delta, Exit, Item, TurnEnd
 from plugins.platforms.aleph.projects.session import REAP_AFTER
-from tests.gateway.aleph_backend import project_adapter, unavailable, until
+from tests.gateway.aleph_backend import open_thread, project_adapter, unavailable, until
 from tests.gateway.aleph_phone import connect
 
 PROJECT = "C41A0000-0000-4000-8000-000000000001"
@@ -23,9 +23,9 @@ THREAD = "8D0F0000-0000-4000-8000-000000000002"
 async def adapter(tmp_path):
     async with project_adapter(tmp_path) as instance:
         await instance.handle_call("project.create", {
-            "id": PROJECT, "name": "web", "folder": str(instance.root / "web"), "clone": None, "backend": "claude",
+            "id": PROJECT, "name": "web", "folder": str(instance.root / "web"), "backend": "claude",
             "model": "opus", "effort": "low", "approval": "auto_review"})
-        await instance.handle_call("thread.open", {"id": THREAD, "project": PROJECT})
+        await open_thread(instance, PROJECT, THREAD)
         instance.backend = instance.projects.backends["claude"]
         yield instance
 

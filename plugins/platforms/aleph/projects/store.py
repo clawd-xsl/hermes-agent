@@ -1,5 +1,5 @@
-"""The projects' tables in Aleph's store: projects, threads, turns, items and queued messages, and the
-coordination journal (deliveries between a project's sessions, and the threads the agent opened).
+"""The projects' tables in Aleph's store: projects, threads, turns, items, queued messages and Always
+Allow rules, and the coordination journal (deliveries between a project's sessions, and the threads the agent opened).
 
 They live in the chats' SQLite file, on its connection and behind its lock (``AlephStore`` composes
 ``ProjectTables``), and are folds of the log: every row changes in the transaction that appends the
@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS deliveries (
     UNIQUE (source, request_id)
 );
 CREATE INDEX IF NOT EXISTS deliveries_inbox ON deliveries (target, status, seq);
+CREATE TABLE IF NOT EXISTS rules (
+    project TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    rule TEXT NOT NULL,
+    PRIMARY KEY (project, kind, rule)
+);
 CREATE TABLE IF NOT EXISTS opened (
     project TEXT NOT NULL,
     source TEXT NOT NULL,
@@ -87,7 +93,7 @@ CREATE TABLE IF NOT EXISTS opened (
     UNIQUE (source, request_id)
 );
 """
-TABLES = ("projects", "threads", "turns", "items", "queued", "deliveries", "opened")
+TABLES = ("projects", "threads", "turns", "items", "queued", "deliveries", "rules", "opened")
 # A delivery not settled yet; ``delivering`` is one being handed over right now.
 PENDING = ("queued", "held", "delivering")
 RATE_HOUR, RATE_MINUTE = 60, 10  # deliveries one session may send per hour, per minute
@@ -127,14 +133,6 @@ def _now_iso() -> str:
 
 def _dump(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def top_level(project: dict[str, Any]) -> dict[str, Any]:
-    """The top level of a project as a thread: it has no ``thread.new`` of its own, and its name and
-    settings are the project's, so its own are always null."""
-    return {"id": project["id"], "project": project["id"], "name": None, "created_at": project["created_at"],
-            "opened_by": "user", "item": None, "brief": None, "model": None, "effort": None, "approval": None,
-            "plan": False, "closed": False}
 
 
 @dataclass(frozen=True)
@@ -196,8 +194,6 @@ class ProjectTables:
         if event_type == "project.new":
             db.execute("INSERT INTO projects (id, payload, created_seq) VALUES (?, ?, ?)",
                        (payload["id"], _dump(payload), seq))
-            db.execute("INSERT INTO threads (id, project, payload, created_seq, last_active_at) VALUES (?, ?, ?, ?, ?)",
-                       (payload["id"], payload["id"], _dump(top_level(payload)), seq, payload["created_at"]))
         elif event_type == "project.update":
             db.execute("UPDATE projects SET payload = ? WHERE id = ?", (_dump(payload), payload["id"]))
         elif event_type == "project.delete":
@@ -299,8 +295,8 @@ class ProjectTables:
 
     def snapshot_locked(self, waiting: set[str]) -> list[dict[str, Any]]:
         """``hello``'s ``projects`` on a reset: every project that exists, oldest first, with all its
-        threads but the top level (its ``project.new`` stands for it), closed ones included (their rows
-        stay in the main transcript). ``waiting`` names the threads with a request open."""
+        threads, the top level first, closed ones included (their rows stay in the main transcript).
+        ``waiting`` names the threads with a request open."""
         db = self._db
         running = {row[0] for row in db.execute("SELECT DISTINCT thread FROM turns WHERE open = 1")}
         queued: dict[str, list[dict[str, Any]]] = {}
@@ -311,8 +307,8 @@ class ProjectTables:
                                            "ORDER BY created_seq").fetchall():
             threads = []
             for thread_id, thread_body, last_active_at in db.execute(
-                    "SELECT id, payload, last_active_at FROM threads WHERE project = ? AND id != project "
-                    "ORDER BY created_seq", (project_id,)).fetchall():
+                    "SELECT id, payload, last_active_at FROM threads WHERE project = ? "
+                    "ORDER BY id != project, created_seq", (project_id,)).fetchall():
                 state = "waiting" if thread_id in waiting else "running" if thread_id in running else "idle"
                 threads.append({**json.loads(thread_body), "state": state, "last_active_at": last_active_at,
                                 "queued": queued.get(thread_id, [])})
@@ -346,10 +342,20 @@ class ProjectTables:
         with self._lock:
             self._db.execute("UPDATE threads SET session_id = ? WHERE id = ?", (session_id, thread))
 
+    def rules(self, project_id: str) -> set[tuple[str, str]]:
+        """A project's Always Allow rules, ``(kind, rule)`` each."""
+        with self._lock:
+            return {(kind, rule) for kind, rule in self._db.execute(
+                "SELECT kind, rule FROM rules WHERE project = ?", (project_id,))}
+
+    def add_rule(self, project_id: str, kind: str, rule: str) -> None:
+        with self._lock:
+            self._db.execute("INSERT OR IGNORE INTO rules (project, kind, rule) VALUES (?, ?, ?)", (project_id, kind, rule))
+
     def delete_project_locked(self, project_id: str) -> None:
         """Drop a project's turns, items and queued messages. Its project and thread rows stay, marked
         by ``project.delete``: their ids are never used again."""
-        for table in ("turns", "items", "queued", "deliveries", "opened"):
+        for table in ("turns", "items", "queued", "deliveries", "rules", "opened"):
             self._db.execute(f"DELETE FROM {table} WHERE project = ?", (project_id,))
 
     def settle_open(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -361,13 +367,13 @@ class ProjectTables:
         return [json.loads(row[0]) for row in items], [json.loads(row[0]) for row in turns]
 
     def unbriefed(self) -> list[ThreadRow]:
-        """Open threads of live projects the agent opened whose brief never started a turn: the
-        restart came between their ``thread.new`` and their first turn."""
+        """Open threads of live projects whose brief never started a turn: the restart came between
+        their ``thread.new`` and their first turn."""
         with self._lock:
             rows = self._db.execute(
                 "SELECT t.id, t.project, t.payload, t.created_seq, t.session_id, t.last_active_at FROM threads t "
                 "JOIN projects p ON p.id = t.project WHERE p.deleted_seq IS NULL "
-                "AND json_extract(t.payload, '$.opened_by') = 'agent' AND json_extract(t.payload, '$.brief') IS NOT NULL "
+                "AND json_extract(t.payload, '$.brief') IS NOT NULL "
                 "AND NOT EXISTS (SELECT 1 FROM turns u WHERE u.thread = t.id) ORDER BY t.created_seq").fetchall()
         return [thread for thread in map(_thread, rows) if not thread.payload.get("closed")]
 

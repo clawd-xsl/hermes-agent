@@ -49,10 +49,9 @@ def push_body_for(event_type: str, payload: dict[str, Any]) -> Optional[str]:
     """The generic body for a logged event that notifies, or ``None`` for one that does not.
 
     Notifies: the agent's text messages (attachment-only ones included), approval requests and
-    questions, and a project's top level ending a turn it spoke in or that failed (a thread's turns
-    do not: the top level hears of them and speaks). Not: tool rows, system notices, the person's own
-    messages (their echo), receipts, edits, deletions and outcomes. Drafts and typing are never
-    logged, so never reach here.
+    questions, and any project thread ending a turn it spoke in or that failed. Not: tool rows,
+    system notices, the person's own messages (their echo), receipts, edits, deletions and outcomes.
+    Drafts and typing are never logged, so never reach here.
     """
     if event_type == "message.new":
         if payload.get("sender") != "agent" or (payload.get("kind") or "text") != "text":
@@ -62,7 +61,7 @@ def push_body_for(event_type: str, payload: dict[str, Any]) -> Optional[str]:
         return BODY_APPROVAL
     if event_type == "clarify.request":
         return BODY_QUESTION
-    if event_type == "turn.completed" and payload.get("thread") == payload.get("project"):
+    if event_type == "turn.completed" and payload.get("project") is not None:
         if payload.get("status") == "failed":
             return BODY_FAILED
         if payload.get("status") == "completed" and not payload.get("silent"):

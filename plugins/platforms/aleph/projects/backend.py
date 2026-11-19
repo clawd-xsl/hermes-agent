@@ -14,9 +14,18 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Protocol
 
 APPROVALS = ("ask", "auto_review", "allow_all")
+TIERS = ("standard", "fast")
 MAX_TITLE = 200  # an item's title, one line
 MAX_INPUT = 4000  # an item's input
 _RECOMMENDED = re.compile(r"\s*\(recommended\)\s*$", re.IGNORECASE)
+# A shell control operator: a command with one is several, and a prefix of it covers nothing of the rest.
+_COMPOUND = re.compile(r"[;&|`\n<>]|\$\(")
+# First words that run whatever follows them: a rule on their prefix would allow anything.
+_RUNNERS = frozenset({"bash", "sh", "zsh", "dash", "fish", "env", "sudo", "doas", "su", "xargs", "eval", "exec",
+                      "command", "builtin", "nohup", "nice", "time", "timeout", "watch", "python", "python3",
+                      "node", "deno", "bun", "perl", "ruby", "php", "npx", "uvx"})
+# A subcommand (``test`` of ``npm test``): a plain word, not an option or a path.
+_SUBCOMMAND = re.compile(r"[a-z][a-z0-9_-]*")
 
 
 def clip(text: str, limit: int = MAX_INPUT) -> str:
@@ -26,6 +35,40 @@ def clip(text: str, limit: int = MAX_INPUT) -> str:
 def title(text: Any) -> str:
     """An item's title: one line, at most ``MAX_TITLE``."""
     return clip(" ".join(str(text or "").split()), MAX_TITLE)
+
+
+def _words(command: str) -> Optional[list[str]]:
+    """A single, plain command's words; None for several in one, or one led by a word that runs
+    whatever follows it."""
+    words = command.split()
+    if not words or _COMPOUND.search(command) or words[0].rsplit("/", 1)[-1] in _RUNNERS:
+        return None
+    return words
+
+
+def command_rule(command: str, prefix: Optional[Iterable[str]] = None) -> str:
+    """What Always Allow of ``command`` covers: the words a later command must start with
+    (``prefix:npm test``), the backend's own ``prefix`` when it proposes one, else the command's first
+    word and its subcommand; or the command exactly (``exact:…``) when no prefix covers it safely."""
+    words = list(prefix) if prefix else _words(command)
+    if not words or _words(" ".join(words)) is None:
+        return f"exact:{command.strip()}"
+    if not prefix:
+        words = words[:2] if len(words) > 1 and _SUBCOMMAND.fullmatch(words[1]) else words[:1]
+    return "prefix:" + " ".join(words)
+
+
+def rule_covers(rule: str, command: str) -> bool:
+    kind, _, pattern = rule.partition(":")
+    if kind == "exact":
+        return command.strip() == pattern
+    words, wanted = _words(command), pattern.split()
+    return words is not None and words[: len(wanted)] == wanted
+
+
+def rule_words(rule: str) -> str:
+    """A rule as the person reads it: its prefix, or its command."""
+    return rule.partition(":")[2]
 
 
 def plain_options(labels: Iterable[str]) -> tuple[tuple[str, ...], Optional[int]]:
@@ -42,9 +85,12 @@ class Model:
     name: str
     efforts: tuple[str, ...] = ()  # the model's own levels, in order
     default_effort: Optional[str] = None
+    tiers: tuple[str, ...] = ()  # its speeds (``TIERS``), empty when it has no choice
+    default_tier: Optional[str] = None
 
     def wire(self) -> dict[str, Any]:
-        return {"id": self.id, "name": self.name, "efforts": list(self.efforts), "default_effort": self.default_effort}
+        return {"id": self.id, "name": self.name, "efforts": list(self.efforts), "default_effort": self.default_effort,
+                "tiers": list(self.tiers), "default_tier": self.default_tier}
 
 
 @dataclass(frozen=True)
@@ -88,14 +134,15 @@ class McpServer:
 
 @dataclass(frozen=True)
 class SessionSpec:
-    """What a thread's session runs with: its folder, its effective settings, and the coordination
-    it is part of (fixed when its process starts)."""
+    """What a thread's session runs with: its folder, its settings, and the coordination it is part of
+    (fixed when its process starts)."""
     thread: str
     project: str
     folder: str
     top_level: bool
     model: Optional[str]
     effort: Optional[str]
+    tier: Optional[str]
     approval: str
     plan: bool
     resume: Optional[str] = None  # the backend's own session id, to resume
@@ -180,17 +227,16 @@ class Ask:
     cwd: Optional[str] = None
     files: tuple[dict[str, Any], ...] = ()  # an edit's {path, old_path?, added, removed}
     questions: tuple[Question, ...] = ()
-    # What a session grant of this ask covers, in the backend's own rule shape: a later ask with the
-    # same ``grant`` is covered by it (Codex: the exact command; Claude Code: its first word; a tool:
-    # its name). None: a session grant of it covers nothing more. Edits are matched by their files.
-    grant: Optional[str] = None
+    # What Always Allow of it covers: for a command its ``command_rule``, for a tool the tool. None: it
+    # offers no Always Allow. Edits are matched by their files.
+    rule: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class Approve:
     """Allow what an ask holds. ``session``: the backend's own grant for its session too (Codex's
-    ``acceptForSession``, a Claude Code session rule). For a plan: leave plan mode and start, in the
-    thread's approval mode."""
+    ``acceptForSession``, a Claude Code session rule), as Always Allow gives it. For a plan: leave plan
+    mode and start, in the thread's approval mode."""
     session: bool = False
 
 

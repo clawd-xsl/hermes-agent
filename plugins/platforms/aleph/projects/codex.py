@@ -25,7 +25,7 @@ from typing import Any, Callable, Optional
 
 from plugins.platforms.aleph.projects.backend import (
     Accepted, Answers, Approve, Ask, BackendInfo, Call, Decision, Delta, Deny, Exit, Item, Model, Patch,
-    Question, SessionSpec, Sink, TurnEnd, clip, plain_options, title)
+    TIERS, Question, SessionSpec, Sink, TurnEnd, clip, command_rule, plain_options, title)
 from plugins.platforms.aleph.projects import process
 from plugins.platforms.aleph.projects.process import STREAM_LIMIT, end, signal_group
 from plugins.platforms.aleph.projects.service import one_line
@@ -219,6 +219,7 @@ class CodexBackend:
         self._sessions: dict[str, CodexSession] = {}  # by Codex thread id
         self._parents: dict[str, str] = {}  # a subagent's thread -> the thread that spawned it
         self._info: Optional[BackendInfo] = None
+        self._fast: dict[str, str] = {}  # model -> the service tier its fast speed is
         self._tasks: set[asyncio.Task] = set()
 
     # ── the shared process ─────────────────────────────────────────────────────────────────────
@@ -323,9 +324,15 @@ class CodexBackend:
             requirements = (await server.request("configRequirements/read", {})).get("requirements") or {}
         except Exception as exc:
             return BackendInfo(self.id, self.name, False, "error", one_line(exc) or "Codex did not answer")
+        # Its one faster service tier, by the id a turn names it with: the speed the phone calls fast.
+        self._fast = {entry["model"]: tiers[0]["id"] for entry in listed
+                      if (tiers := [tier for tier in entry.get("serviceTiers") or () if isinstance(tier, dict) and tier.get("id")])}
         models = tuple(Model(entry["model"], entry.get("displayName") or entry["model"],
                              tuple(option["reasoningEffort"] for option in entry.get("supportedReasoningEfforts") or ()),
-                             entry.get("defaultReasoningEffort")) for entry in listed)
+                             entry.get("defaultReasoningEffort"),
+                             tiers=TIERS if entry["model"] in self._fast else (),
+                             default_tier=("fast" if entry.get("defaultServiceTier") else "standard")
+                             if entry["model"] in self._fast else None) for entry in listed)
         ids = [model.id for model in models]
         default = config.get("model") if config.get("model") in ids else next(
             (entry["model"] for entry in listed if entry.get("isDefault")), ids[0] if ids else None)
@@ -345,13 +352,17 @@ class CodexBackend:
         await session.begin()
         return session
 
-    def defaults(self, model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-        """The model and effort a turn runs with when the thread names none: what ``backends.list``
-        offered as the default."""
+    def defaults(self, model: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """The model, effort and speed a turn runs with when the thread names none: what
+        ``backends.list`` offered as the default."""
         info = self._info
         model = model or (info.default_model if info else None)
         listed = info.model(model) if info else None
-        return model, listed.default_effort if listed else None
+        return model, listed.default_effort if listed else None, listed.default_tier if listed else None
+
+    def service_tier(self, model: Optional[str], tier: Optional[str]) -> Optional[str]:
+        """The service tier a turn names for ``tier`` (null: the model's standard speed)."""
+        return self._fast.get(model) if tier == "fast" else None
 
 
 class CodexSession:
@@ -418,11 +429,12 @@ class CodexSession:
     def _turn_params(self, text: str) -> dict[str, Any]:
         spec = self.spec
         policy, reviewer, sandbox = _MODES[spec.approval]
-        model, effort = self.backend.defaults(spec.model)
-        model, effort = model or self._model, spec.effort or effort
+        model, effort, tier = self.backend.defaults(spec.model)
+        model, effort, tier = model or self._model, spec.effort or effort, spec.tier or tier
         return {"threadId": self.thread_id, "input": [{"type": "text", "text": text, "text_elements": []}],
                 "cwd": spec.folder, "approvalPolicy": policy, "approvalsReviewer": reviewer,
                 "sandboxPolicy": self._sandbox(sandbox), "model": model, "effort": effort,
+                "serviceTier": self.backend.service_tier(model, tier),
                 # Sent on every turn: a mode stays with the thread until another is sent.
                 "collaborationMode": {"mode": "plan" if spec.plan else "default", "settings": {
                     "model": model, "reasoning_effort": effort, "developer_instructions": None}}}
@@ -653,16 +665,17 @@ class CodexSession:
         if method == _APPROVALS[0]:
             command = params.get("command") or ""
             offered = params.get("availableDecisions")
+            proposed = params.get("proposedExecpolicyAmendment")
             ask = Ask(key, "command", item, params.get("reason") or "", _shown(command), params.get("cwd"),
-                      grant=command if offered is None or "acceptForSession" in offered else None)
+                      rule=command_rule(_shown(command), proposed if isinstance(proposed, list) else None)
+                      if offered is None or "acceptForSession" in offered else None)
         elif method == _APPROVALS[1]:
             files = tuple({"path": patch.path, **({"old_path": patch.old_path} if patch.old_path else {}),
                            "added": _counts(patch.diff)[0], "removed": _counts(patch.diff)[1]}
                           for patch in self._edits.get(params.get("itemId"), ()))
             ask = Ask(key, "edit", item, params.get("reason") or "", files=files)
         elif method == _PERMISSIONS:
-            ask = Ask(key, "permission", item, params.get("reason") or "",
-                      grant=json.dumps(params.get("permissions"), sort_keys=True))
+            ask = Ask(key, "permission", item, params.get("reason") or "")
         elif method == _QUESTION:
             ask = Ask(key, "question", item, questions=tuple(_question(entry) for entry in params.get("questions") or ()))
         elif method == _ELICITATION and (params.get("_meta") or {}).get("codex_approval_kind") == "mcp_tool_call":
@@ -670,7 +683,7 @@ class CodexSession:
             call = None if child else next((tool_key for tool_key, (server, _) in reversed(self._tools.items())
                                             if server == params.get("serverName")), None)
             tool = self._tools[call][1] if call else str(params.get("serverName") or "")
-            ask = Ask(key, "tool", call, tool, grant=f"{params.get('serverName')}/{tool}" if call else None)
+            ask = Ask(key, "tool", call, tool, rule=f"{params.get('serverName')}/{tool}" if call else None)
         elif method == _ELICITATION:
             self.backend.spawn(self.server.respond(request_id, {"action": "decline", "content": None, "_meta": None}))
             return
@@ -697,7 +710,7 @@ def _response(method: str, params: dict[str, Any], ask: Ask, decision: Decision)
     approve = isinstance(decision, Approve)
     session = approve and decision.session
     if method in _APPROVALS:
-        if method == _APPROVALS[0] and ask.grant is None:
+        if method == _APPROVALS[0] and ask.rule is None:
             session = False  # this command offers no session grant (``availableDecisions``)
         return {"decision": "acceptForSession" if session else "accept" if approve else "decline"}
     if method == _PERMISSIONS:

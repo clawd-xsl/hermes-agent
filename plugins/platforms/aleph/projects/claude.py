@@ -29,8 +29,9 @@ from typing import Any, Optional
 
 from plugins.platforms.aleph.projects import child, git
 from plugins.platforms.aleph.projects.backend import (
+    TIERS,
     Accepted, Answers, Approve, Ask, BackendInfo, Call, Decision, Delta, Deny, Exit, Item, Model, Question,
-    SessionSpec, Sink, TurnEnd, clip, plain_options, title)
+    SessionSpec, Sink, TurnEnd, clip, command_rule, plain_options, title)
 from plugins.platforms.aleph.projects import process
 from plugins.platforms.aleph.projects.process import STREAM_LIMIT, end, kill, signal_group
 from plugins.platforms.aleph.projects.service import one_line
@@ -53,12 +54,6 @@ _PLAN_TOOLS = frozenset({"TodoWrite", "TaskCreate", "TaskUpdate"})
 # AskUserQuestion and ExitPlanMode are requests.
 _HIDDEN = frozenset({"ToolSearch", "TaskList", "TaskGet", "AskUserQuestion", "ExitPlanMode"})
 _EXIT_CODE = re.compile(r"\AExit code (\d+)\n?")
-# A shell control operator: a command with one is several, and its first word grants nothing of the rest.
-_COMPOUND = re.compile(r"[;&|`\n<>]|\$\(")
-# First words that run whatever follows them: their ``<word>:*`` rule would allow anything.
-_RUNNERS = frozenset({"bash", "sh", "zsh", "dash", "fish", "env", "sudo", "doas", "su", "xargs", "eval", "exec",
-                      "command", "builtin", "nohup", "nice", "time", "timeout", "watch", "python", "python3",
-                      "node", "deno", "bun", "perl", "ruby", "php", "npx", "uvx"})
 # What the CLI says when ``--resume`` names a session it no longer has.
 _NO_SESSION = "No conversation found"
 
@@ -71,15 +66,6 @@ def _environment(home: str, extra: dict[str, str]) -> dict[str, str]:
     env = process.environment(home, **extra)
     env.pop("CLAUDE_CONFIG_DIR", None)  # it would move the config out of HOME
     return env
-
-
-def _command_prefix(command: str) -> Optional[str]:
-    """The first word of a single, plain command, whose ``<word>:*`` rule a session grant gives: None
-    for several commands in one, or a word that runs whatever follows it."""
-    words = command.split()
-    if not words or _COMPOUND.search(command) or os.path.basename(words[0]) in _RUNNERS:
-        return None
-    return words[0]
 
 
 def _text_of(content: Any) -> str:
@@ -117,7 +103,9 @@ class ClaudeBackend:
             return self._info(False, "error", one_line(exc))
         listed = [entry for entry in catalog if isinstance(entry, dict) and entry.get("value")]
         models = tuple(Model(str(entry["value"]), str(entry.get("displayName") or entry["value"]),
-                             tuple(entry.get("supportedEffortLevels") or ()) if entry.get("supportsEffort") else ())
+                             tuple(entry.get("supportedEffortLevels") or ()) if entry.get("supportsEffort") else (),
+                             tiers=TIERS if entry.get("supportsFastMode") else (),
+                             default_tier="standard" if entry.get("supportsFastMode") else None)
                        for entry in listed if entry["value"] != "default")
         # "default" is the CLI's own selector: what null runs, named here by the model it resolves to.
         resolved = next((entry.get("resolvedModel") for entry in listed if entry["value"] == "default"), None)
@@ -251,11 +239,14 @@ class ClaudeSession:
             extra.update(server.env)
             argv += ["--mcp-config", json.dumps({"mcpServers": {server.name: config}}),
                      "--allowedTools", *(f"mcp__{server.name}__{tool}" for tool in server.tools)]
+        # Fast mode is set only at launch, and stated either way: the account's own default is not the thread's.
+        settings: dict[str, Any] = {"fastMode": spec.tier == "fast"}
         if spec.stop_report:
             hook = {"type": "command", "timeout": 10,
                     "command": shlex.join([sys.executable, "-I", os.path.abspath(child.__file__), "stop"])}
-            argv += ["--settings", json.dumps({"hooks": {"Stop": [{"hooks": [hook]}]}})]
+            settings["hooks"] = {"Stop": [{"hooks": [hook]}]}
             extra[child.STOP_ENV] = spec.stop_report
+        argv += ["--settings", json.dumps(settings)]
         if spec.memory:
             # Outside the folder: without the CLI's access to it, every memory write would ask the person.
             argv += ["--add-dir", spec.memory]
@@ -439,8 +430,8 @@ class ClaudeSession:
     async def apply(self, spec: SessionSpec) -> None:
         """``self.spec`` stays what the process runs until each change took: a change refused is tried
         again by the next ``apply``."""
-        if spec.effort != self.spec.effort:
-            # The CLI sets effort only at launch: the same session goes on in a new process.
+        if spec.effort != self.spec.effort or spec.tier != self.spec.tier:
+            # The CLI sets effort and fast mode only at launch: the same session goes on in a new process.
             self.spec, self._mode = spec, _permission_mode(spec)
             await self._respawn()
             return
@@ -713,14 +704,14 @@ class ClaudeSession:
         if name == "Bash":
             command = str(data.get("command") or "")
             self.sink(Ask(request_id, "command", item, reason or str(data.get("description") or ""), command,
-                          self.spec.folder, grant=_command_prefix(command)))
+                          self.spec.folder, rule=command_rule(command)))
         elif name in _EDIT_TOOLS:
             files = await asyncio.to_thread(git.edit_files, self.spec.folder, data, ()) if name in _DIFFED else []
             self.sink(Ask(request_id, "edit", item, reason, files=tuple(
                 {key: entry[key] for key in ("path", "old_path", "added", "removed") if entry.get(key) is not None}
                 for entry in files)))
         else:
-            self.sink(Ask(request_id, "tool", item, str(request.get("display_name") or name), grant=name))
+            self.sink(Ask(request_id, "tool", item, str(request.get("display_name") or name), rule=name))
 
     # ── the task list ──────────────────────────────────────────────────────────────────────────
 
@@ -760,15 +751,12 @@ class ClaudeSession:
 
 
 def _session_grant(request: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """The CLI's own rule for "for this session". Its suggestions are exact-command rules saved to the
-    project's local settings; a Bash command gets its first word's prefix rule (``git:*``) for this
-    session instead, as the person's grant reads, and none when that word grants nothing safely
-    (``_command_prefix``). Other tools: the CLI's suggestion, for this session."""
+    """The CLI's own rule for the rest of the session, as Always Allow gives it: a Bash command's
+    ``command_rule`` (``npm test:*``, or the command exactly); another tool, the CLI's suggestion. Never
+    saved to the folder's own settings: the server keeps the lasting rule."""
     if request.get("tool_name") == "Bash":
-        prefix = _command_prefix(str((request.get("input") or {}).get("command") or ""))
-        if prefix is None:
-            return None
-        return {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": f"{prefix}:*"}],
+        kind, _, words = command_rule(str((request.get("input") or {}).get("command") or "")).partition(":")
+        return {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": f"{words}:*" if kind == "prefix" else words}],
                 "behavior": "allow", "destination": "session"}
     suggestions = [one for one in request.get("permission_suggestions") or [] if isinstance(one, dict)]
     preferred = sorted(suggestions, key=lambda one: one.get("type") == "setMode")

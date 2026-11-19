@@ -111,6 +111,26 @@ def test_env_only_setup_enables_the_platform_with_main_as_home(monkeypatch, tmp_
     assert Platform("aleph") in config.get_connected_platforms()
 
 
+def test_alephs_tools_stay_in_front_of_the_model():
+    """Aleph's tools are its sessions' own surface: as registered, none hides behind tool search."""
+    from gateway.platform_registry import PlatformEntry, platform_registry
+    from tools.registry import registry
+    from tools.tool_search import is_deferrable_tool_name
+    captured = _register()
+    captured.pop("cli")
+    platform_registry.register(PlatformEntry(source="plugin", **captured))
+    for tool in _register.tools:
+        registry.register(**tool)
+    try:
+        assert _register.tools
+        for tool in _register.tools:
+            assert not is_deferrable_tool_name(tool["name"]), tool["name"]
+    finally:
+        platform_registry.unregister("aleph")
+        for tool in _register.tools:
+            registry.deregister(tool["name"])
+
+
 def test_tool_progress_marker_is_opt_in():
     from plugins.platforms.aleph.adapter import AlephAdapter
     from gateway.platforms.base import BasePlatformAdapter

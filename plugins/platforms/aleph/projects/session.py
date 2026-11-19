@@ -160,11 +160,12 @@ class Session:
             known = await self._projects.sent_seq(payload["id"], self.thread)
             if known is not None:
                 return known
-            if delivery == "after_turn" and self.turn is not None:
+            desk = self._projects.desks.get(self.project)
+            # A message sent while the thread waits on the person answers that, whatever its delivery.
+            if delivery == "after_turn" and self.turn is not None and not (desk is not None and desk.waits(self.thread)):
                 queued = self._scoped(id=payload["id"], text=payload["text"], attachments=payload["attachments"],
                                       comments=payload.get("comments", []), created_at=payload["created_at"])
                 return (await self._log("message.queued", queued)).seq
-            desk = self._projects.desks.get(self.project)
             text = await self._projects.prompt(payload)
             if desk is not None and desk.asks_secret(self.thread):
                 # The answer to a secret question goes to the backend from memory; the log keeps a mask.
@@ -299,16 +300,14 @@ class Session:
 
     async def _ready(self) -> BackendSession:
         """The backend session, opened (resuming the thread's last one) or brought to the thread's
-        settings as they are now: its own, else the project's."""
+        settings as they are now."""
         tables = self._projects.tables
         thread = await asyncio.to_thread(tables.thread, self.thread)
         project = await asyncio.to_thread(tables.project, self.project)
         own, base = thread.payload, project.payload
-
-        def setting(key: str) -> Any:
-            return own.get(key) if own.get(key) is not None else base.get(key)
-        spec = SessionSpec(self.thread, self.project, base["folder"], self.top_level, setting("model"),
-                           setting("effort"), setting("approval"), bool(own.get("plan")), self._session_id)
+        folder = self._projects.folder(project)
+        spec = SessionSpec(self.thread, self.project, folder, self.top_level, own.get("model"), own.get("effort"),
+                           own.get("tier"), own["approval"], bool(own.get("plan")), self._session_id)
         if self.backend is not None:
             # The coordination is fixed for the process: a memory index that changed reaches the next one.
             spec = dataclasses.replace(spec, instructions=self._spec.instructions, mcp=self._spec.mcp,
@@ -327,8 +326,8 @@ class Session:
         state = projects.state_dir / self.project
         self._token = projects.bus.issue(self.project, self.thread, self.top_level)
         instructions = await asyncio.to_thread(
-            tag.instructions, top_level=self.top_level, project=base["name"], folder=base["folder"],
-            memory=state / "memory", thread=own.get("name"), opened_by_agent=own.get("opened_by") == "agent")
+            tag.instructions, top_level=self.top_level, project=base.get("name") or "No Project", folder=folder,
+            memory=state / "memory", thread=own.get("name"))
         spec = dataclasses.replace(spec, instructions=instructions, mcp=projects.bus.server(self._token),
                                    memory=str(state / "memory"), stop_report=str(state / f"{self.thread}.stop.json"))
         try:

@@ -1,5 +1,5 @@
 """A project's folder as git sees it: its changes (``changes.get``, ``project.changes``), a changed
-file's diff (``diff.get``), an edit item's diff, and cloning a repository into a new folder.
+file's diff (``diff.get``) and an edit item's diff.
 
 Every git runs as an asyncio subprocess with a timeout, under ``LC_ALL=C`` (its messages are matched
 in English), with prompts off and ``--no-optional-locks``: looking at a working tree must never take
@@ -12,8 +12,6 @@ import asyncio
 import difflib
 import os
 import re
-import secrets
-import shutil
 import signal
 import stat
 from dataclasses import dataclass
@@ -24,7 +22,6 @@ from plugins.platforms.aleph.projects.backend import Patch
 from plugins.platforms.aleph.projects.process import signal_group
 
 GIT_SECONDS = 30.0
-CLONE_SECONDS = 600.0
 MAX_FILES = 2000
 MAX_DIFF_LINES = 20000
 MAX_DIFF_BYTES = 2 * 1024 * 1024
@@ -38,20 +35,6 @@ _DIFF = ("--no-color", "--no-ext-diff", "--no-textconv")
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _STATUS = {"A": "added", "C": "added", "D": "deleted", "R": "renamed"}
 _COUNTED: dict[tuple[str, int, int], tuple[int, bool]] = {}
-_TEMP_CLONE = re.compile(r"^\..+\.clone-[0-9a-f]+$")
-# git's own words for why a clone failed, under LC_ALL=C, first match wins: local trouble, then a
-# remote that refused (git cannot tell a missing repository from one it may not read), then the way
-# there. Anything else is taken as refused.
-_CLONE_FAILURES = (
-    ("io", ("no space left", "could not create", "read-only file system", "disk quota")),
-    ("access", ("not found", "does not appear to be a git repository", "could not read username",
-                "could not read password", "authentication failed", "permission denied (", "access denied",
-                "host key verification failed", "terminal prompts disabled", "returned error: 40")),
-    ("network", ("could not resolve", "connection refused", "timed out", "network is unreachable",
-                 "no route to host", "failed to connect", "connection reset", "early eof", "rpc failed", "ssl",
-                 "unable to access", "proxy")),
-    ("io", ("permission denied",)),
-)
 
 
 class GitError(Exception):
@@ -65,12 +48,6 @@ class GitError(Exception):
 
 class NotGit(Exception):
     """The folder is no git working tree."""
-
-
-class CloneError(Exception):
-    def __init__(self, reason: str, message: str) -> None:
-        super().__init__(message)
-        self.reason = reason
 
 
 # ── running git ───────────────────────────────────────────────────────────────────────────────
@@ -390,65 +367,3 @@ def edit_files(folder: str, arguments: Optional[dict[str, Any]], patches: tuple[
     return [_file(path, status, None, diff)]
 
 
-# ── cloning ───────────────────────────────────────────────────────────────────────────────────
-
-
-def _failure(message: str) -> str:
-    lowered = message.lower()
-    return next((reason for reason, words in _CLONE_FAILURES if any(word in lowered for word in words)), "access")
-
-
-def _place(temp: str, folder: str) -> None:
-    if os.path.lexists(folder):
-        raise FileExistsError(f"{folder} appeared while cloning")
-    os.rename(temp, folder)
-
-
-async def clone(url: str, folder: str, records: Path) -> None:
-    """Clone ``url`` into the new ``folder``, in at most ``CLONE_SECONDS``. git clones into a hidden
-    sibling that is renamed into place only once whole, so a failure, or a crash, leaves no folder: a
-    record of it in ``records`` lets the next start remove what a crash left (``sweep``).
-    ``CloneError`` with ``access``, ``network``, ``timeout`` or ``io``."""
-    parent, name = os.path.split(folder)
-    token = secrets.token_hex(6)
-    temp = os.path.join(parent, f".{name}.clone-{token}")
-    record = records / token
-
-    def note() -> None:
-        records.mkdir(parents=True, exist_ok=True)
-        record.write_text(temp)
-    try:
-        await asyncio.to_thread(note)
-    except OSError as exc:
-        raise CloneError("io", str(exc)) from exc
-    ssh = os.environ.get("GIT_SSH_COMMAND") or "ssh"
-    try:
-        await _run(["git", "clone", "--quiet", "--", url, temp], env={"GIT_SSH_COMMAND": f"{ssh} -o BatchMode=yes"},
-                   timeout=CLONE_SECONDS)
-        await asyncio.to_thread(_place, temp, folder)
-    except GitError as exc:
-        raise CloneError("timeout" if exc.timed_out else _failure(exc.stderr), str(exc)) from exc
-    except OSError as exc:
-        raise CloneError("io", str(exc)) from exc
-    finally:
-        await asyncio.to_thread(_forget, temp, record)
-
-
-def _forget(temp: str, record: Path) -> None:
-    shutil.rmtree(temp, ignore_errors=True)
-    record.unlink(missing_ok=True)
-
-
-def sweep(records: Path) -> int:
-    """Blocking. Remove the clones a crash left half made; how many."""
-    if not records.is_dir():
-        return 0
-    swept = 0
-    for record in records.iterdir():
-        temp = record.read_text().strip()
-        if _TEMP_CLONE.match(os.path.basename(temp)):
-            swept += os.path.lexists(temp)
-            _forget(temp, record)
-        else:
-            record.unlink(missing_ok=True)
-    return swept

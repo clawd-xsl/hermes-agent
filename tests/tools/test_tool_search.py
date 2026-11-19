@@ -182,6 +182,27 @@ class TestClassification:
         assert "xx_unknown_tool" in names
         assert deferrable == []
 
+    def test_plugin_platform_tools_stay_direct(self):
+        """A plugin platform's own tools reach only its sessions, so they stay in front of the
+        model there; any other plugin's tools still defer."""
+        from gateway.platform_registry import PlatformEntry, platform_registry
+        from tools.registry import registry
+        from tools.tool_search import is_deferrable_tool_name
+
+        platform_registry.register(PlatformEntry(
+            name="probeplat", label="Probe", adapter_factory=lambda config: None, check_fn=lambda: True))
+        tools = (("probeplat_tap", "probeplat"), ("probe_other_tap", "probeother"))
+        for name, toolset in tools:
+            registry.register(name=name, handler=lambda args, **kw: "{}",
+                              schema=_td(name)["function"], toolset=toolset)
+        try:
+            assert not is_deferrable_tool_name("probeplat_tap")
+            assert is_deferrable_tool_name("probe_other_tap")
+        finally:
+            platform_registry.unregister("probeplat")
+            for name, _ in tools:
+                registry.deregister(name)
+
 
 # ---------------------------------------------------------------------------
 # Token estimation + threshold gate

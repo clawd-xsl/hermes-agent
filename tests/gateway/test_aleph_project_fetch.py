@@ -1,7 +1,6 @@
 """Projects on Aleph, what is fetched on demand: a project's changes against HEAD or its base, a
 changed file's diff within its limits, an edit's diff kept from before its approval, a command's
-output paged and followed, a clone that leaves nothing when it fails, and ``project.changes`` sent
-when the working tree's summary changed."""
+output paged and followed, and ``project.changes`` sent when the working tree's summary changed."""
 
 from __future__ import annotations
 
@@ -45,7 +44,7 @@ async def adapter(tmp_path, monkeypatch):
         git(web, "commit", "-q", "-m", "first")
         instance.web = web
         await instance.handle_call("project.create", {
-            "id": PROJECT, "name": "web", "folder": str(web), "clone": None, "backend": "claude", "model": None,
+            "id": PROJECT, "name": "web", "folder": str(web), "backend": "claude", "model": None,
             "effort": None, "approval": "ask"})
         yield instance
 
@@ -102,7 +101,7 @@ async def test_changes_compare_the_working_tree_with_head_or_with_the_branchs_ba
     # A folder that is no repository has no changes to show.
     (adapter.root / "plain").mkdir()
     await adapter.handle_call("project.create", {
-        "id": OTHER, "name": "plain", "folder": str(adapter.root / "plain"), "clone": None, "backend": "claude",
+        "id": OTHER, "name": "plain", "folder": str(adapter.root / "plain"), "backend": "claude",
         "model": None, "effort": None, "approval": "ask"})
     error = await _error(adapter, "changes.get", {"project": OTHER, "scope": "uncommitted"})
     assert error.data["reason"] == "not_git"
@@ -220,34 +219,3 @@ async def test_a_commands_output_is_paged_and_followed_until_it_ends_or_the_phon
         assert not adapter.projects.outputs._following  # following ended with the command
     finally:
         await phone.close()
-
-
-# ── clones ────────────────────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_a_clone_answers_once_however_often_it_is_asked_and_a_failed_one_leaves_nothing(adapter, tmp_path,
-                                                                                            monkeypatch):
-    remote = tmp_path / "remote"
-    remote.mkdir()
-    git(remote, "clone", "-q", "--bare", str(adapter.web), "app.git")
-    # https://git.test/ reaches the local bare repositories, as a host would.
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.file://{remote}/.insteadOf")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://git.test/")
-
-    def create(project_id, name, url):
-        return adapter.handle_call("project.create", {
-            "id": project_id, "name": name, "folder": str(adapter.root / name), "clone": url, "backend": "claude",
-            "model": None, "effort": None, "approval": "ask"})
-    first, again = await asyncio.gather(create(OTHER, "app", "https://git.test/app.git"),
-                                        create(OTHER, "app", "https://git.test/app.git"))
-    assert first == again and len(_logged(adapter, "project.new")) == 2
-    assert (adapter.root / "app" / "count.txt").read_text() == lines(20)
-
-    error = await _error(adapter, "project.create", {
-        "id": "C41A0000-0000-4000-8000-000000000003", "name": "missing", "folder": str(adapter.root / "missing"),
-        "clone": "https://git.test/missing.git", "backend": "claude", "model": None, "effort": None,
-        "approval": "ask"})
-    assert error.code == 4003 and error.data["reason"] == "access"
-    assert sorted(os.listdir(adapter.root)) == ["app", "web"] and len(_logged(adapter, "project.new")) == 2
