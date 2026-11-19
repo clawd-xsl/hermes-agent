@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from unittest import mock
 from typing import Any, Callable, Optional
 
 from gateway.config import PlatformConfig
@@ -32,7 +33,9 @@ async def project_adapter(tmp_path):
     adapter.root = adapter.projects.root
     adapter.device, adapter.keys = pair_device(adapter)
     try:
-        yield adapter
+        # No model call: a project's better name is a test's own (``generate_title`` patched there).
+        with mock.patch("agent.title_generator.generate_title", lambda text, **_: None):
+            yield adapter
     finally:
         await adapter.disconnect()
 

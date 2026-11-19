@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 
 import pytest
 import pytest_asyncio
@@ -97,18 +98,50 @@ async def test_a_project_with_no_folder_works_in_its_own_folder_for_good(adapter
     await _call(adapter, "project.create", _create(adapter, name=None, folder=None))
     working = adapter.root / ".aleph" / PROJECT
     assert working.is_dir() and adapter.store.events_after(0)[0].payload["folder"] is None
-    # Unnamed until the person's first message names it.
-    await _call(adapter, "message.send", {"id": "m-1", "thread": PROJECT, "text": "What does   this script do?"})
-    [renamed] = [e.payload for e in adapter.store.events_after(0) if e.type == "project.update"]
-    assert renamed["name"] == "What does this script do?" and renamed["folder"] is None
+    await _call(adapter, "message.send", {"id": "m-1", "thread": PROJECT, "text": "What does this script do?"})
     [session] = adapter.projects.backends["claude"].sessions
     assert session.spec.folder == str(working)
-    await _call(adapter, "message.send", {"id": "m-2", "thread": PROJECT, "text": "And this one?"})
-    assert len([e for e in adapter.store.events_after(0) if e.type == "project.update"]) == 1
     # It has no changes to show, and its folder goes with it.
     assert (await _error(adapter, "changes.get", {"project": PROJECT, "scope": "uncommitted"})).code == -32602
     await _call(adapter, "project.delete", {"id": PROJECT})
     assert not working.exists()
+
+
+def _names(adapter):
+    return [e.payload["name"] for e in adapter.store.events_after(0) if e.type == "project.update"]
+
+
+@pytest.mark.asyncio
+async def test_the_title_generator_names_a_project_unless_it_was_given_a_name(adapter, monkeypatch):
+    better = threading.Event()
+    monkeypatch.setattr("agent.title_generator.generate_title",
+                        lambda text, **_: "Script walkthrough" if better.wait(5) else None)
+    await _call(adapter, "project.create", _create(adapter, name=None))
+    # Its first message it can title gives the quick title at once, the model's better one after.
+    await _call(adapter, "message.send", {"id": "m-0", "thread": PROJECT, "text": "",
+                                          "comments": [{"path": "a.py", "line": 1, "side": "new", "text": "?"}]})
+    await _call(adapter, "message.send", {"id": "m-1", "thread": PROJECT, "text": "What does   this script do?"})
+    assert _names(adapter) == ["What does this script do?"]
+    better.set()
+    await until(lambda: len(_names(adapter)) == 2)
+    assert _names(adapter)[1] == "Script walkthrough"
+    await _call(adapter, "message.send", {"id": "m-2", "thread": PROJECT, "text": "And this one?"})
+    assert len(_names(adapter)) == 2
+    await _call(adapter, "project.delete", {"id": PROJECT})
+
+    # The person's name stands, even over a better title already on the way.
+    better.clear()
+    await _call(adapter, "project.create", _create(adapter, id="P-2", name=None))
+    await _call(adapter, "message.send", {"id": "m-3", "thread": "P-2", "text": "Fix the login page"})
+    await _call(adapter, "project.update", {"id": "P-2", "name": "Login"})
+    better.set()
+    await asyncio.sleep(0.1)
+    assert _names(adapter)[-2:] == ["Fix the login page", "Login"]
+    # So does a name given at creation.
+    await _call(adapter, "project.create", _create(adapter, id="P-3"))
+    await _call(adapter, "message.send", {"id": "m-4", "thread": "P-3", "text": "Ship it"})
+    await asyncio.sleep(0.1)
+    assert _names(adapter)[-1] == "Login"
 
 
 @pytest.mark.asyncio

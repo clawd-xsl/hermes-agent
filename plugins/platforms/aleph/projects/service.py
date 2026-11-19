@@ -155,6 +155,8 @@ class Projects:
         self._look_again: set[str] = set()  # asked for while one was under way
         self._poller: Optional[asyncio.Task] = None
         self._deleted: set[str] = set()  # this run: a look under way at one must not bring it back
+        # By project: the title generator's better name on the way; a name the person gives ends it.
+        self._titling: dict[str, asyncio.Task] = {}
         self.calls: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
             "backends.list": self._backends_list, "fs.list": self._fs_list, "fs.mkdir": self._fs_mkdir,
             "project.create": self._create_project, "project.update": self._update_project,
@@ -200,7 +202,7 @@ class Projects:
     async def stop(self) -> None:
         """The server stops: every backend process ends; what was open settles at the next start."""
         await self.bus.stop()
-        for task in [*self._looking.values(), *([self._poller] if self._poller else [])]:
+        for task in [*self._looking.values(), *self._titling.values(), *([self._poller] if self._poller else [])]:
             task.cancel()
         for desk in self.desks.values():
             desk.stop()
@@ -525,7 +527,7 @@ class Projects:
             folder = await asyncio.to_thread(self._real_folder, folder)
             if not await asyncio.to_thread(os.access, folder, os.R_OK | os.W_OK | os.X_OK):
                 raise failed("access", f"{folder} cannot be read and written here")
-        name = _name(params.get("name"), nullable=True)  # else named from the person's first message
+        name = _name(params.get("name"), nullable=True)  # else the title generator names it (``_name_from``)
         settings = {key: _optional_str(params, key) for key in ("model", "effort", "tier", "approval")}
         await self._settings(backend_id, settings)
         async with self._lock:
@@ -550,6 +552,7 @@ class Projects:
         project_id, name = _id(params), _name(params.get("name"))
         async with self._lock:
             row = await self._live_project(project_id)
+            self._stop_titling(project_id)  # the person's name is final
             if row.payload.get("name") == name:
                 return {"seq": None}
             event = await self.adapter._log("project.update", {**row.payload, "name": name})
@@ -566,6 +569,7 @@ class Projects:
             if row.deleted_seq is not None:
                 return {"seq": row.deleted_seq}  # a resend after a lost answer
             await self._end_sessions(project_id)
+            self._stop_titling(project_id)
             self._deleted.add(project_id)
             self._changes.pop(project_id, None)
             self.outputs.forget(project_id)
@@ -760,14 +764,39 @@ class Projects:
         return await self.hub.session(thread).accept(payload, attachments, delivery)
 
     async def _name_from(self, project_id: str, text: str) -> None:
-        """A project still unnamed is named from the person's first message."""
-        name = _name(text, nullable=True)
-        if name is None:
-            return
+        """A project still unnamed is named by Hermes's title generator from the person's first message
+        it can title, as a side chat is: the quick title now, the better one when the model answers."""
+        from agent.title_generator import (
+            _auto_title_enabled, _model_title_upgrade_enabled, derive_title, is_titleable_user_message)
         async with self._lock:
             row = await self._live_project(project_id)
-            if row.payload.get("name") is None:
+            if (row.payload.get("name") is not None or not is_titleable_user_message(text)
+                    or not await asyncio.to_thread(_auto_title_enabled)):
+                return
+            quick = _name(derive_title(text), nullable=True)
+            if quick is None:
+                return
+            await self.adapter._log("project.update", {**row.payload, "name": quick})
+            if await asyncio.to_thread(_model_title_upgrade_enabled):
+                task = self._titling[project_id] = asyncio.create_task(self._better_name(project_id, text))
+                task.add_done_callback(lambda done: self._titling.pop(project_id, None)
+                                       if self._titling.get(project_id) is done else None)
+
+    async def _better_name(self, project_id: str, text: str) -> None:
+        from agent.title_generator import generate_title
+        name = _name(await asyncio.to_thread(generate_title, text), nullable=True)
+        async with self._lock:
+            # Checked under the lock that a name from the person takes: theirs stands.
+            if name is None or self._titling.get(project_id) is not asyncio.current_task():
+                return
+            row = await self._live_project(project_id)
+            if row.payload.get("name") != name:
                 await self.adapter._log("project.update", {**row.payload, "name": name})
+
+    def _stop_titling(self, project_id: str) -> None:
+        task = self._titling.pop(project_id, None)
+        if task is not None:
+            task.cancel()
 
     async def sent_seq(self, message_id: str, thread_id: str) -> Optional[int]:
         """The seq ``message.send`` first answered for ``message_id`` in this thread (its
