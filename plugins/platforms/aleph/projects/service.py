@@ -156,7 +156,7 @@ class Projects:
         self._poller: Optional[asyncio.Task] = None
         self._deleted: set[str] = set()  # this run: a look under way at one must not bring it back
         self.calls: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
-            "backends.list": self._backends_list, "fs.list": self._fs_list,
+            "backends.list": self._backends_list, "fs.list": self._fs_list, "fs.mkdir": self._fs_mkdir,
             "project.create": self._create_project, "project.update": self._update_project,
             "project.delete": self._delete_project, "thread.update": self._update_thread, "thread.close": self._close_thread,
             "thread.stop": self._stop_thread, "message.cancel": self._cancel_message,
@@ -428,7 +428,7 @@ class Projects:
         return real
 
     def _list(self, path: Optional[str]) -> dict[str, Any]:
-        real = self._real_folder(os.path.expanduser("~") if path is None else path)
+        real = self._real_folder(str(self.root) if path is None else path)
         folders = []
         try:
             with os.scandir(real) as entries:
@@ -447,6 +447,36 @@ class Projects:
     async def _fs_list(self, params: dict[str, Any]) -> dict[str, Any]:
         self._host(params)
         return await asyncio.to_thread(self._list, params.get("path"))
+
+    def _mkdir(self, path: Any, name: Any) -> dict[str, Any]:
+        name = name.strip() if isinstance(name, str) else ""
+        if not name:
+            raise _invalid("Give the folder a name.")
+        # A leading "." also rules out "." and "..": the folder would be hidden from fs.list.
+        if "/" in name or "\x00" in name or name.startswith("."):
+            raise _invalid("A folder name can't contain \"/\" or start with \".\".")
+        if len(name.encode()) > 255:
+            raise _invalid("That folder name is too long.")
+        if not isinstance(path, str) or not os.path.isabs(path) or "\x00" in path:
+            raise _invalid("path must be an absolute path")
+        real = os.path.realpath(path)
+        if not os.path.isdir(real):
+            raise failed("access", f"{real} is not a folder")
+        made = os.path.join(real, name)
+        try:
+            os.mkdir(made)
+        except FileExistsError as exc:
+            raise _invalid(f"A folder named \"{name}\" already exists.") from exc
+        except PermissionError as exc:
+            raise failed("access", f"{real} cannot be written to") from exc
+        except OSError as exc:
+            raise failed("access", exc) from exc
+        return {"path": made}
+
+    async def _fs_mkdir(self, params: dict[str, Any]) -> dict[str, Any]:
+        """``fs.mkdir {host?, path, name}``: a new folder in the one the browser shows."""
+        self._host(params)
+        return await asyncio.to_thread(self._mkdir, params.get("path"), params.get("name"))
 
     # ── projects ───────────────────────────────────────────────────────────────────────────────
 
